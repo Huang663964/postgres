@@ -2884,10 +2884,7 @@ InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
 	char	   *dstpath;
 	createdb_failure_params fparms;
 
-	if (src_deftablespace != DEFAULTTABLESPACE_OID)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("db_branch currently supports only pg_default tablespace")));
+	Assert(src_deftablespace == DEFAULTTABLESPACE_OID);
 
 	pg_database_rel = table_open(DatabaseRelationId, RowExclusiveLock);
 	do
@@ -3181,15 +3178,29 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 				 errdetail_busy_db(notherbackends, npreparedxacts)));
 	}
 
-	redo_ptr = GetRedoRecPtr();
-	branch_lsn = GetXLogInsertRecPtr();
-	XLogFlush(branch_lsn);
-	FlushDatabaseBuffers(source_dboid);
-
 	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
 	snprintf(srcpath, sizeof(srcpath), "base/%u", source_dboid);
 	snprintf(clone_path, sizeof(clone_path), "base/pg_dbbranch_%u_%08x",
 			 source_dboid, (unsigned int) branch_hash);
+
+	if (source_deftablespace != DEFAULTTABLESPACE_OID)
+	{
+		const char *tablespace_failure =
+			"db_branch currently supports only pg_default tablespace";
+
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
+						  "not_started", "not_started",
+						  "CREATING,FAILED", "FAILED", tablespace_failure);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s", tablespace_failure)));
+	}
+
+	redo_ptr = GetRedoRecPtr();
+	branch_lsn = GetXLogInsertRecPtr();
+	XLogFlush(branch_lsn);
+	FlushDatabaseBuffers(source_dboid);
 
 	if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
 	{

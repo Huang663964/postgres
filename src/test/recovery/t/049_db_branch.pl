@@ -121,6 +121,49 @@ is($xact_branch_count, '0', 'transaction-block rejection creates no branch datab
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 is(scalar @metadata_files, 1, 'transaction-block rejection writes no metadata file');
 
+my $tablespace_dir = $node->basedir . '/dbbranch_ts';
+mkdir($tablespace_dir) or die "could not create $tablespace_dir: $!";
+$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_ts LOCATION '$tablespace_dir';");
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_ts_source TABLESPACE dbbranch_ts;');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[SELECT pg_create_database_branch('dbbranch_ts_source', 'dbbranch_ts_target');],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects non-default source tablespace');
+like(
+	$stderr,
+	qr/db_branch currently supports only pg_default tablespace/,
+	'db branch reports tablespace limitation before clone');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 2, 'tablespace rejection writes separate metadata file');
+
+my $tablespace_metadata = '';
+for my $path (@metadata_files)
+{
+	open my $fh, '<', $path or die "could not open $path: $!";
+	my $contents = do { local $/; <$fh> };
+	close $fh;
+	if ($contents =~ /^branch_name=dbbranch_ts_target$/m)
+	{
+		$tablespace_metadata = $contents;
+		last;
+	}
+}
+
+like($tablespace_metadata, qr/^clone_result=not_started$/m, 'tablespace metadata records clone not started');
+like($tablespace_metadata, qr/^cleanup=not_started$/m, 'tablespace metadata records cleanup not started');
+like($tablespace_metadata, qr/^status=FAILED$/m, 'tablespace metadata final state is FAILED');
+like(
+	$tablespace_metadata,
+	qr/^failure=db_branch currently supports only pg_default tablespace$/m,
+	'tablespace metadata records limitation');
+my ($tablespace_clone_path) = $tablespace_metadata =~ /^clone_path=(.+)$/m;
+ok(!-e $node->data_dir . '/' . $tablespace_clone_path, 'tablespace rejection does not create clone staging path');
+
 my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
 $writer->query_safe(q[BEGIN; INSERT INTO users VALUES (3, 'carol');]);
 
@@ -140,7 +183,7 @@ $writer->query_safe('ROLLBACK;');
 $writer->quit;
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 2, 'busy branch attempt writes separate metadata file');
+is(scalar @metadata_files, 3, 'busy branch attempt writes separate metadata file');
 
 my $busy_metadata = '';
 for my $path (@metadata_files)
