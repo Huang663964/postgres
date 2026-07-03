@@ -288,7 +288,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		CreateFdwStmt CreateForeignServerStmt CreateForeignTableStmt
 		CreateAssertionStmt CreateTransformStmt CreateTrigStmt CreateEventTrigStmt
 		CreateUserStmt CreateUserMappingStmt CreateRoleStmt CreatePolicyStmt
-		CreatedbStmt DeclareCursorStmt DefineStmt DeleteStmt DiscardStmt DoStmt
+		CreateDbBranchStmt CreatedbStmt DeclareCursorStmt DefineStmt DeleteStmt DiscardStmt DoStmt
 		DropOpClassStmt DropOpFamilyStmt DropStmt
 		DropCastStmt DropRoleStmt
 		DropdbStmt DropTableSpaceStmt
@@ -702,7 +702,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ASENSITIVE ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTACH ATTRIBUTE AUTHORIZATION
 
 	BACKWARD BEFORE BEGIN_P BETWEEN BIGINT BINARY BIT
-	BOOLEAN_P BOTH BREADTH BY
+	BOOLEAN_P BOTH BRANCH BREADTH BY
 
 	CACHE CALL CALLED CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
@@ -1060,6 +1060,7 @@ stmt:
 			| CreateRoleStmt
 			| CreateUserStmt
 			| CreateUserMappingStmt
+			| CreateDbBranchStmt
 			| CreatedbStmt
 			| DeallocateStmt
 			| DeclareCursorStmt
@@ -11377,6 +11378,23 @@ LoadStmt:	LOAD file_name
 
 /*****************************************************************************
  *
+ *		CREATE BRANCH
+ *
+ *****************************************************************************/
+
+CreateDbBranchStmt:
+			CREATE BRANCH name FROM DATABASE name
+				{
+					CreateDbBranchStmt *n = makeNode(CreateDbBranchStmt);
+
+					n->branchname = $3;
+					n->sourcename = $6;
+					$$ = (Node *) n;
+				}
+		;
+
+/****************************************************************************
+ *
  *		CREATE DATABASE
  *
  *****************************************************************************/
@@ -17705,6 +17723,7 @@ unreserved_keyword:
 			| BACKWARD
 			| BEFORE
 			| BEGIN_P
+			| BRANCH
 			| BREADTH
 			| BY
 			| CACHE
@@ -18260,6 +18279,7 @@ bare_label_keyword:
 			| BIT
 			| BOOLEAN_P
 			| BOTH
+			| BRANCH
 			| BREADTH
 			| BY
 			| CACHE

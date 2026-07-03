@@ -191,6 +191,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_CreateTransformStmt:
 		case T_CreateTrigStmt:
 		case T_CreateUserMappingStmt:
+		case T_CreateDbBranchStmt:
 		case T_CreatedbStmt:
 		case T_DefineStmt:
 		case T_DropOwnedStmt:
@@ -764,6 +765,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_GrantRoleStmt:
 			/* no event triggers for global objects */
 			GrantRole(pstate, (GrantRoleStmt *) parsetree);
+			break;
+
+		case T_CreateDbBranchStmt:
+			{
+				CreateDbBranchStmt *stmt = (CreateDbBranchStmt *) parsetree;
+
+				/* no event triggers for global objects */
+				PreventInTransactionBlock(isTopLevel, "CREATE BRANCH");
+				CreateDatabaseBranch(stmt->sourcename, stmt->branchname);
+			}
 			break;
 
 		case T_CreatedbStmt:
@@ -2824,6 +2835,7 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_DO;
 			break;
 
+		case T_CreateDbBranchStmt:
 		case T_CreatedbStmt:
 			tag = CMDTAG_CREATE_DATABASE;
 			break;
@@ -3472,6 +3484,7 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_ALL;
 			break;
 
+		case T_CreateDbBranchStmt:
 		case T_CreatedbStmt:
 			lev = LOGSTMT_DDL;
 			break;

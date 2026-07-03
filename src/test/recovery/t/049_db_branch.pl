@@ -27,12 +27,10 @@ my $source_rows = $node->safe_psql(
 	'SELECT count(*) FROM users;');
 is($source_rows, '2', 'source database baseline is ready for DB Branch');
 
-my $stdout = '';
 my $stderr = '';
 my $result = $node->psql(
 	'postgres',
-	q[SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_target');],
-	stdout => \$stdout,
+	q[CREATE BRANCH dbbranch_target FROM DATABASE dbbranch_source],
 	stderr => \$stderr);
 
 my @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -54,7 +52,6 @@ like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata 
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
 if ($result == 0)
 {
-	like($stdout, qr/^\s*[0-9]+\s*$/m, 'db branch function returns branch database oid');
 	like($metadata, qr/^clone_result=(done|copy_fallback)$/m, 'metadata records storage clone success');
 	like($metadata, qr/^cleanup=not_needed$/m, 'metadata records no failed clone cleanup needed');
 	like($metadata, qr/^status_history=CREATING,COPYING,READY$/m, 'metadata records READY transition');
@@ -104,13 +101,13 @@ else
 $stderr = '';
 $result = $node->psql(
 	'postgres',
-	q[BEGIN; SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_xact_target'); ROLLBACK;],
+	q[BEGIN; CREATE BRANCH dbbranch_xact_target FROM DATABASE dbbranch_source; ROLLBACK;],
 	stderr => \$stderr);
 
 is($result, 3, 'db branch rejects explicit transaction block');
 like(
 	$stderr,
-	qr/CREATE DATABASE BRANCH cannot run inside a transaction block/,
+	qr/CREATE BRANCH cannot run inside a transaction block/,
 	'db branch reports transaction block restriction');
 
 my $xact_branch_count = $node->safe_psql(
@@ -121,6 +118,31 @@ is($xact_branch_count, '0', 'transaction-block rejection creates no branch datab
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 is(scalar @metadata_files, 1, 'transaction-block rejection writes no metadata file');
 
+$node->safe_psql('postgres', q[
+CREATE FUNCTION dbbranch_wrapper() RETURNS oid LANGUAGE sql AS $$
+  SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_func_target')
+$$;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[SELECT dbbranch_wrapper();],
+	stderr => \$stderr);
+
+is($result, 3, 'disabled SQL wrapper cannot create a branch');
+like(
+	$stderr,
+	qr/pg_create_database_branch\(\) is disabled; use CREATE BRANCH instead/,
+	'disabled SQL wrapper reports CREATE BRANCH replacement');
+
+my $func_branch_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_func_target';]);
+is($func_branch_count, '0', 'disabled SQL wrapper creates no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 1, 'disabled SQL wrapper writes no metadata file');
+
 my $tablespace_dir = $node->basedir . '/dbbranch_ts';
 mkdir($tablespace_dir) or die "could not create $tablespace_dir: $!";
 $node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_ts LOCATION '$tablespace_dir';");
@@ -129,7 +151,7 @@ $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_ts_source TABLESPACE dbbr
 $stderr = '';
 $result = $node->psql(
 	'postgres',
-	q[SELECT pg_create_database_branch('dbbranch_ts_source', 'dbbranch_ts_target');],
+	q[CREATE BRANCH dbbranch_ts_target FROM DATABASE dbbranch_ts_source],
 	stderr => \$stderr);
 
 is($result, 3, 'db branch rejects non-default source tablespace');
@@ -170,7 +192,7 @@ $writer->query_safe(q[BEGIN; INSERT INTO users VALUES (3, 'carol');]);
 $stderr = '';
 $result = $node->psql(
 	'postgres',
-	q[SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_busy_target');],
+	q[CREATE BRANCH dbbranch_busy_target FROM DATABASE dbbranch_source],
 	stderr => \$stderr);
 
 is($result, 3, 'db branch internal entry rejects busy source database');
