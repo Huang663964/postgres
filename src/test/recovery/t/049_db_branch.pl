@@ -108,6 +108,16 @@ if ($result == 0)
 		'dbbranch_source',
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
 	is($source_after_branch_write, '1:alice,2:bob', 'branch writes do not affect source');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_target;]);
+	my $catalog_after_drop = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_dbbranch WHERE branch_db_oid = ]
+		  . $branch_oid
+		  . q[ OR source_db_oid = ]
+		  . $branch_oid
+		  . q[;]);
+	is($catalog_after_drop, '0', 'dropping branch removes pg_dbbranch metadata');
 }
 else
 {

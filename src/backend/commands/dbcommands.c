@@ -173,6 +173,7 @@ static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
 static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid);
+static void DeleteDBBranchCatalogForDatabase(Oid dboid);
 static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 								  const char *status, const char *failure);
@@ -1847,6 +1848,11 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	DropSetting(db_id, InvalidOid);
 
 	/*
+	 * Remove DB Branch metadata involving this database.
+	 */
+	DeleteDBBranchCatalogForDatabase(db_id);
+
+	/*
 	 * Remove shared dependency references for the database.
 	 */
 	dropDatabaseDependencies(db_id);
@@ -2814,7 +2820,10 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 }
 
 
-/* ponytail: flat file metadata until pg_dbbranch catalog exists. */
+/*
+ * ponytail: flat file keeps failure diagnostics; pg_dbbranch records
+ * committed READY rows.
+ */
 static void
 WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 					  const char *branch_name, XLogRecPtr redo_ptr,
@@ -3151,6 +3160,39 @@ LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid)
 	XLogRegisterData(&xlrec, sizeof(xl_dbase_create_file_copy_rec));
 	(void) XLogInsert(RM_DBASE_ID,
 						  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
+}
+
+static void
+DeleteDBBranchCatalogForDatabase(Oid dboid)
+{
+	Relation	relation;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+
+	relation = table_open(DbBranchRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_dbbranch_branch_db_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(dboid));
+	scan = systable_beginscan(relation, DbBranchBranchIndexId, true,
+						  NULL, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		CatalogTupleDelete(relation, &tuple->t_self);
+	systable_endscan(scan);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_dbbranch_source_db_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(dboid));
+	scan = systable_beginscan(relation, DbBranchSourceIndexId, true,
+						  NULL, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		CatalogTupleDelete(relation, &tuple->t_self);
+	systable_endscan(scan);
+
+	table_close(relation, RowExclusiveLock);
 }
 
 static void
