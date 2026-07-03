@@ -21,7 +21,11 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/fs.h>
+#endif
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -49,6 +53,7 @@
 #include "commands/defrem.h"
 #include "commands/seclabel.h"
 #include "commands/tablespace.h"
+#include "common/file_utils.h"
 #include "common/file_perm.h"
 #include "common/hashfn.h"
 #include "mb/pg_wchar.h"
@@ -142,8 +147,13 @@ static void CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid,
 static void recovery_create_dbdir(char *path, bool only_tblspc);
 static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *branch_name, XLogRecPtr redo_ptr,
-								  XLogRecPtr branch_lsn, const char *status,
+								  XLogRecPtr branch_lsn, const char *clone_path,
+								  const char *status_history, const char *status,
 								  const char *failure);
+static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
+								   char *failure, Size failure_len);
+static bool CloneDBBranchFile(const char *fromfile, const char *tofile,
+							  char *failure, Size failure_len);
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -2783,7 +2793,8 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 static void
 WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 					  const char *branch_name, XLogRecPtr redo_ptr,
-					  XLogRecPtr branch_lsn, const char *status,
+					  XLogRecPtr branch_lsn, const char *clone_path,
+					  const char *status_history, const char *status,
 					  const char *failure)
 {
 	char		path[MAXPGPATH];
@@ -2808,12 +2819,13 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "branch_name=%s\n"
 			 "redo_ptr=%X/%X\n"
 			 "branch_lsn=%X/%X\n"
-			 "status_history=CREATING,%s\n"
+			 "clone_path=%s\n"
+			 "status_history=%s\n"
 			 "status=%s\n"
 			 "failure=%s\n",
 			 source_dboid, source_name, branch_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
-			 status, status, failure) >= 0;
+			 clone_path ? clone_path : "", status_history, status, failure) >= 0;
 
 	if (ferror(file))
 		ok = false;
@@ -2830,6 +2842,133 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 }
 
 
+static bool
+CloneDBBranchFile(const char *fromfile, const char *tofile,
+				  char *failure, Size failure_len)
+{
+#if defined(__linux__) && defined(FICLONE)
+	int			srcfd;
+	int			dstfd;
+	int			save_errno;
+
+	srcfd = OpenTransientFile(fromfile, O_RDONLY | PG_BINARY);
+	if (srcfd < 0)
+	{
+		snprintf(failure, failure_len, "could not open file \"%s\": %s",
+				 fromfile, strerror(errno));
+		return false;
+	}
+
+	dstfd = OpenTransientFile(tofile, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY);
+	if (dstfd < 0)
+	{
+		save_errno = errno;
+		CloseTransientFile(srcfd);
+		snprintf(failure, failure_len, "could not create file \"%s\": %s",
+				 tofile, strerror(save_errno));
+		return false;
+	}
+
+	if (ioctl(dstfd, FICLONE, srcfd) < 0)
+	{
+		save_errno = errno;
+		CloseTransientFile(dstfd);
+		CloseTransientFile(srcfd);
+		snprintf(failure, failure_len, "db_branch storage clone requires FICLONE: %s",
+				 strerror(save_errno));
+		return false;
+	}
+
+	if (CloseTransientFile(dstfd) != 0)
+	{
+		snprintf(failure, failure_len, "could not close file \"%s\": %s",
+				 tofile, strerror(errno));
+		CloseTransientFile(srcfd);
+		return false;
+	}
+	if (CloseTransientFile(srcfd) != 0)
+	{
+		snprintf(failure, failure_len, "could not close file \"%s\": %s",
+				 fromfile, strerror(errno));
+		return false;
+	}
+
+	return true;
+#else
+	snprintf(failure, failure_len, "db_branch storage clone requires FICLONE");
+	return false;
+#endif
+}
+
+static bool
+CloneDBBranchDirectory(const char *fromdir, const char *todir,
+					   char *failure, Size failure_len)
+{
+	DIR		   *xldir;
+	struct dirent *xlde;
+	char		fromfile[MAXPGPATH * 2];
+	char		tofile[MAXPGPATH * 2];
+
+#if !(defined(__linux__) && defined(FICLONE))
+	snprintf(failure, failure_len, "db_branch storage clone requires FICLONE");
+	return false;
+#endif
+
+	if (MakePGDirectory(todir) != 0)
+	{
+		snprintf(failure, failure_len, "could not create directory \"%s\": %s",
+				 todir, strerror(errno));
+		return false;
+	}
+
+	xldir = AllocateDir(fromdir);
+	if (xldir == NULL)
+	{
+		snprintf(failure, failure_len, "could not open directory \"%s\": %s",
+				 fromdir, strerror(errno));
+		return false;
+	}
+
+	while ((xlde = ReadDir(xldir, fromdir)) != NULL)
+	{
+		PGFileType	xlde_type;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (strcmp(xlde->d_name, ".") == 0 ||
+			strcmp(xlde->d_name, "..") == 0)
+			continue;
+
+		snprintf(fromfile, sizeof(fromfile), "%s/%s", fromdir, xlde->d_name);
+		snprintf(tofile, sizeof(tofile), "%s/%s", todir, xlde->d_name);
+
+		xlde_type = get_dirent_type(fromfile, xlde, false, ERROR);
+		if (xlde_type == PGFILETYPE_DIR)
+		{
+			if (!CloneDBBranchDirectory(fromfile, tofile, failure, failure_len))
+			{
+				FreeDir(xldir);
+				return false;
+			}
+		}
+		else if (xlde_type == PGFILETYPE_REG)
+		{
+			if (!CloneDBBranchFile(fromfile, tofile, failure, failure_len))
+			{
+				FreeDir(xldir);
+				return false;
+			}
+		}
+	}
+	FreeDir(xldir);
+
+	if (enableFsync)
+		fsync_fname(todir, true);
+
+	return true;
+}
+
+
 Datum
 pg_create_database_branch(PG_FUNCTION_ARGS)
 {
@@ -2843,7 +2982,10 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	int		npreparedxacts;
 	XLogRecPtr redo_ptr;
 	XLogRecPtr branch_lsn;
-	const char *failure = "db_branch internal create entry not implemented yet";
+	uint32		branch_hash;
+	char		srcpath[MAXPGPATH];
+	char		clone_path[MAXPGPATH];
+	char		failure[MAXPGPATH * 2];
 
 	source_dboid = get_database_oid(source_name, false);
 
@@ -2858,8 +3000,8 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 		const char *busy_failure = "source database is being accessed by other users";
 
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  InvalidXLogRecPtr, InvalidXLogRecPtr,
-						  "FAILED", busy_failure);
+						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
+						  "CREATING,FAILED", "FAILED", busy_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("source database \"%s\" is being accessed by other users",
@@ -2871,8 +3013,25 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	branch_lsn = GetXLogInsertRecPtr();
 	XLogFlush(branch_lsn);
 
+	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
+	snprintf(srcpath, sizeof(srcpath), "base/%u", source_dboid);
+	snprintf(clone_path, sizeof(clone_path), "base/pg_dbbranch_%u_%08x",
+			 source_dboid, (unsigned int) branch_hash);
+
+	if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
+	{
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "CREATING,COPYING,FAILED", "FAILED", failure);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s", failure)));
+	}
+
+	snprintf(failure, sizeof(failure), "db_branch replay not implemented yet");
 	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-					  redo_ptr, branch_lsn, "FAILED", failure);
+					  redo_ptr, branch_lsn, clone_path,
+					  "CREATING,COPYING,FAILED", "FAILED", failure);
 
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
