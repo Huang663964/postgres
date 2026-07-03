@@ -58,4 +58,44 @@ my $branch_count = $node->safe_psql(
 	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target';]);
 is($branch_count, '0', 'failed branch is not connectable');
 
+my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
+$writer->query_safe(q[BEGIN; INSERT INTO users VALUES (3, 'carol');]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_busy_target');],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch internal entry rejects busy source database');
+like(
+	$stderr,
+	qr/source database "dbbranch_source" is being accessed by other users/,
+	'conservative source drain blocks active writer');
+
+$writer->query_safe('ROLLBACK;');
+$writer->quit;
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 2, 'busy branch attempt writes separate metadata file');
+
+my $busy_metadata = '';
+for my $path (@metadata_files)
+{
+	open my $fh, '<', $path or die "could not open $path: $!";
+	my $contents = do { local $/; <$fh> };
+	close $fh;
+	if ($contents =~ /^branch_name=dbbranch_busy_target$/m)
+	{
+		$busy_metadata = $contents;
+		last;
+	}
+}
+
+like($busy_metadata, qr/^status=FAILED$/m, 'busy source metadata final state is FAILED');
+like(
+	$busy_metadata,
+	qr/^failure=source database is being accessed by other users$/m,
+	'busy source metadata records drain failure');
+
 done_testing();

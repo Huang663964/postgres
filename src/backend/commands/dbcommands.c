@@ -2832,6 +2832,8 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	const char *branch_name = NameStr(*branch);
 
 	Oid		source_dboid;
+	int		notherbackends;
+	int		npreparedxacts;
 	const char *failure = "db_branch internal create entry not implemented yet";
 
 	source_dboid = get_database_oid(source_name, false);
@@ -2840,6 +2842,20 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_DATABASE),
 				 errmsg("database \"%s\" already exists", branch_name)));
+
+	/* ponytail: full backend drain first; relax to writer-only gate later. */
+	if (CountOtherDBBackends(source_dboid, &notherbackends, &npreparedxacts))
+	{
+		const char *busy_failure = "source database is being accessed by other users";
+
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  "FAILED", busy_failure);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("source database \"%s\" is being accessed by other users",
+						source_name),
+				 errdetail_busy_db(notherbackends, npreparedxacts)));
+	}
 
 	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 					  "FAILED", failure);
