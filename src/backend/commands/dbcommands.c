@@ -62,6 +62,7 @@
 #include "postmaster/bgwriter.h"
 #include "replication/slot.h"
 #include "storage/copydir.h"
+#include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -152,6 +153,14 @@ static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *status_history, const char *status,
 								  const char *failure);
 static bool CleanupDBBranchClonePath(const char *clone_path);
+static Oid InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
+								   const char *clone_path,
+								   int src_encoding, bool src_hasloginevt,
+								   TransactionId src_frozenxid, MultiXactId src_minmxid,
+								   Oid src_deftablespace, char *src_collate,
+								   char *src_ctype, char *src_locale,
+								   char *src_icurules, char src_locprovider,
+								   char *src_collversion);
 static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
 								   char *failure, Size failure_len);
 static bool CloneDBBranchFile(const char *fromfile, const char *tofile,
@@ -2858,6 +2867,106 @@ CleanupDBBranchClonePath(const char *clone_path)
 	return rmtree(clone_path, true);
 }
 
+static Oid
+InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
+						const char *clone_path,
+						int src_encoding, bool src_hasloginevt,
+						TransactionId src_frozenxid, MultiXactId src_minmxid,
+						Oid src_deftablespace, char *src_collate, char *src_ctype,
+						char *src_locale, char *src_icurules,
+						char src_locprovider, char *src_collversion)
+{
+	Relation	pg_database_rel;
+	HeapTuple	tuple;
+	Datum		new_record[Natts_pg_database] = {0};
+	bool		new_record_nulls[Natts_pg_database] = {0};
+	Oid			dboid;
+	char	   *dstpath;
+	createdb_failure_params fparms;
+
+	if (src_deftablespace != DEFAULTTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("db_branch currently supports only pg_default tablespace")));
+
+	pg_database_rel = table_open(DatabaseRelationId, RowExclusiveLock);
+	do
+	{
+		dboid = GetNewOidWithIndex(pg_database_rel, DatabaseOidIndexId,
+								   Anum_pg_database_oid);
+	} while (check_db_file_conflict(dboid));
+
+	dstpath = GetDatabasePath(dboid, src_deftablespace);
+
+	new_record[Anum_pg_database_oid - 1] = ObjectIdGetDatum(dboid);
+	new_record[Anum_pg_database_datname - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(branch_name));
+	new_record[Anum_pg_database_datdba - 1] = ObjectIdGetDatum(GetUserId());
+	new_record[Anum_pg_database_encoding - 1] = Int32GetDatum(src_encoding);
+	new_record[Anum_pg_database_datlocprovider - 1] = CharGetDatum(src_locprovider);
+	new_record[Anum_pg_database_datistemplate - 1] = BoolGetDatum(false);
+	new_record[Anum_pg_database_datallowconn - 1] = BoolGetDatum(true);
+	new_record[Anum_pg_database_dathasloginevt - 1] = BoolGetDatum(src_hasloginevt);
+	new_record[Anum_pg_database_datconnlimit - 1] = Int32GetDatum(DATCONNLIMIT_UNLIMITED);
+	new_record[Anum_pg_database_datfrozenxid - 1] = TransactionIdGetDatum(src_frozenxid);
+	new_record[Anum_pg_database_datminmxid - 1] = TransactionIdGetDatum(src_minmxid);
+	new_record[Anum_pg_database_dattablespace - 1] = ObjectIdGetDatum(src_deftablespace);
+	new_record[Anum_pg_database_datcollate - 1] = CStringGetTextDatum(src_collate);
+	new_record[Anum_pg_database_datctype - 1] = CStringGetTextDatum(src_ctype);
+	if (src_locale)
+		new_record[Anum_pg_database_datlocale - 1] = CStringGetTextDatum(src_locale);
+	else
+		new_record_nulls[Anum_pg_database_datlocale - 1] = true;
+	if (src_icurules)
+		new_record[Anum_pg_database_daticurules - 1] = CStringGetTextDatum(src_icurules);
+	else
+		new_record_nulls[Anum_pg_database_daticurules - 1] = true;
+	if (src_collversion)
+		new_record[Anum_pg_database_datcollversion - 1] = CStringGetTextDatum(src_collversion);
+	else
+		new_record_nulls[Anum_pg_database_datcollversion - 1] = true;
+	new_record_nulls[Anum_pg_database_datacl - 1] = true;
+
+	tuple = heap_form_tuple(RelationGetDescr(pg_database_rel),
+							new_record, new_record_nulls);
+	CatalogTupleInsert(pg_database_rel, tuple);
+	heap_freetuple(tuple);
+
+	recordDependencyOnOwner(DatabaseRelationId, dboid, GetUserId());
+	copyTemplateDependencies(source_dboid, dboid);
+	InvokeObjectPostCreateHook(DatabaseRelationId, dboid, 0);
+
+	fparms.src_dboid = source_dboid;
+	fparms.dest_dboid = dboid;
+	fparms.strategy = CREATEDB_FILE_COPY;
+
+	PG_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
+							PointerGetDatum(&fparms));
+	{
+		if (rename(clone_path, dstpath) != 0)
+		{
+			int			save_errno = errno;
+
+			(void) CleanupDBBranchClonePath(clone_path);
+			errno = save_errno;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not rename directory \"%s\" to \"%s\": %m",
+							clone_path, dstpath)));
+		}
+
+		fsync_fname(dstpath, true);
+		fsync_fname("base", true);
+		table_close(pg_database_rel, NoLock);
+		ForceSyncCommit();
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
+								PointerGetDatum(&fparms));
+
+	pfree(dstpath);
+	return dboid;
+}
+
 
 static bool
 CloneDBBranchFile(const char *fromfile, const char *tofile,
@@ -2995,6 +3104,21 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	const char *branch_name = NameStr(*branch);
 
 	Oid		source_dboid;
+	int		source_encoding;
+	bool		source_istemplate;
+	bool		source_allowconn;
+	bool		source_hasloginevt;
+	TransactionId source_frozenxid;
+	MultiXactId source_minmxid;
+	Oid		source_deftablespace;
+	char	   *source_collate;
+	char	   *source_ctype;
+	char	   *source_locale;
+	char	   *source_icurules;
+	char		source_locprovider;
+	char	   *source_collversion;
+	Oid		branch_dboid;
+	const char *clone_result = "done";
 	int		notherbackends;
 	int		npreparedxacts;
 	XLogRecPtr redo_ptr;
@@ -3003,8 +3127,35 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	char		srcpath[MAXPGPATH];
 	char		clone_path[MAXPGPATH];
 	char		failure[MAXPGPATH * 2];
+	const char *ficlone_required = "db_branch storage clone requires FICLONE";
 
-	source_dboid = get_database_oid(source_name, false);
+	if (!get_db_info(source_name, ShareLock,
+					 &source_dboid, NULL, &source_encoding,
+					 &source_istemplate, &source_allowconn, &source_hasloginevt,
+					 &source_frozenxid, &source_minmxid,
+					 &source_deftablespace, &source_collate, &source_ctype,
+					 &source_locale, &source_icurules, &source_locprovider,
+					 &source_collversion))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_DATABASE),
+				 errmsg("source database \"%s\" does not exist", source_name)));
+
+	if (!have_createdb_privilege())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to create database")));
+	if (!source_istemplate &&
+		!object_ownercheck(DatabaseRelationId, source_dboid, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to copy database \"%s\"",
+						source_name)));
+
+	if (!source_allowconn)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("source database \"%s\" is not accepting connections",
+						source_name)));
 
 	if (OidIsValid(get_database_oid(branch_name, true)))
 		ereport(ERROR,
@@ -3030,6 +3181,7 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	redo_ptr = GetRedoRecPtr();
 	branch_lsn = GetXLogInsertRecPtr();
 	XLogFlush(branch_lsn);
+	FlushDatabaseBuffers(source_dboid);
 
 	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
 	snprintf(srcpath, sizeof(srcpath), "base/%u", source_dboid);
@@ -3040,36 +3192,39 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	{
 		bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
 
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  redo_ptr, branch_lsn, clone_path,
-						  "failed", cleanup_ok ? "done" : "failed",
-						  "CREATING,COPYING,FAILED", "FAILED", failure);
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("%s", failure)));
+		if (strncmp(failure, ficlone_required, strlen(ficlone_required)) == 0 &&
+			cleanup_ok)
+		{
+			/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
+			copydir(srcpath, clone_path, false);
+			clone_result = "copy_fallback";
+		}
+		else
+		{
+			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+							  redo_ptr, branch_lsn, clone_path,
+							  "failed", cleanup_ok ? "done" : "failed",
+							  "CREATING,COPYING,FAILED", "FAILED", failure);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s", failure)));
+		}
 	}
 
-	snprintf(failure, sizeof(failure), "db_branch replay not implemented yet");
-	if (CleanupDBBranchClonePath(clone_path))
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  redo_ptr, branch_lsn, clone_path,
-						  "done", "done",
-						  "CREATING,COPYING,FAILED", "FAILED", failure);
-	else
-	{
-		snprintf(failure, sizeof(failure), "db_branch cleanup failed for \"%s\"",
-				 clone_path);
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  redo_ptr, branch_lsn, clone_path,
-						  "done", "failed",
-						  "CREATING,COPYING,FAILED", "FAILED", failure);
-	}
+	branch_dboid = InstallDBBranchDatabase(source_dboid, branch_name, clone_path,
+									   source_encoding, source_hasloginevt,
+									   source_frozenxid, source_minmxid,
+									   source_deftablespace, source_collate,
+									   source_ctype, source_locale,
+									   source_icurules, source_locprovider,
+									   source_collversion);
 
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("%s", failure)));
+	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+					  redo_ptr, branch_lsn, clone_path,
+					  clone_result, "not_needed",
+					  "CREATING,COPYING,READY", "READY", "");
 
-	PG_RETURN_VOID();
+	PG_RETURN_OID(branch_dboid);
 }
 
 

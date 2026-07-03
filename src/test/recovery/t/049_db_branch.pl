@@ -1,8 +1,7 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Prototype harness for DB Branch.  This starts with the smallest real PG
-# surface: a callable internal entry that validates names, then fails before
-# branch creation until the freeze/clone/replay steps are implemented.
+# Prototype harness for DB Branch.  The primary path creates a real,
+# connectable branch when the filesystem supports FICLONE.
 
 use strict;
 use warnings FATAL => 'all';
@@ -28,20 +27,16 @@ my $source_rows = $node->safe_psql(
 	'SELECT count(*) FROM users;');
 is($source_rows, '2', 'source database baseline is ready for DB Branch');
 
+my $stdout = '';
 my $stderr = '';
 my $result = $node->psql(
 	'postgres',
 	q[SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_target');],
+	stdout => \$stdout,
 	stderr => \$stderr);
 
-is($result, 3, 'db branch internal entry rejects before replay is implemented');
-like(
-	$stderr,
-	qr/(db_branch replay not implemented yet|db_branch storage clone requires FICLONE|db_branch cleanup failed)/,
-	'internal entry reaches the DB Branch storage, cleanup, or replay boundary');
-
 my @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 1, 'failed branch creation writes one metadata file');
+is(scalar @metadata_files, 1, 'branch creation writes one metadata file');
 
 open my $metadata_fh, '<', $metadata_files[0]
   or die "could not open $metadata_files[0]: $!";
@@ -55,28 +50,56 @@ unlike($metadata, qr/^redo_ptr=0\/0$/m, 'redo pointer is valid');
 like($metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m, 'metadata records branch LSN');
 unlike($metadata, qr/^branch_lsn=0\/0$/m, 'branch LSN is valid');
 like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
-like($metadata, qr/^clone_result=(done|failed)$/m, 'metadata records storage clone result');
-like($metadata, qr/^cleanup=done$/m, 'metadata records failed clone cleanup');
-like($metadata, qr/^status_history=CREATING,COPYING,FAILED$/m, 'metadata records CREATING to COPY failed transition');
-like($metadata, qr/^status=FAILED$/m, 'metadata final state is FAILED');
-like(
-	$metadata,
-	qr/^failure=(db_branch replay not implemented yet|db_branch storage clone requires FICLONE.*)$/m,
-	'metadata records storage or replay failure');
 
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
-my ($clone_result) = $metadata =~ /^clone_result=(.+)$/m;
-my ($failure) = $metadata =~ /^failure=(.+)$/m;
-is(
-	$clone_result,
-	$failure eq 'db_branch replay not implemented yet' ? 'done' : 'failed',
-	'clone result matches the failure boundary');
-ok(!-e $node->data_dir . '/' . $clone_path, 'failed branch cleanup removes clone staging path');
+if ($result == 0)
+{
+	like($stdout, qr/^\s*[0-9]+\s*$/m, 'db branch function returns branch database oid');
+	like($metadata, qr/^clone_result=(done|copy_fallback)$/m, 'metadata records storage clone success');
+	like($metadata, qr/^cleanup=not_needed$/m, 'metadata records no failed clone cleanup needed');
+	like($metadata, qr/^status_history=CREATING,COPYING,READY$/m, 'metadata records READY transition');
+	like($metadata, qr/^status=READY$/m, 'metadata final state is READY');
+	like($metadata, qr/^failure=$/m, 'metadata records no failure');
+	ok(!-e $node->data_dir . '/' . $clone_path, 'clone staging path is installed, not left behind');
 
-my $branch_count = $node->safe_psql(
-	'postgres',
-	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target';]);
-is($branch_count, '0', 'failed branch is not connectable');
+	my $branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target' AND datallowconn;]);
+	is($branch_count, '1', 'ready branch is connectable');
+
+	my $branch_rows = $node->safe_psql(
+		'dbbranch_target',
+		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
+	is($branch_rows, '1:alice,2:bob', 'ready branch can read cloned source rows');
+
+	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (3, 'dora');]);
+	my $source_after_branch_write = $node->safe_psql(
+		'dbbranch_source',
+		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
+	is($source_after_branch_write, '1:alice,2:bob', 'branch writes do not affect source');
+}
+else
+{
+	is($result, 3, 'db branch fails explicitly when FICLONE is unavailable');
+	like(
+		$stderr,
+		qr/db_branch/,
+		'internal entry reports storage clone failure');
+	like($metadata, qr/^clone_result=failed$/m, 'metadata records storage clone failure');
+	like($metadata, qr/^cleanup=done$/m, 'metadata records failed clone cleanup');
+	like($metadata, qr/^status_history=CREATING,COPYING,FAILED$/m, 'metadata records failed transition');
+	like($metadata, qr/^status=FAILED$/m, 'metadata final state is FAILED');
+	like(
+		$metadata,
+		qr/^failure=.+$/m,
+		'metadata records storage clone failure');
+	ok(!-e $node->data_dir . '/' . $clone_path, 'failed branch cleanup removes clone staging path');
+
+	my $branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target';]);
+	is($branch_count, '0', 'failed branch is not connectable');
+}
 
 my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
 $writer->query_safe(q[BEGIN; INSERT INTO users VALUES (3, 'carol');]);
