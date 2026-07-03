@@ -29,6 +29,7 @@
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
@@ -307,6 +308,7 @@ IsSharedRelation(Oid relationId)
 	if (relationId == AuthIdRelationId ||
 		relationId == AuthMemRelationId ||
 		relationId == DatabaseRelationId ||
+		relationId == DbBranchRelationId ||
 		relationId == DbRoleSettingRelationId ||
 		relationId == ParameterAclRelationId ||
 		relationId == ReplicationOriginRelationId ||
@@ -325,6 +327,8 @@ IsSharedRelation(Oid relationId)
 		relationId == AuthMemGrantorIndexId ||
 		relationId == DatabaseNameIndexId ||
 		relationId == DatabaseOidIndexId ||
+		relationId == DbBranchBranchIndexId ||
+		relationId == DbBranchSourceIndexId ||
 		relationId == DbRoleSettingDatidRolidIndexId ||
 		relationId == ParameterAclOidIndexId ||
 		relationId == ParameterAclParnameIndexId ||

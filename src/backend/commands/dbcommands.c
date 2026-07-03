@@ -44,6 +44,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
@@ -72,6 +73,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/pg_lsn.h"
 #include "utils/pg_locale.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
@@ -171,6 +173,9 @@ static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
 static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid);
+static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
+								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
+								  const char *status, const char *failure);
 static bool SourceDatabaseHasUnloggedRelations(Oid source_dboid,
 										 Oid source_deftablespace,
 										 char *srcpath);
@@ -3148,6 +3153,30 @@ LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid)
 						  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
 }
 
+static void
+InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
+					  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
+					  const char *status, const char *failure)
+{
+	Relation	relation;
+	HeapTuple	tuple;
+	Datum		values[Natts_pg_dbbranch] = {0};
+	bool		nulls[Natts_pg_dbbranch] = {0};
+
+	values[Anum_pg_dbbranch_source_db_oid - 1] = ObjectIdGetDatum(source_dboid);
+	values[Anum_pg_dbbranch_branch_db_oid - 1] = ObjectIdGetDatum(branch_dboid);
+	values[Anum_pg_dbbranch_redo_ptr - 1] = LSNGetDatum(redo_ptr);
+	values[Anum_pg_dbbranch_branch_lsn - 1] = LSNGetDatum(branch_lsn);
+	values[Anum_pg_dbbranch_status - 1] = CStringGetTextDatum(status);
+	values[Anum_pg_dbbranch_failure - 1] = CStringGetTextDatum(failure);
+
+	relation = table_open(DbBranchRelationId, RowExclusiveLock);
+	tuple = heap_form_tuple(RelationGetDescr(relation), values, nulls);
+	CatalogTupleInsert(relation, tuple);
+	heap_freetuple(tuple);
+	table_close(relation, RowExclusiveLock);
+}
+
 static bool
 SourceDatabaseHasUnloggedRelations(Oid source_dboid, Oid source_deftablespace,
 								   char *srcpath)
@@ -3330,6 +3359,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 									   source_collversion);
 
 	LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
+	InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
+					  "READY", "");
 	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 					  CHECKPOINT_WAIT);
 	ReleaseDBBranchWalPin();

@@ -71,6 +71,12 @@ if ($result == 0)
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
 	is($branch_rows, '1:alice,2:bob', 'ready branch can read cloned source rows');
 
+	my $source_oid = $node->safe_psql(
+		'postgres',
+		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_source';]);
+	my $branch_oid = $node->safe_psql(
+		'postgres',
+		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_target';]);
 	my $source_locator = $node->safe_psql(
 		'postgres',
 		q[SELECT dattablespace || '/' || oid FROM pg_database WHERE datname = 'dbbranch_source';]);
@@ -79,6 +85,14 @@ if ($result == 0)
 		q[SELECT dattablespace || '/' || oid FROM pg_database WHERE datname = 'dbbranch_target';]);
 	my $wal_end = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
 	my $waldump = '';
+	my $catalog_state = $node->safe_psql(
+		'postgres',
+		q[SELECT status || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
+	is(
+		$catalog_state,
+		'READY|' . $source_oid . '|' . $branch_oid . '|true|true|',
+		'pg_dbbranch records READY branch metadata');
+
 	ok(
 		PostgreSQL::Test::Utils::run_log(
 			[ 'pg_waldump', '-p', $node->data_dir, '-r', 'Database', '-s', $wal_start, '-e', $wal_end ],

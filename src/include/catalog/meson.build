@@ -36,6 +36,7 @@ catalog_headers = [
   'pg_conversion.h',
   'pg_depend.h',
   'pg_database.h',
+  'pg_dbbranch.h',
   'pg_db_role_setting.h',
   'pg_tablespace.h',
   'pg_authid.h',
