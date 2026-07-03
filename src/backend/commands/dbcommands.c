@@ -3129,6 +3129,9 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	char		failure[MAXPGPATH * 2];
 	const char *ficlone_required = "db_branch storage clone requires FICLONE";
 
+	/* ponytail: SQL-callable prototype; a real command should pass isTopLevel. */
+	PreventInTransactionBlock(true, "CREATE DATABASE BRANCH");
+
 	if (!get_db_info(source_name, ShareLock,
 					 &source_dboid, NULL, &source_encoding,
 					 &source_istemplate, &source_allowconn, &source_hasloginevt,

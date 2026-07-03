@@ -101,6 +101,26 @@ else
 	is($branch_count, '0', 'failed branch is not connectable');
 }
 
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[BEGIN; SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_xact_target'); ROLLBACK;],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects explicit transaction block');
+like(
+	$stderr,
+	qr/CREATE DATABASE BRANCH cannot run inside a transaction block/,
+	'db branch reports transaction block restriction');
+
+my $xact_branch_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_xact_target';]);
+is($xact_branch_count, '0', 'transaction-block rejection creates no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 1, 'transaction-block rejection writes no metadata file');
+
 my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
 $writer->query_safe(q[BEGIN; INSERT INTO users VALUES (3, 'carol');]);
 
