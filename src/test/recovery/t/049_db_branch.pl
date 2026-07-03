@@ -87,11 +87,11 @@ if ($result == 0)
 	my $waldump = '';
 	my $catalog_state = $node->safe_psql(
 		'postgres',
-		q[SELECT status || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
+		q[SELECT status || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
 	is(
 		$catalog_state,
-		'READY|' . $source_oid . '|' . $branch_oid . '|true|true|',
-		'pg_dbbranch records READY branch metadata');
+		'READY|' . $source_oid . '|' . $branch_oid . '|true|true|true|',
+		'pg_dbbranch records ordered READY branch metadata');
 
 	ok(
 		PostgreSQL::Test::Utils::run_log(

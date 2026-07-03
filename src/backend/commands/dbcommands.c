@@ -3378,7 +3378,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	}
 
 	redo_ptr = PinDBBranchWal(wal_pin_name);
-	branch_lsn = GetXLogInsertRecPtr();
+	branch_lsn = GetXLogInsertEndRecPtr();
 	XLogFlush(branch_lsn);
 	FlushDatabaseBuffers(source_dboid);
 
