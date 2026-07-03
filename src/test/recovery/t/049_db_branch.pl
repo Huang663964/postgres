@@ -193,6 +193,51 @@ like(
 my ($tablespace_clone_path) = $tablespace_metadata =~ /^clone_path=(.+)$/m;
 ok(!-e $node->data_dir . '/' . $tablespace_clone_path, 'tablespace rejection does not create clone staging path');
 
+
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_unlogged_source;');
+$node->safe_psql(
+	'dbbranch_unlogged_source',
+	q[CREATE UNLOGGED TABLE cache_entries (id int PRIMARY KEY); INSERT INTO cache_entries VALUES (1);]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_unlogged_target FROM DATABASE dbbranch_unlogged_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects unlogged source relations');
+like(
+	$stderr,
+	qr/db_branch currently does not support unlogged relations/,
+	'db branch reports unlogged relation limitation before clone');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 3, 'unlogged rejection writes separate metadata file');
+
+my $unlogged_metadata = '';
+for my $path (@metadata_files)
+{
+	open my $fh, '<', $path or die "could not open $path: $!";
+	my $contents = do { local $/; <$fh> };
+	close $fh;
+	if ($contents =~ /^branch_name=dbbranch_unlogged_target$/m)
+	{
+		$unlogged_metadata = $contents;
+		last;
+	}
+}
+
+like($unlogged_metadata, qr/^wal_pin=not_started$/m, 'unlogged metadata records WAL pin not started');
+like($unlogged_metadata, qr/^clone_result=not_started$/m, 'unlogged metadata records clone not started');
+like($unlogged_metadata, qr/^cleanup=not_started$/m, 'unlogged metadata records cleanup not started');
+like($unlogged_metadata, qr/^status=FAILED$/m, 'unlogged metadata final state is FAILED');
+like(
+	$unlogged_metadata,
+	qr/^failure=db_branch currently does not support unlogged relations$/m,
+	'unlogged metadata records limitation');
+my ($unlogged_clone_path) = $unlogged_metadata =~ /^clone_path=(.+)$/m;
+ok(!-e $node->data_dir . '/' . $unlogged_clone_path, 'unlogged rejection does not create clone staging path');
+
 my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
 $writer->query_safe(q[BEGIN; INSERT INTO users VALUES (3, 'carol');]);
 
@@ -212,7 +257,7 @@ $writer->query_safe('ROLLBACK;');
 $writer->quit;
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 3, 'busy branch attempt writes separate metadata file');
+is(scalar @metadata_files, 4, 'busy branch attempt writes separate metadata file');
 
 my $busy_metadata = '';
 for my $path (@metadata_files)

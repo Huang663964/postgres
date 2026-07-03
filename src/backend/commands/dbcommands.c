@@ -170,6 +170,9 @@ static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
+static bool SourceDatabaseHasUnloggedRelations(Oid source_dboid,
+										 Oid source_deftablespace,
+										 char *srcpath);
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -3128,6 +3131,31 @@ ReleaseDBBranchWalPin(void)
 		ReplicationSlotDropAcquired();
 }
 
+static bool
+SourceDatabaseHasUnloggedRelations(Oid source_dboid, Oid source_deftablespace,
+								   char *srcpath)
+{
+	List	   *rlocatorlist;
+	ListCell   *cell;
+	bool		has_unlogged = false;
+
+	rlocatorlist = ScanSourceDatabasePgClass(source_deftablespace,
+										 source_dboid, srcpath);
+	foreach(cell, rlocatorlist)
+	{
+		CreateDBRelInfo *relinfo = (CreateDBRelInfo *) lfirst(cell);
+
+		if (!relinfo->permanent)
+		{
+			has_unlogged = true;
+			break;
+		}
+	}
+	list_free_deep(rlocatorlist);
+
+	return has_unlogged;
+}
+
 Oid
 CreateDatabaseBranch(const char *source_name, const char *branch_name)
 {
@@ -3229,6 +3257,21 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("%s", tablespace_failure)));
+	}
+
+	if (SourceDatabaseHasUnloggedRelations(source_dboid, source_deftablespace, srcpath))
+	{
+		const char *unlogged_failure =
+			"db_branch currently does not support unlogged relations";
+
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
+						  "not_started",
+						  "not_started", "not_started",
+						  "CREATING,FAILED", "FAILED", unlogged_failure);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s", unlogged_failure)));
 	}
 
 	redo_ptr = PinDBBranchWal(wal_pin_name);
