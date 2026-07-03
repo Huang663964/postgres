@@ -2774,6 +2774,29 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 
 
 Datum
+pg_create_database_branch(PG_FUNCTION_ARGS)
+{
+	Name		source = PG_GETARG_NAME(0);
+	Name		branch = PG_GETARG_NAME(1);
+	const char *source_name = NameStr(*source);
+	const char *branch_name = NameStr(*branch);
+
+	(void) get_database_oid(source_name, false);
+
+	if (OidIsValid(get_database_oid(branch_name, true)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_DATABASE),
+				 errmsg("database \"%s\" already exists", branch_name)));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("db_branch internal create entry not implemented yet")));
+
+	PG_RETURN_VOID();
+}
+
+
+Datum
 pg_database_collation_actual_version(PG_FUNCTION_ARGS)
 {
 	Oid			dbid = PG_GETARG_OID(0);

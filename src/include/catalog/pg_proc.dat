@@ -12343,6 +12343,10 @@
   proname => 'pg_database_collation_actual_version', procost => '100',
   provolatile => 'v', prorettype => 'text', proargtypes => 'oid',
   prosrc => 'pg_database_collation_actual_version' },
+{ oid => '8000', descr => 'create a database branch from a source database',
+  proname => 'pg_create_database_branch', provolatile => 'v',
+  proparallel => 'u', prorettype => 'void', proargtypes => 'name name',
+  proargnames => '{source,branch}', prosrc => 'pg_create_database_branch' },
 
 # system management/monitoring related functions
 { oid => '3353', descr => 'list files in the log directory',

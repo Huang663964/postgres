@@ -1,8 +1,8 @@
 # Copyright (c) 2026, PostgreSQL Global Development Group
 
-# Prototype harness for DB Branch.  v0.1 only proves that the recovery TAP
-# entry exists and can prepare a source database; the branch implementation
-# starts in later v0 milestones.
+# Prototype harness for DB Branch.  This starts with the smallest real PG
+# surface: a callable internal entry that validates names, then fails before
+# branch creation until the freeze/clone/replay steps are implemented.
 
 use strict;
 use warnings FATAL => 'all';
@@ -28,17 +28,16 @@ my $source_rows = $node->safe_psql(
 	'SELECT count(*) FROM users;');
 is($source_rows, '2', 'source database baseline is ready for DB Branch');
 
-SKIP:
-{
-	skip 'db_branch internal create entry not implemented yet', 1;
+my $stderr = '';
+my $result = $node->psql(
+	'postgres',
+	q[SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_target');],
+	stderr => \$stderr);
 
-	# v0.2 will replace this skip with a call to the internal DB Branch entry.
-	# Expected final shape: create dbbranch_target from dbbranch_source and
-	# verify target rows match source at branch_lsn.
-	my $branch_rows = $node->safe_psql(
-		'dbbranch_target',
-		'SELECT count(*) FROM users;');
-	is($branch_rows, '2', 'branch matches source at branch_lsn');
-}
+is($result, 3, 'db branch internal entry rejects unfinished implementation');
+like(
+	$stderr,
+	qr/db_branch internal create entry not implemented yet/,
+	'internal entry reaches the DB Branch implementation boundary');
 
 done_testing();
