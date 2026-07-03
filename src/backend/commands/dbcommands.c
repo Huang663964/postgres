@@ -153,6 +153,7 @@ static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  XLogRecPtr branch_lsn, const char *clone_path,
 								  const char *wal_pin,
 								  const char *clone_result, const char *cleanup,
+								  const char *replay_method,
 								  const char *status_history, const char *status,
 								  const char *failure);
 static bool CleanupDBBranchClonePath(const char *clone_path);
@@ -2831,6 +2832,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 					  XLogRecPtr branch_lsn, const char *clone_path,
 					  const char *wal_pin,
 					  const char *clone_result, const char *cleanup,
+					  const char *replay_method,
 					  const char *status_history, const char *status,
 					  const char *failure)
 {
@@ -2860,13 +2862,14 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "wal_pin=%s\n"
 			 "clone_result=%s\n"
 			 "cleanup=%s\n"
+			 "replay_method=%s\n"
 			 "status_history=%s\n"
 			 "status=%s\n"
 			 "failure=%s\n",
 			 source_dboid, source_name, branch_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
 			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
-			 status_history, status, failure) >= 0;
+			 replay_method, status_history, status, failure) >= 0;
 
 	if (ferror(file))
 		ok = false;
@@ -3319,7 +3322,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
 						  "not_started",
-						  "not_started", "not_started",
+						  "not_started", "not_started", "not_started",
 						  "CREATING,FAILED", "FAILED", busy_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
@@ -3343,7 +3346,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
 						  "not_started",
-						  "not_started", "not_started",
+						  "not_started", "not_started", "not_started",
 						  "CREATING,FAILED", "FAILED", tablespace_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3358,7 +3361,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
 						  "not_started",
-						  "not_started", "not_started",
+						  "not_started", "not_started", "not_started",
 						  "CREATING,FAILED", "FAILED", unlogged_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3373,7 +3376,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
 						  "not_started",
-						  "not_started", "failed",
+						  "not_started", "failed", "not_started",
 						  "CREATING,FAILED", "FAILED", cleanup_failure);
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -3403,6 +3406,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 							  redo_ptr, branch_lsn, clone_path,
 							  "released",
 							  "failed", cleanup_ok ? "done" : "failed",
+							  "not_started",
 							  "CREATING,COPYING,FAILED", "FAILED", failure);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3427,7 +3431,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 					  redo_ptr, branch_lsn, clone_path,
 					  "released",
-					  clone_result, "not_needed",
+					  clone_result, "not_needed", "source_flush",
 					  "CREATING,COPYING,READY", "READY", "");
 
 	return branch_dboid;

@@ -50,6 +50,7 @@ like($metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m, 'metadata records branch
 unlike($metadata, qr/^branch_lsn=0\/0$/m, 'branch LSN is valid');
 like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
 like($metadata, qr/^wal_pin=released$/m, 'metadata records released WAL pin');
+like($metadata, qr/^replay_method=source_flush$/m, 'metadata records source flush replay method');
 
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
 if ($result == 0)
@@ -241,6 +242,7 @@ for my $path (@metadata_files)
 like($tablespace_metadata, qr/^wal_pin=not_started$/m, 'tablespace metadata records WAL pin not started');
 like($tablespace_metadata, qr/^clone_result=not_started$/m, 'tablespace metadata records clone not started');
 like($tablespace_metadata, qr/^cleanup=not_started$/m, 'tablespace metadata records cleanup not started');
+like($tablespace_metadata, qr/^replay_method=not_started$/m, 'tablespace metadata records replay not started');
 like($tablespace_metadata, qr/^status=FAILED$/m, 'tablespace metadata final state is FAILED');
 like(
 	$tablespace_metadata,
@@ -286,6 +288,7 @@ for my $path (@metadata_files)
 like($unlogged_metadata, qr/^wal_pin=not_started$/m, 'unlogged metadata records WAL pin not started');
 like($unlogged_metadata, qr/^clone_result=not_started$/m, 'unlogged metadata records clone not started');
 like($unlogged_metadata, qr/^cleanup=not_started$/m, 'unlogged metadata records cleanup not started');
+like($unlogged_metadata, qr/^replay_method=not_started$/m, 'unlogged metadata records replay not started');
 like($unlogged_metadata, qr/^status=FAILED$/m, 'unlogged metadata final state is FAILED');
 like(
 	$unlogged_metadata,
@@ -331,6 +334,7 @@ for my $path (@metadata_files)
 like($busy_metadata, qr/^wal_pin=not_started$/m, 'busy source metadata records WAL pin not started');
 like($busy_metadata, qr/^clone_result=not_started$/m, 'busy source metadata records clone not started');
 like($busy_metadata, qr/^cleanup=not_started$/m, 'busy source metadata records cleanup not started');
+like($busy_metadata, qr/^replay_method=not_started$/m, 'busy source metadata records replay not started');
 like($busy_metadata, qr/^status=FAILED$/m, 'busy source metadata final state is FAILED');
 like(
 	$busy_metadata,
