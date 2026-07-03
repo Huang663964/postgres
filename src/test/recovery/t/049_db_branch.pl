@@ -50,6 +50,10 @@ close $metadata_fh;
 
 like($metadata, qr/^source_db_name=dbbranch_source$/m, 'metadata records source database');
 like($metadata, qr/^branch_name=dbbranch_target$/m, 'metadata records branch database');
+like($metadata, qr/^redo_ptr=[0-9A-F]+\/[0-9A-F]+$/m, 'metadata records redo pointer');
+unlike($metadata, qr/^redo_ptr=0\/0$/m, 'redo pointer is valid');
+like($metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m, 'metadata records branch LSN');
+unlike($metadata, qr/^branch_lsn=0\/0$/m, 'branch LSN is valid');
 like($metadata, qr/^status_history=CREATING,FAILED$/m, 'metadata records CREATING to FAILED transition');
 like($metadata, qr/^status=FAILED$/m, 'metadata final state is FAILED');
 

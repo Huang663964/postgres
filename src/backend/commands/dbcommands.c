@@ -29,6 +29,7 @@
 #include "access/multixact.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
@@ -140,7 +141,8 @@ static void CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid,
 										Oid src_tsid, Oid dst_tsid);
 static void recovery_create_dbdir(char *path, bool only_tblspc);
 static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
-								  const char *branch_name, const char *status,
+								  const char *branch_name, XLogRecPtr redo_ptr,
+								  XLogRecPtr branch_lsn, const char *status,
 								  const char *failure);
 
 /*
@@ -2780,7 +2782,8 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 /* ponytail: flat file metadata until pg_dbbranch catalog exists. */
 static void
 WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
-					  const char *branch_name, const char *status,
+					  const char *branch_name, XLogRecPtr redo_ptr,
+					  XLogRecPtr branch_lsn, const char *status,
 					  const char *failure)
 {
 	char		path[MAXPGPATH];
@@ -2803,10 +2806,14 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "source_db_oid=%u\n"
 			 "source_db_name=%s\n"
 			 "branch_name=%s\n"
+			 "redo_ptr=%X/%X\n"
+			 "branch_lsn=%X/%X\n"
 			 "status_history=CREATING,%s\n"
 			 "status=%s\n"
 			 "failure=%s\n",
-			 source_dboid, source_name, branch_name, status, status, failure) >= 0;
+			 source_dboid, source_name, branch_name,
+			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
+			 status, status, failure) >= 0;
 
 	if (ferror(file))
 		ok = false;
@@ -2834,6 +2841,8 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	Oid		source_dboid;
 	int		notherbackends;
 	int		npreparedxacts;
+	XLogRecPtr redo_ptr;
+	XLogRecPtr branch_lsn;
 	const char *failure = "db_branch internal create entry not implemented yet";
 
 	source_dboid = get_database_oid(source_name, false);
@@ -2849,6 +2858,7 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 		const char *busy_failure = "source database is being accessed by other users";
 
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  InvalidXLogRecPtr, InvalidXLogRecPtr,
 						  "FAILED", busy_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
@@ -2857,8 +2867,12 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 				 errdetail_busy_db(notherbackends, npreparedxacts)));
 	}
 
+	redo_ptr = GetRedoRecPtr();
+	branch_lsn = GetXLogInsertRecPtr();
+	XLogFlush(branch_lsn);
+
 	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-					  "FAILED", failure);
+					  redo_ptr, branch_lsn, "FAILED", failure);
 
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
