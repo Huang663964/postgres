@@ -148,8 +148,10 @@ static void recovery_create_dbdir(char *path, bool only_tblspc);
 static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *branch_name, XLogRecPtr redo_ptr,
 								  XLogRecPtr branch_lsn, const char *clone_path,
+								  const char *clone_result, const char *cleanup,
 								  const char *status_history, const char *status,
 								  const char *failure);
+static bool CleanupDBBranchClonePath(const char *clone_path);
 static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
 								   char *failure, Size failure_len);
 static bool CloneDBBranchFile(const char *fromfile, const char *tofile,
@@ -2794,6 +2796,7 @@ static void
 WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 					  const char *branch_name, XLogRecPtr redo_ptr,
 					  XLogRecPtr branch_lsn, const char *clone_path,
+					  const char *clone_result, const char *cleanup,
 					  const char *status_history, const char *status,
 					  const char *failure)
 {
@@ -2820,12 +2823,15 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "redo_ptr=%X/%X\n"
 			 "branch_lsn=%X/%X\n"
 			 "clone_path=%s\n"
+			 "clone_result=%s\n"
+			 "cleanup=%s\n"
 			 "status_history=%s\n"
 			 "status=%s\n"
 			 "failure=%s\n",
 			 source_dboid, source_name, branch_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
-			 clone_path ? clone_path : "", status_history, status, failure) >= 0;
+			 clone_path ? clone_path : "", clone_result, cleanup,
+			 status_history, status, failure) >= 0;
 
 	if (ferror(file))
 		ok = false;
@@ -2839,6 +2845,17 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 
 	fsync_fname(path, false);
 	fsync_fname("global", true);
+}
+
+static bool
+CleanupDBBranchClonePath(const char *clone_path)
+{
+	struct stat statbuf;
+
+	if (stat(clone_path, &statbuf) != 0)
+		return errno == ENOENT;
+
+	return rmtree(clone_path, true);
 }
 
 
@@ -3001,6 +3018,7 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
+						  "not_started", "not_started",
 						  "CREATING,FAILED", "FAILED", busy_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
@@ -3020,8 +3038,11 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 
 	if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
 	{
+		bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
+						  "failed", cleanup_ok ? "done" : "failed",
 						  "CREATING,COPYING,FAILED", "FAILED", failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3029,9 +3050,20 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	}
 
 	snprintf(failure, sizeof(failure), "db_branch replay not implemented yet");
-	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-					  redo_ptr, branch_lsn, clone_path,
-					  "CREATING,COPYING,FAILED", "FAILED", failure);
+	if (CleanupDBBranchClonePath(clone_path))
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "done", "done",
+						  "CREATING,COPYING,FAILED", "FAILED", failure);
+	else
+	{
+		snprintf(failure, sizeof(failure), "db_branch cleanup failed for \"%s\"",
+				 clone_path);
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "done", "failed",
+						  "CREATING,COPYING,FAILED", "FAILED", failure);
+	}
 
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

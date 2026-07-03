@@ -37,8 +37,8 @@ my $result = $node->psql(
 is($result, 3, 'db branch internal entry rejects before replay is implemented');
 like(
 	$stderr,
-	qr/(db_branch replay not implemented yet|db_branch storage clone requires FICLONE)/,
-	'internal entry reaches the DB Branch storage or replay boundary');
+	qr/(db_branch replay not implemented yet|db_branch storage clone requires FICLONE|db_branch cleanup failed)/,
+	'internal entry reaches the DB Branch storage, cleanup, or replay boundary');
 
 my @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 is(scalar @metadata_files, 1, 'failed branch creation writes one metadata file');
@@ -55,6 +55,8 @@ unlike($metadata, qr/^redo_ptr=0\/0$/m, 'redo pointer is valid');
 like($metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m, 'metadata records branch LSN');
 unlike($metadata, qr/^branch_lsn=0\/0$/m, 'branch LSN is valid');
 like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
+like($metadata, qr/^clone_result=(done|failed)$/m, 'metadata records storage clone result');
+like($metadata, qr/^cleanup=done$/m, 'metadata records failed clone cleanup');
 like($metadata, qr/^status_history=CREATING,COPYING,FAILED$/m, 'metadata records CREATING to COPY failed transition');
 like($metadata, qr/^status=FAILED$/m, 'metadata final state is FAILED');
 like(
@@ -63,17 +65,13 @@ like(
 	'metadata records storage or replay failure');
 
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
+my ($clone_result) = $metadata =~ /^clone_result=(.+)$/m;
 my ($failure) = $metadata =~ /^failure=(.+)$/m;
-if ($failure eq 'db_branch replay not implemented yet')
-{
-	ok(-d $node->data_dir . '/' . $clone_path, 'FICLONE clone staging directory exists');
-	ok(-f $node->data_dir . '/' . $clone_path . '/PG_VERSION', 'FICLONE clone copied PG_VERSION');
-}
-else
-{
-	pass('FICLONE is unavailable on this filesystem and branch creation failed explicitly');
-	pass('skipped clone file checks because FICLONE is unavailable');
-}
+is(
+	$clone_result,
+	$failure eq 'db_branch replay not implemented yet' ? 'done' : 'failed',
+	'clone result matches the failure boundary');
+ok(!-e $node->data_dir . '/' . $clone_path, 'failed branch cleanup removes clone staging path');
 
 my $branch_count = $node->safe_psql(
 	'postgres',
@@ -114,6 +112,8 @@ for my $path (@metadata_files)
 	}
 }
 
+like($busy_metadata, qr/^clone_result=not_started$/m, 'busy source metadata records clone not started');
+like($busy_metadata, qr/^cleanup=not_started$/m, 'busy source metadata records cleanup not started');
 like($busy_metadata, qr/^status=FAILED$/m, 'busy source metadata final state is FAILED');
 like(
 	$busy_metadata,
