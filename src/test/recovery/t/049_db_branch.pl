@@ -118,6 +118,19 @@ if ($result == 0)
 		  . $branch_oid
 		  . q[;]);
 	is($catalog_after_drop, '0', 'dropping branch removes pg_dbbranch metadata');
+
+	mkdir($node->data_dir . '/' . $clone_path)
+	  or die "could not create stale clone path $clone_path: $!";
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_target FROM DATABASE dbbranch_source],
+		stderr => \$stderr);
+	is($result, 0, 'db branch removes stale clone staging path before retry');
+	my $retry_branch_rows = $node->safe_psql(
+		'dbbranch_target',
+		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
+	is($retry_branch_rows, '1:alice,2:bob', 'retried branch reads cloned source rows');
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_target;]);
 }
 else
 {

@@ -3362,6 +3362,21 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				 errmsg("%s", unlogged_failure)));
 	}
 
+	if (!CleanupDBBranchClonePath(clone_path))
+	{
+		const char *cleanup_failure =
+			"could not remove stale db_branch clone path";
+
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
+						  "not_started",
+						  "not_started", "failed",
+						  "CREATING,FAILED", "FAILED", cleanup_failure);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("%s \"%s\"", cleanup_failure, clone_path)));
+	}
+
 	redo_ptr = PinDBBranchWal(wal_pin_name);
 	branch_lsn = GetXLogInsertRecPtr();
 	XLogFlush(branch_lsn);
