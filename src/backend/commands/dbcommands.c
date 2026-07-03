@@ -170,6 +170,7 @@ static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
+static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid);
 static bool SourceDatabaseHasUnloggedRelations(Oid source_dboid,
 										 Oid source_deftablespace,
 										 char *srcpath);
@@ -3131,6 +3132,22 @@ ReleaseDBBranchWalPin(void)
 		ReplicationSlotDropAcquired();
 }
 
+static void
+LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid)
+{
+	xl_dbase_create_file_copy_rec xlrec;
+
+	xlrec.db_id = branch_dboid;
+	xlrec.tablespace_id = DEFAULTTABLESPACE_OID;
+	xlrec.src_db_id = source_dboid;
+	xlrec.src_tablespace_id = DEFAULTTABLESPACE_OID;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, sizeof(xl_dbase_create_file_copy_rec));
+	(void) XLogInsert(RM_DBASE_ID,
+						  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
+}
+
 static bool
 SourceDatabaseHasUnloggedRelations(Oid source_dboid, Oid source_deftablespace,
 								   char *srcpath)
@@ -3312,6 +3329,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 									   source_icurules, source_locprovider,
 									   source_collversion);
 
+	LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
+	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
+					  CHECKPOINT_WAIT);
 	ReleaseDBBranchWalPin();
 	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 					  redo_ptr, branch_lsn, clone_path,

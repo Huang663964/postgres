@@ -27,6 +27,7 @@ my $source_rows = $node->safe_psql(
 	'SELECT count(*) FROM users;');
 is($source_rows, '2', 'source database baseline is ready for DB Branch');
 
+my $wal_start = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
 my $stderr = '';
 my $result = $node->psql(
 	'postgres',
@@ -69,6 +70,24 @@ if ($result == 0)
 		'dbbranch_target',
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
 	is($branch_rows, '1:alice,2:bob', 'ready branch can read cloned source rows');
+
+	my $source_locator = $node->safe_psql(
+		'postgres',
+		q[SELECT dattablespace || '/' || oid FROM pg_database WHERE datname = 'dbbranch_source';]);
+	my $branch_locator = $node->safe_psql(
+		'postgres',
+		q[SELECT dattablespace || '/' || oid FROM pg_database WHERE datname = 'dbbranch_target';]);
+	my $wal_end = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
+	my $waldump = '';
+	ok(
+		PostgreSQL::Test::Utils::run_log(
+			[ 'pg_waldump', '-p', $node->data_dir, '-r', 'Database', '-s', $wal_start, '-e', $wal_end ],
+			'>' => \$waldump),
+		'db branch WAL can be dumped');
+	like(
+		$waldump,
+		qr/CREATE_FILE_COPY.*copy dir \Q$source_locator\E to \Q$branch_locator\E/,
+		'db branch creation records database file-copy WAL');
 
 	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (3, 'dora');]);
 	my $source_after_branch_write = $node->safe_psql(
