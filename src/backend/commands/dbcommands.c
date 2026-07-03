@@ -176,6 +176,7 @@ static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid);
 static void DeleteDBBranchCatalogForDatabase(Oid dboid);
 static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
+								  const char *replay_method,
 								  const char *status, const char *failure);
 static bool SourceDatabaseHasUnloggedRelations(Oid source_dboid,
 										 Oid source_deftablespace,
@@ -3198,6 +3199,7 @@ DeleteDBBranchCatalogForDatabase(Oid dboid)
 static void
 InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 					  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
+					  const char *replay_method,
 					  const char *status, const char *failure)
 {
 	Relation	relation;
@@ -3209,6 +3211,7 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 	values[Anum_pg_dbbranch_branch_db_oid - 1] = ObjectIdGetDatum(branch_dboid);
 	values[Anum_pg_dbbranch_redo_ptr - 1] = LSNGetDatum(redo_ptr);
 	values[Anum_pg_dbbranch_branch_lsn - 1] = LSNGetDatum(branch_lsn);
+	values[Anum_pg_dbbranch_replay_method - 1] = CStringGetTextDatum(replay_method);
 	values[Anum_pg_dbbranch_status - 1] = CStringGetTextDatum(status);
 	values[Anum_pg_dbbranch_failure - 1] = CStringGetTextDatum(failure);
 
@@ -3417,7 +3420,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 	LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
 	InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
-					  "READY", "");
+					  "source_flush", "READY", "");
 	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 					  CHECKPOINT_WAIT);
 	ReleaseDBBranchWalPin();

@@ -29,6 +29,7 @@ CATALOG(pg_dbbranch,8785,DbBranchRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	XLogRecPtr	branch_lsn;
 
 #ifdef CATALOG_VARLEN
+	text		replay_method BKI_FORCE_NOT_NULL;
 	text		status BKI_FORCE_NOT_NULL;
 	text		failure BKI_FORCE_NOT_NULL;
 #endif
