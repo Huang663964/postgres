@@ -49,6 +49,7 @@
 #include "commands/seclabel.h"
 #include "commands/tablespace.h"
 #include "common/file_perm.h"
+#include "common/hashfn.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -138,6 +139,9 @@ static void CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid,
 static void CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid,
 										Oid src_tsid, Oid dst_tsid);
 static void recovery_create_dbdir(char *path, bool only_tblspc);
+static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
+								  const char *branch_name, const char *status,
+								  const char *failure);
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -2773,6 +2777,52 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 }
 
 
+/* ponytail: flat file metadata until pg_dbbranch catalog exists. */
+static void
+WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
+					  const char *branch_name, const char *status,
+					  const char *failure)
+{
+	char		path[MAXPGPATH];
+	FILE	   *file;
+	uint32		branch_hash;
+	bool		ok;
+
+	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
+	snprintf(path, sizeof(path), "global/pg_dbbranch_%u_%08x.state",
+			 source_dboid, (unsigned int) branch_hash);
+
+	file = AllocateFile(path, PG_BINARY_W);
+	if (file == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create file \"%s\": %m", path)));
+
+	ok = fprintf(file,
+			 "version=1\n"
+			 "source_db_oid=%u\n"
+			 "source_db_name=%s\n"
+			 "branch_name=%s\n"
+			 "status_history=CREATING,%s\n"
+			 "status=%s\n"
+			 "failure=%s\n",
+			 source_dboid, source_name, branch_name, status, status, failure) >= 0;
+
+	if (ferror(file))
+		ok = false;
+	if (FreeFile(file))
+		ok = false;
+
+	if (!ok)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", path)));
+
+	fsync_fname(path, false);
+	fsync_fname("global", true);
+}
+
+
 Datum
 pg_create_database_branch(PG_FUNCTION_ARGS)
 {
@@ -2781,16 +2831,22 @@ pg_create_database_branch(PG_FUNCTION_ARGS)
 	const char *source_name = NameStr(*source);
 	const char *branch_name = NameStr(*branch);
 
-	(void) get_database_oid(source_name, false);
+	Oid		source_dboid;
+	const char *failure = "db_branch internal create entry not implemented yet";
+
+	source_dboid = get_database_oid(source_name, false);
 
 	if (OidIsValid(get_database_oid(branch_name, true)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_DATABASE),
 				 errmsg("database \"%s\" already exists", branch_name)));
 
+	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+					  "FAILED", failure);
+
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("db_branch internal create entry not implemented yet")));
+			 errmsg("%s", failure)));
 
 	PG_RETURN_VOID();
 }
