@@ -149,6 +149,7 @@ static void recovery_create_dbdir(char *path, bool only_tblspc);
 static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *branch_name, XLogRecPtr redo_ptr,
 								  XLogRecPtr branch_lsn, const char *clone_path,
+								  const char *wal_pin,
 								  const char *clone_result, const char *cleanup,
 								  const char *status_history, const char *status,
 								  const char *failure);
@@ -165,6 +166,10 @@ static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
 								   char *failure, Size failure_len);
 static bool CloneDBBranchFile(const char *fromfile, const char *tofile,
 							  char *failure, Size failure_len);
+static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
+								   char *slot_name, Size slot_name_len);
+static XLogRecPtr PinDBBranchWal(const char *slot_name);
+static void ReleaseDBBranchWalPin(void);
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -2805,6 +2810,7 @@ static void
 WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 					  const char *branch_name, XLogRecPtr redo_ptr,
 					  XLogRecPtr branch_lsn, const char *clone_path,
+					  const char *wal_pin,
 					  const char *clone_result, const char *cleanup,
 					  const char *status_history, const char *status,
 					  const char *failure)
@@ -2832,6 +2838,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "redo_ptr=%X/%X\n"
 			 "branch_lsn=%X/%X\n"
 			 "clone_path=%s\n"
+			 "wal_pin=%s\n"
 			 "clone_result=%s\n"
 			 "cleanup=%s\n"
 			 "status_history=%s\n"
@@ -2839,7 +2846,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "failure=%s\n",
 			 source_dboid, source_name, branch_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
-			 clone_path ? clone_path : "", clone_result, cleanup,
+			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
 			 status_history, status, failure) >= 0;
 
 	if (ferror(file))
@@ -3092,6 +3099,35 @@ CloneDBBranchDirectory(const char *fromdir, const char *todir,
 }
 
 
+static void
+MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
+					   char *slot_name, Size slot_name_len)
+{
+	snprintf(slot_name, slot_name_len, "dbbranch_%u_%08x",
+			 source_dboid, (unsigned int) branch_hash);
+}
+
+static XLogRecPtr
+PinDBBranchWal(const char *slot_name)
+{
+	XLogRecPtr	restart_lsn;
+
+	ReplicationSlotCreate(slot_name, false, RS_TEMPORARY, false, false, false);
+	ReplicationSlotReserveWal();
+	restart_lsn = MyReplicationSlot->data.restart_lsn;
+	ReplicationSlotMarkDirty();
+	ReplicationSlotSave();
+
+	return restart_lsn;
+}
+
+static void
+ReleaseDBBranchWalPin(void)
+{
+	if (MyReplicationSlot != NULL)
+		ReplicationSlotDropAcquired();
+}
+
 Oid
 CreateDatabaseBranch(const char *source_name, const char *branch_name)
 {
@@ -3118,6 +3154,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	uint32		branch_hash;
 	char		srcpath[MAXPGPATH];
 	char		clone_path[MAXPGPATH];
+	char		wal_pin_name[NAMEDATALEN];
 	char		failure[MAXPGPATH * 2];
 	const char *ficlone_required = "db_branch storage clone requires FICLONE";
 
@@ -3162,6 +3199,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
+						  "not_started",
 						  "not_started", "not_started",
 						  "CREATING,FAILED", "FAILED", busy_failure);
 		ereport(ERROR,
@@ -3175,6 +3213,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	snprintf(srcpath, sizeof(srcpath), "base/%u", source_dboid);
 	snprintf(clone_path, sizeof(clone_path), "base/pg_dbbranch_%u_%08x",
 			 source_dboid, (unsigned int) branch_hash);
+	MakeDBBranchWalPinName(source_dboid, branch_hash, wal_pin_name,
+						   sizeof(wal_pin_name));
 
 	if (source_deftablespace != DEFAULTTABLESPACE_OID)
 	{
@@ -3183,6 +3223,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
+						  "not_started",
 						  "not_started", "not_started",
 						  "CREATING,FAILED", "FAILED", tablespace_failure);
 		ereport(ERROR,
@@ -3190,7 +3231,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				 errmsg("%s", tablespace_failure)));
 	}
 
-	redo_ptr = GetRedoRecPtr();
+	redo_ptr = PinDBBranchWal(wal_pin_name);
 	branch_lsn = GetXLogInsertRecPtr();
 	XLogFlush(branch_lsn);
 	FlushDatabaseBuffers(source_dboid);
@@ -3208,8 +3249,10 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		}
 		else
 		{
+			ReleaseDBBranchWalPin();
 			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 							  redo_ptr, branch_lsn, clone_path,
+							  "released",
 							  "failed", cleanup_ok ? "done" : "failed",
 							  "CREATING,COPYING,FAILED", "FAILED", failure);
 			ereport(ERROR,
@@ -3226,8 +3269,10 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 									   source_icurules, source_locprovider,
 									   source_collversion);
 
+	ReleaseDBBranchWalPin();
 	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 					  redo_ptr, branch_lsn, clone_path,
+					  "released",
 					  clone_result, "not_needed",
 					  "CREATING,COPYING,READY", "READY", "");
 

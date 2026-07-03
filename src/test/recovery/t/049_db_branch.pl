@@ -48,6 +48,7 @@ unlike($metadata, qr/^redo_ptr=0\/0$/m, 'redo pointer is valid');
 like($metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m, 'metadata records branch LSN');
 unlike($metadata, qr/^branch_lsn=0\/0$/m, 'branch LSN is valid');
 like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
+like($metadata, qr/^wal_pin=released$/m, 'metadata records released WAL pin');
 
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
 if ($result == 0)
@@ -97,6 +98,11 @@ else
 		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target';]);
 	is($branch_count, '0', 'failed branch is not connectable');
 }
+
+my $slot_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%']);
+is($slot_count, '0', 'db branch releases WAL pin slot');
 
 $stderr = '';
 $result = $node->psql(
@@ -176,6 +182,7 @@ for my $path (@metadata_files)
 	}
 }
 
+like($tablespace_metadata, qr/^wal_pin=not_started$/m, 'tablespace metadata records WAL pin not started');
 like($tablespace_metadata, qr/^clone_result=not_started$/m, 'tablespace metadata records clone not started');
 like($tablespace_metadata, qr/^cleanup=not_started$/m, 'tablespace metadata records cleanup not started');
 like($tablespace_metadata, qr/^status=FAILED$/m, 'tablespace metadata final state is FAILED');
@@ -220,6 +227,7 @@ for my $path (@metadata_files)
 	}
 }
 
+like($busy_metadata, qr/^wal_pin=not_started$/m, 'busy source metadata records WAL pin not started');
 like($busy_metadata, qr/^clone_result=not_started$/m, 'busy source metadata records clone not started');
 like($busy_metadata, qr/^cleanup=not_started$/m, 'busy source metadata records cleanup not started');
 like($busy_metadata, qr/^status=FAILED$/m, 'busy source metadata final state is FAILED');
