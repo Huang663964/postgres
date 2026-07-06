@@ -2836,6 +2836,9 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 		case T_CreateDbBranchStmt:
+			tag = CMDTAG_CREATE_BRANCH;
+			break;
+
 		case T_CreatedbStmt:
 			tag = CMDTAG_CREATE_DATABASE;
 			break;

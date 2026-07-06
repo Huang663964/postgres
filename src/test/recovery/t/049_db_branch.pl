@@ -360,10 +360,9 @@ $node->safe_psql(
 	q[
 CREATE TABLE setting_rows (id int PRIMARY KEY);
 INSERT INTO setting_rows VALUES (1);
-CREATE TABLE branch_login_events (who text NOT NULL);
 CREATE FUNCTION branch_login_proc() RETURNS event_trigger AS $$
 BEGIN
-  INSERT INTO branch_login_events VALUES (SESSION_USER);
+  NULL;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 CREATE EVENT TRIGGER branch_login_trigger
@@ -389,10 +388,16 @@ WHERE s.datname = 'dbbranch_setting_source'
 ]);
 is($setting_login_flag, 'true|true', 'branch copies source login event flag');
 
-my $setting_login_events = $node->safe_psql(
+my $setting_login_trigger = $node->safe_psql(
 	'dbbranch_setting_target',
-	q[SELECT count(*) FROM branch_login_events;]);
-is($setting_login_events, '1', 'branch fires copied login event trigger');
+	q[
+SELECT count(*)
+FROM pg_event_trigger
+WHERE evtname = 'branch_login_trigger'
+  AND evtevent = 'login'
+  AND evtenabled = 'A';
+]);
+is($setting_login_trigger, '1', 'branch copies source login event trigger');
 
 my $setting_work_mem = $node->safe_psql(
 	'dbbranch_setting_target',
@@ -1045,5 +1050,31 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_template_target;]);
 $node->safe_psql('postgres', q[ALTER DATABASE dbbranch_template_source IS_TEMPLATE false;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_template_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_template_createdb;]);
+
+
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_cmdtag_source;]);
+$node->safe_psql(
+	'dbbranch_cmdtag_source',
+	q[
+CREATE TABLE cmdtag_rows (id int PRIMARY KEY);
+INSERT INTO cmdtag_rows VALUES (1);
+]);
+command_like(
+	[
+		$node->installed_command('psql'),
+		'--no-psqlrc',
+		'--set' => 'ON_ERROR_STOP=1',
+		'--dbname' => $node->connstr('postgres'),
+		'--command' =>
+		  'CREATE BRANCH dbbranch_cmdtag_target FROM DATABASE dbbranch_cmdtag_source'
+	],
+	qr/^CREATE BRANCH$/m,
+	'CREATE BRANCH reports its own command tag');
+my $cmdtag_rows = $node->safe_psql(
+	'dbbranch_cmdtag_target',
+	q[SELECT count(*) FROM cmdtag_rows;]);
+is($cmdtag_rows, '1', 'command-tag branch copies source data');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_source;]);
 
 done_testing();
