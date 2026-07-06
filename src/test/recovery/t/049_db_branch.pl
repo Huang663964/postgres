@@ -21,12 +21,13 @@ $node->safe_psql(
 CREATE TABLE users (id int PRIMARY KEY, name text NOT NULL);
 INSERT INTO users VALUES (1, 'alice'), (2, 'bob');
 CHECKPOINT;
+INSERT INTO users VALUES (3, 'carol');
 ));
 
 my $source_rows = $node->safe_psql(
 	'dbbranch_source',
 	'SELECT count(*) FROM users;');
-is($source_rows, '2', 'source database baseline is ready for DB Branch');
+is($source_rows, '3', 'source database baseline is ready for DB Branch');
 
 my $wal_start = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
 my $stderr = '';
@@ -63,6 +64,7 @@ my ($wal_global_records) = $metadata =~ /^wal_global_records=([0-9]+)$/m;
 ok(
 	$wal_records_scanned >= $wal_source_records,
 	'metadata WAL scan count covers source WAL count');
+ok($wal_source_records > 0, 'metadata records source WAL after last checkpoint');
 ok($wal_mixed_records <= $wal_source_records, 'metadata mixed WAL count is bounded by source WAL count');
 ok(
 	$wal_records_scanned >= $wal_source_records + $wal_other_db_records + $wal_global_records,
@@ -89,7 +91,7 @@ if ($result == 0)
 	my $branch_rows = $node->safe_psql(
 		'dbbranch_target',
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
-	is($branch_rows, '1:alice,2:bob', 'ready branch can read cloned source rows');
+	is($branch_rows, '1:alice,2:bob,3:carol', 'ready branch can read cloned source rows');
 
 	my $source_oid = $node->safe_psql(
 		'postgres',
@@ -127,7 +129,7 @@ if ($result == 0)
 	my $branch_rows_after_restart = $node->safe_psql(
 		'dbbranch_target',
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
-	is($branch_rows_after_restart, '1:alice,2:bob', 'ready branch survives restart');
+	is($branch_rows_after_restart, '1:alice,2:bob,3:carol', 'ready branch survives restart');
 	my $catalog_state_after_restart = $node->safe_psql(
 		'postgres',
 		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || (wal_records_scanned >= wal_source_records) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = ]
@@ -138,11 +140,11 @@ if ($result == 0)
 		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
 		'pg_dbbranch READY metadata with WAL scan counts survives restart');
 
-	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (3, 'dora');]);
+	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (4, 'dora');]);
 	my $source_after_branch_write = $node->safe_psql(
 		'dbbranch_source',
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
-	is($source_after_branch_write, '1:alice,2:bob', 'branch writes do not affect source');
+	is($source_after_branch_write, '1:alice,2:bob,3:carol', 'branch writes do not affect source');
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_target;]);
 	my $catalog_after_drop = $node->safe_psql(
@@ -164,7 +166,7 @@ if ($result == 0)
 	my $retry_branch_rows = $node->safe_psql(
 		'dbbranch_target',
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
-	is($retry_branch_rows, '1:alice,2:bob', 'retried branch reads cloned source rows');
+	is($retry_branch_rows, '1:alice,2:bob,3:carol', 'retried branch reads cloned source rows');
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_target;]);
 }
 else
@@ -338,7 +340,7 @@ my ($unlogged_clone_path) = $unlogged_metadata =~ /^clone_path=(.+)$/m;
 ok(!-e $node->data_dir . '/' . $unlogged_clone_path, 'unlogged rejection does not create clone staging path');
 
 my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
-$writer->query_safe(q[BEGIN; INSERT INTO users VALUES (3, 'carol');]);
+$writer->query_safe(q[BEGIN; INSERT INTO users VALUES (5, 'erin');]);
 
 $stderr = '';
 $result = $node->psql(
