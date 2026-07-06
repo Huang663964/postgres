@@ -664,6 +664,51 @@ is($drop_catalog_rows, '0',
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_target;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_ddl_source;');
+$node->safe_psql(
+	'dbbranch_ddl_source',
+	q[
+CREATE TABLE ddl_base (id int PRIMARY KEY);
+INSERT INTO ddl_base VALUES (1);
+CHECKPOINT;
+CREATE TABLE ddl_after (id int PRIMARY KEY, payload text NOT NULL);
+INSERT INTO ddl_after VALUES (2, 'created-after-checkpoint');
+CREATE INDEX ddl_after_payload_idx ON ddl_after(payload);
+CREATE VIEW ddl_after_view AS SELECT id, payload FROM ddl_after;
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_ddl_target FROM DATABASE dbbranch_ddl_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch supports post-checkpoint DDL');
+
+my $ddl_rows = $node->safe_psql(
+	'dbbranch_ddl_target',
+	q[SELECT string_agg(id || ':' || payload, ',' ORDER BY id) FROM ddl_after;]);
+is($ddl_rows, '2:created-after-checkpoint',
+	'branch reads table created after checkpoint');
+
+my $ddl_view_rows = $node->safe_psql(
+	'dbbranch_ddl_target',
+	q[SELECT string_agg(id || ':' || payload, ',' ORDER BY id) FROM ddl_after_view;]);
+is($ddl_view_rows, '2:created-after-checkpoint',
+	'branch reads view created after checkpoint');
+
+my $ddl_index_lookup = $node->safe_psql(
+	'dbbranch_ddl_target',
+	q[
+SET enable_seqscan = off;
+SELECT id FROM ddl_after WHERE payload = 'created-after-checkpoint';
+]);
+is($ddl_index_lookup, '2',
+	'branch index lookup works on table created after checkpoint');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_ddl_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_ddl_source;]);
+
 $node->append_conf('postgresql.conf', 'full_page_writes = off');
 $node->reload;
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_nonfpi_source;');
