@@ -263,6 +263,51 @@ is(scalar @metadata_files, 1, 'permission failures write no metadata file');
 
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_no_createdb, dbbranch_createdb;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_existing_target;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_existing_target FROM DATABASE dbbranch_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects an existing target database name');
+like(
+	$stderr,
+	qr/database "dbbranch_existing_target" already exists/,
+	'db branch reports existing target database name');
+
+$node->safe_psql('postgres', q[
+CREATE DATABASE dbbranch_no_conn_source;
+ALTER DATABASE dbbranch_no_conn_source WITH ALLOW_CONNECTIONS false;
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_no_conn_target FROM DATABASE dbbranch_no_conn_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects source database with disabled connections');
+like(
+	$stderr,
+	qr/source database "dbbranch_no_conn_source" is not accepting connections/,
+	'db branch reports source allow-connection restriction');
+
+my $control_reject_branch_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname IN ('dbbranch_no_conn_target')]);
+is($control_reject_branch_count, '0', 'control validation failures create no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 1, 'control validation failures write no metadata file');
+
+$node->safe_psql('postgres', q[
+DROP DATABASE dbbranch_existing_target;
+ALTER DATABASE dbbranch_no_conn_source WITH ALLOW_CONNECTIONS true;
+DROP DATABASE dbbranch_no_conn_source;
+]);
+
 $node->safe_psql('postgres', q[
 CREATE FUNCTION dbbranch_wrapper() RETURNS oid LANGUAGE sql AS $$
   SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_func_target')
