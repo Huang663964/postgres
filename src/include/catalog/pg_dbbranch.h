@@ -29,6 +29,8 @@ CATALOG(pg_dbbranch,8785,DbBranchRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	XLogRecPtr	branch_lsn;
 	int64		wal_records_scanned;
 	int64		wal_source_records;
+	float8		clone_elapsed_ms;
+	float8		replay_elapsed_ms;
 
 #ifdef CATALOG_VARLEN
 	text		replay_method BKI_FORCE_NOT_NULL;

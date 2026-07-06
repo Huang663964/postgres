@@ -208,6 +208,7 @@ static void DeleteDBBranchCatalogForDatabase(Oid dboid);
 static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 								  const DBBranchWalScan *wal_scan,
+								  double clone_elapsed_ms, double replay_elapsed_ms,
 								  const char *replay_method,
 								  const char *status, const char *failure);
 static bool ScanDBBranchSourceRelations(Oid source_dboid,
@@ -3602,6 +3603,7 @@ static void
 InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 					  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 					  const DBBranchWalScan *wal_scan,
+					  double clone_elapsed_ms, double replay_elapsed_ms,
 					  const char *replay_method,
 					  const char *status, const char *failure)
 {
@@ -3620,6 +3622,10 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 		Int64GetDatum((int64) wal_scan->records);
 	values[Anum_pg_dbbranch_wal_source_records - 1] =
 		Int64GetDatum((int64) wal_scan->source_records);
+	values[Anum_pg_dbbranch_clone_elapsed_ms - 1] =
+		Float8GetDatum(clone_elapsed_ms);
+	values[Anum_pg_dbbranch_replay_elapsed_ms - 1] =
+		Float8GetDatum(replay_elapsed_ms);
 	values[Anum_pg_dbbranch_replay_method - 1] = CStringGetTextDatum(replay_method);
 	values[Anum_pg_dbbranch_status - 1] = CStringGetTextDatum(status);
 	values[Anum_pg_dbbranch_failure - 1] = CStringGetTextDatum(failure);
@@ -3911,7 +3917,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		foreach(cell, tablespace_oids)
 			LogDBBranchCreateFileCopy(source_dboid, branch_dboid, lfirst_oid(cell));
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
-						  &wal_scan, "rmgr_redo", "READY", "");
+						  &wal_scan,
+						  clone_elapsed_ms, replay_elapsed_ms,
+						  "rmgr_redo", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 		ReleaseDBBranchWalPin();
