@@ -3804,8 +3804,24 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	{
 		branch_lsn = GetXLogInsertEndRecPtr();
 		XLogFlush(branch_lsn);
-		FlushDatabaseBuffers(source_dboid);
 		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, &wal_scan);
+
+		if (wal_scan.source_non_fpi_records > 0)
+		{
+			const char *fpi_failure =
+				"db_branch FPI replay requires source WAL full-page images";
+
+			ReleaseDBBranchWalPin();
+			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "released",
+						  "not_started", "not_started", "fpi_restore",
+						  &wal_scan,
+						  "CREATING,REPLAYING,FAILED", "FAILED", fpi_failure);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("%s", fpi_failure)));
+		}
 
 		if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
 		{
@@ -3844,7 +3860,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
 						  clone_result, cleanup_ok ? "done" : "failed",
-						  "fpi_restore+source_flush",
+						  "fpi_restore",
 						  &wal_scan,
 						  "CREATING,COPYING,REPLAYING,FAILED", "FAILED", failure);
 			ereport(ERROR,
@@ -3862,14 +3878,14 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
-						  &wal_scan, "fpi_restore+source_flush", "READY", "");
+						  &wal_scan, "fpi_restore", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 		ReleaseDBBranchWalPin();
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
-						  clone_result, "not_needed", "fpi_restore+source_flush",
+						  clone_result, "not_needed", "fpi_restore",
 						  &wal_scan,
 						  "CREATING,COPYING,REPLAYING,READY", "READY", "");
 	}
