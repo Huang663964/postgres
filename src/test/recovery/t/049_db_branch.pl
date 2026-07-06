@@ -240,6 +240,14 @@ my $tablespace_dir = $node->basedir . '/dbbranch_ts';
 mkdir($tablespace_dir) or die "could not create $tablespace_dir: $!";
 $node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_ts LOCATION '$tablespace_dir';");
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_ts_source TABLESPACE dbbranch_ts;');
+$node->safe_psql(
+	'dbbranch_ts_source',
+	q[
+CREATE TABLE ts_rows (id int PRIMARY KEY, name text NOT NULL);
+INSERT INTO ts_rows VALUES (1, 'ts');
+CHECKPOINT;
+INSERT INTO ts_rows VALUES (2, 'redo');
+]);
 
 $stderr = '';
 $result = $node->psql(
@@ -247,14 +255,10 @@ $result = $node->psql(
 	q[CREATE BRANCH dbbranch_ts_target FROM DATABASE dbbranch_ts_source],
 	stderr => \$stderr);
 
-is($result, 3, 'db branch rejects non-default source tablespace');
-like(
-	$stderr,
-	qr/db_branch currently supports only pg_default tablespace/,
-	'db branch reports tablespace limitation before clone');
+is($result, 0, 'db branch supports non-default source tablespace');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 2, 'tablespace rejection writes separate metadata file');
+is(scalar @metadata_files, 2, 'tablespace branch writes separate metadata file');
 
 my $tablespace_metadata = '';
 for my $path (@metadata_files)
@@ -269,25 +273,33 @@ for my $path (@metadata_files)
 	}
 }
 
-like($tablespace_metadata, qr/^wal_range_bytes=0$/m, 'tablespace metadata records zero WAL range');
-like($tablespace_metadata, qr/^wal_records_scanned=0$/m, 'tablespace metadata records zero scanned WAL count');
-like($tablespace_metadata, qr/^wal_source_records=0$/m, 'tablespace metadata records zero source WAL count');
-like($tablespace_metadata, qr/^wal_other_db_records=0$/m, 'tablespace metadata records zero other DB WAL count');
-like($tablespace_metadata, qr/^wal_mixed_records=0$/m, 'tablespace metadata records zero mixed WAL count');
-like($tablespace_metadata, qr/^wal_global_records=0$/m, 'tablespace metadata records zero global WAL count');
-like($tablespace_metadata, qr/^wal_source_fpi_blocks=0$/m, 'tablespace metadata records zero source FPI block count');
-like($tablespace_metadata, qr/^wal_source_non_fpi_records=0$/m, 'tablespace metadata records zero source non-FPI record count');
-like($tablespace_metadata, qr/^wal_pin=not_started$/m, 'tablespace metadata records WAL pin not started');
-like($tablespace_metadata, qr/^clone_result=not_started$/m, 'tablespace metadata records clone not started');
-like($tablespace_metadata, qr/^cleanup=not_started$/m, 'tablespace metadata records cleanup not started');
-like($tablespace_metadata, qr/^replay_method=not_started$/m, 'tablespace metadata records replay not started');
-like($tablespace_metadata, qr/^status=FAILED$/m, 'tablespace metadata final state is FAILED');
-like(
-	$tablespace_metadata,
-	qr/^failure=db_branch currently supports only pg_default tablespace$/m,
-	'tablespace metadata records limitation');
+like($tablespace_metadata, qr/^wal_range_bytes=[1-9][0-9]*$/m, 'tablespace metadata records WAL range');
+like($tablespace_metadata, qr/^wal_records_scanned=[1-9][0-9]*$/m, 'tablespace metadata records scanned WAL count');
+like($tablespace_metadata, qr/^wal_source_records=[1-9][0-9]*$/m, 'tablespace metadata records source WAL count');
+like($tablespace_metadata, qr/^clone_path=pg_tblspc\/[0-9]+\/[^\/]+\/[0-9]+$/m,
+	'tablespace metadata records tablespace branch storage path');
+like($tablespace_metadata, qr/^wal_pin=released$/m, 'tablespace metadata records released WAL pin');
+like($tablespace_metadata, qr/^clone_result=(done|copy_fallback)$/m, 'tablespace metadata records clone success');
+like($tablespace_metadata, qr/^cleanup=not_needed$/m, 'tablespace metadata records no cleanup');
+like($tablespace_metadata, qr/^replay_method=rmgr_redo$/m, 'tablespace metadata records rmgr replay');
+like($tablespace_metadata, qr/^status=READY$/m, 'tablespace metadata final state is READY');
+like($tablespace_metadata, qr/^failure=$/m, 'tablespace metadata records no failure');
 my ($tablespace_clone_path) = $tablespace_metadata =~ /^clone_path=(.+)$/m;
-ok(!-e $node->data_dir . '/' . $tablespace_clone_path, 'tablespace rejection does not create clone staging path');
+ok(-d $node->data_dir . '/' . $tablespace_clone_path, 'tablespace branch storage path is installed');
+
+my $tablespace_rows = $node->safe_psql(
+	'dbbranch_ts_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM ts_rows;]);
+is($tablespace_rows, '1:ts,2:redo', 'tablespace branch reads cloned and replayed rows');
+
+my $same_tablespace = $node->safe_psql(
+	'postgres',
+	q[SELECT s.dattablespace = t.dattablespace FROM pg_database s, pg_database t WHERE s.datname = 'dbbranch_ts_source' AND t.datname = 'dbbranch_ts_target';]);
+is($same_tablespace, 't', 'tablespace branch keeps source default tablespace');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_ts_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_ts_source;]);
+$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_ts;]);
 
 
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_unlogged_source;');

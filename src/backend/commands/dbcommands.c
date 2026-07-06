@@ -199,7 +199,8 @@ static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
-static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid);
+static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
+									  Oid tablespace_oid);
 static void DeleteDBBranchCatalogForDatabase(Oid dboid);
 static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
@@ -3302,8 +3303,6 @@ InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_n
 	char	   *dstpath;
 	createdb_failure_params fparms;
 
-	Assert(src_deftablespace == DEFAULTTABLESPACE_OID);
-
 	pg_database_rel = table_open(DatabaseRelationId, RowExclusiveLock);
 	dstpath = GetDatabasePath(dboid, src_deftablespace);
 
@@ -3534,14 +3533,15 @@ ReleaseDBBranchWalPin(void)
 }
 
 static void
-LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid)
+LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
+						  Oid tablespace_oid)
 {
 	xl_dbase_create_file_copy_rec xlrec;
 
 	xlrec.db_id = branch_dboid;
-	xlrec.tablespace_id = DEFAULTTABLESPACE_OID;
+	xlrec.tablespace_id = tablespace_oid;
 	xlrec.src_db_id = source_dboid;
-	xlrec.src_tablespace_id = DEFAULTTABLESPACE_OID;
+	xlrec.src_tablespace_id = tablespace_oid;
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xl_dbase_create_file_copy_rec));
@@ -3665,8 +3665,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	XLogRecPtr branch_lsn;
 	DBBranchWalScan wal_scan;
 	uint32		branch_hash;
-	char		srcpath[MAXPGPATH];
-	char		clone_path[MAXPGPATH];
+	char	   *srcpath;
+	char	   *clone_path;
 	char		wal_pin_name[NAMEDATALEN];
 	char		failure[MAXPGPATH * 2];
 	const char *ficlone_required = "db_branch storage clone requires FICLONE";
@@ -3739,27 +3739,11 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 					 errdetail_busy_db(notherbackends, npreparedxacts)));
 	}
 	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
-	snprintf(srcpath, sizeof(srcpath), "base/%u", source_dboid);
-	snprintf(clone_path, sizeof(clone_path), "base/pg_dbbranch_%u_%08x",
-			 source_dboid, (unsigned int) branch_hash);
+	srcpath = GetDatabasePath(source_dboid, source_deftablespace);
+	clone_path = psprintf("pg_dbbranch_%u_%08x",
+					   source_dboid, (unsigned int) branch_hash);
 	MakeDBBranchWalPinName(source_dboid, branch_hash, wal_pin_name,
 						   sizeof(wal_pin_name));
-
-	if (source_deftablespace != DEFAULTTABLESPACE_OID)
-	{
-		const char *tablespace_failure =
-			"db_branch currently supports only pg_default tablespace";
-
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
-						  "not_started",
-						  "not_started", "not_started", "not_started",
-						  NULL,
-						  "CREATING,FAILED", "FAILED", tablespace_failure);
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("%s", tablespace_failure)));
-	}
 
 	if (SourceDatabaseHasUnloggedRelations(source_dboid, source_deftablespace, srcpath))
 	{
@@ -3778,7 +3762,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	}
 	branch_dboid = AllocateDBBranchDatabaseOid();
 	/* ponytail: final path avoids a DB-branch-only relpath hook. */
-	snprintf(clone_path, sizeof(clone_path), "base/%u", branch_dboid);
+	pfree(clone_path);
+	clone_path = GetDatabasePath(branch_dboid, source_deftablespace);
 
 	redo_ptr = PinDBBranchWal(wal_pin_name);
 	PG_TRY();
@@ -3846,7 +3831,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 									   source_icurules, source_locprovider,
 									   source_collversion);
 
-		LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
+		LogDBBranchCreateFileCopy(source_dboid, branch_dboid, source_deftablespace);
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
 						  &wal_scan, "rmgr_redo", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
