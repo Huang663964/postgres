@@ -11,6 +11,7 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
+$node->append_conf('postgresql.conf', 'max_prepared_transactions = 10');
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_source;');
@@ -340,5 +341,58 @@ like(
 	$busy_metadata,
 	qr/^failure=source database is being accessed by other users$/m,
 	'busy source metadata records drain failure');
+
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_prepared_source;');
+$node->safe_psql(
+	'dbbranch_prepared_source',
+	q[
+CREATE TABLE prepared_rows (id int PRIMARY KEY);
+BEGIN;
+INSERT INTO prepared_rows VALUES (1);
+PREPARE TRANSACTION 'dbbranch_prepared_xact';
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_prepared_target FROM DATABASE dbbranch_prepared_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects source database with prepared transaction');
+like(
+	$stderr,
+	qr/source database "dbbranch_prepared_source" has prepared transactions/,
+	'db branch reports prepared transaction limitation');
+
+$node->safe_psql('dbbranch_prepared_source', q[ROLLBACK PREPARED 'dbbranch_prepared_xact';]);
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 5, 'prepared transaction rejection writes separate metadata file');
+
+my $prepared_metadata = '';
+for my $path (@metadata_files)
+{
+	open my $fh, '<', $path or die "could not open $path: $!";
+	my $contents = do { local $/; <$fh> };
+	close $fh;
+	if ($contents =~ /^branch_name=dbbranch_prepared_target$/m)
+	{
+		$prepared_metadata = $contents;
+		last;
+	}
+}
+
+like($prepared_metadata, qr/^wal_pin=not_started$/m, 'prepared metadata records WAL pin not started');
+like($prepared_metadata, qr/^clone_result=not_started$/m, 'prepared metadata records clone not started');
+like($prepared_metadata, qr/^cleanup=not_started$/m, 'prepared metadata records cleanup not started');
+like($prepared_metadata, qr/^replay_method=not_started$/m, 'prepared metadata records replay not started');
+like($prepared_metadata, qr/^status=FAILED$/m, 'prepared metadata final state is FAILED');
+like(
+	$prepared_metadata,
+	qr/^failure=source database has prepared transactions$/m,
+	'prepared metadata records drain failure');
+my ($prepared_clone_path) = $prepared_metadata =~ /^clone_path=(.*)$/m;
+ok($prepared_clone_path eq '' || !-e $node->data_dir . '/' . $prepared_clone_path,
+	'prepared rejection does not create clone staging path');
 
 done_testing();

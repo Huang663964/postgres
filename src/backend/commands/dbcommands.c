@@ -3317,20 +3317,29 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	/* ponytail: full backend drain first; relax to writer-only gate later. */
 	if (CountOtherDBBackends(source_dboid, &notherbackends, &npreparedxacts))
 	{
-		const char *busy_failure = "source database is being accessed by other users";
+		const char *busy_failure =
+			(npreparedxacts > 0 && notherbackends == 0) ?
+			"source database has prepared transactions" :
+			"source database is being accessed by other users";
 
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
 						  "not_started",
 						  "not_started", "not_started", "not_started",
 						  "CREATING,FAILED", "FAILED", busy_failure);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("source database \"%s\" is being accessed by other users",
-						source_name),
-				 errdetail_busy_db(notherbackends, npreparedxacts)));
+		if (npreparedxacts > 0 && notherbackends == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("source database \"%s\" has prepared transactions",
+							source_name),
+					 errdetail_busy_db(notherbackends, npreparedxacts)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("source database \"%s\" is being accessed by other users",
+							source_name),
+					 errdetail_busy_db(notherbackends, npreparedxacts)));
 	}
-
 	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
 	snprintf(srcpath, sizeof(srcpath), "base/%u", source_dboid);
 	snprintf(clone_path, sizeof(clone_path), "base/pg_dbbranch_%u_%08x",
