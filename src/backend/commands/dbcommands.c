@@ -3461,6 +3461,15 @@ CloneDBBranchFile(const char *fromfile, const char *tofile,
 		return false;
 	}
 
+	if (enableFsync && pg_fsync(dstfd) != 0)
+	{
+		snprintf(failure, failure_len, "could not fsync file \"%s\": %s",
+				 tofile, strerror(errno));
+		CloseTransientFile(dstfd);
+		CloseTransientFile(srcfd);
+		return false;
+	}
+
 	if (CloseTransientFile(dstfd) != 0)
 	{
 		snprintf(failure, failure_len, "could not close file \"%s\": %s",
