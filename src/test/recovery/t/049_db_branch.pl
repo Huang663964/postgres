@@ -70,14 +70,13 @@ ok(
 	'metadata WAL scan count covers source WAL count');
 ok($wal_source_records > 0, 'metadata records source WAL after last checkpoint');
 ok($wal_source_fpi_blocks > 0, 'metadata records restored source full-page images');
-is($wal_source_non_fpi_records, '0', 'metadata records no source WAL outside FPI-only replay');
 ok($wal_mixed_records <= $wal_source_records, 'metadata mixed WAL count is bounded by source WAL count');
 ok(
 	$wal_records_scanned >= $wal_source_records + $wal_other_db_records + $wal_global_records,
 	'metadata WAL scan count covers classified WAL counts');
 like($metadata, qr/^clone_path=base\/[0-9]+$/m, 'metadata records branch storage path');
 like($metadata, qr/^wal_pin=released$/m, 'metadata records released WAL pin');
-like($metadata, qr/^replay_method=fpi_restore$/m, 'metadata records FPI restore replay method');
+like($metadata, qr/^replay_method=rmgr_redo$/m, 'metadata records rmgr redo replay method');
 
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
 if ($result == 0)
@@ -119,7 +118,7 @@ if ($result == 0)
 		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || (wal_records_scanned >= wal_source_records) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
 	is(
 		$catalog_state,
-		'READY|fpi_restore|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
+		'READY|rmgr_redo|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
 		'pg_dbbranch records READY metadata with replay method and WAL scan counts');
 
 	ok(
@@ -144,7 +143,7 @@ if ($result == 0)
 		  . q[;]);
 	is(
 		$catalog_state_after_restart,
-		'READY|fpi_restore|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
+		'READY|rmgr_redo|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
 		'pg_dbbranch READY metadata with WAL scan counts survives restart');
 
 	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (4, 'dora');]);
@@ -479,11 +478,7 @@ $result = $node->psql(
 	q[CREATE BRANCH dbbranch_nonfpi_target FROM DATABASE dbbranch_nonfpi_source],
 	stderr => \$stderr);
 
-is($result, 3, 'db branch rejects source WAL records without full-page images');
-like(
-	$stderr,
-	qr/db_branch FPI replay requires source WAL full-page images/,
-	'db branch reports FPI-only replay limitation');
+is($result, 0, 'db branch replays source WAL records without full-page images');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 my $nonfpi_metadata = '';
@@ -505,27 +500,26 @@ like(
 	'non-FPI metadata records source WAL outside FPI replay');
 like(
 	$nonfpi_metadata,
-	qr/^clone_result=not_started$/m,
-	'non-FPI metadata records clone not started');
+	qr/^clone_result=(done|copy_fallback)$/m,
+	'non-FPI metadata records storage clone success');
 like(
 	$nonfpi_metadata,
-	qr/^replay_method=fpi_restore$/m,
-	'non-FPI metadata records FPI replay method');
+	qr/^replay_method=rmgr_redo$/m,
+	'non-FPI metadata records rmgr redo replay method');
 like(
 	$nonfpi_metadata,
-	qr/^status_history=CREATING,REPLAYING,FAILED$/m,
-	'non-FPI metadata records replay failure transition');
+	qr/^status_history=CREATING,COPYING,REPLAYING,READY$/m,
+	'non-FPI metadata records READY transition');
 like(
 	$nonfpi_metadata,
-	qr/^failure=db_branch FPI replay requires source WAL full-page images$/m,
-	'non-FPI metadata records replay limitation');
+	qr/^failure=$/m,
+	'non-FPI metadata records no failure');
 
-my $nonfpi_branch_count = $node->safe_psql(
-	'postgres',
-	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_nonfpi_target';]);
-is(
-	$nonfpi_branch_count,
-	'0',
-	'non-FPI replay rejection creates no branch database');
+my $nonfpi_rows = $node->safe_psql(
+	'dbbranch_nonfpi_target',
+	q[SELECT count(*) FROM nonfpi_rows;]);
+is($nonfpi_rows, '1', 'non-FPI branch reads rmgr-replayed rows');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_nonfpi_target;]);
 
 done_testing();

@@ -34,6 +34,7 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
@@ -76,6 +77,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/pg_locale.h"
 #include "utils/relmapper.h"
@@ -173,12 +175,12 @@ static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *failure);
 static void ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 								 XLogRecPtr end_lsn, DBBranchWalScan *wal_scan);
-static bool ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
-										 XLogRecPtr start_lsn, XLogRecPtr end_lsn,
-										 char *failure, Size failure_len);
-static bool WriteDBBranchFullPageImage(const char *clone_path, RelFileLocator rlocator,
-									  ForkNumber forknum, BlockNumber blkno,
-									  const char *page, char *failure, Size failure_len);
+static bool ReplayDBBranchWal(Oid source_dboid, Oid branch_dboid,
+								  XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+								  char *failure, Size failure_len);
+static bool ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
+										XLogReaderState *xlogreader,
+										char *failure, Size failure_len);
 static bool CleanupDBBranchClonePath(const char *clone_path);
 static Oid AllocateDBBranchDatabaseOid(void);
 static void InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_name,
@@ -3061,107 +3063,117 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 
 
 static bool
-WriteDBBranchFullPageImage(const char *clone_path, RelFileLocator rlocator,
-					ForkNumber forknum, BlockNumber blkno,
-					const char *page, char *failure, Size failure_len)
+ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
+						XLogReaderState *xlogreader,
+						char *failure, Size failure_len)
 {
-	char        path[MAXPGPATH * 2];
-	size_t      path_len;
-	BlockNumber segno = blkno / ((BlockNumber) RELSEG_SIZE);
-	BlockNumber segblk = blkno % ((BlockNumber) RELSEG_SIZE);
-	off_t       offset = (off_t) BLCKSZ * segblk;
-	int         fd;
-	ssize_t     nbytes;
+	RmgrData	rmgr;
+	Oid			saved_dbids[XLR_MAX_BLOCK_ID + 1];
+	bool		remapped[XLR_MAX_BLOCK_ID + 1] = {false};
+	bool		touches_source = false;
+	bool		touches_non_source = false;
+	bool		replay_ok = true;
+	MemoryContext oldcontext;
+	bool		saved_InRecovery;
+	uint8		block_id;
 
-	if (rlocator.spcOid != DEFAULTTABLESPACE_OID ||
-		!RelFileNumberIsValid(rlocator.relNumber) ||
-		forknum < MAIN_FORKNUM || forknum > MAX_FORKNUM)
+	if (!XLogRecHasAnyBlockRefs(xlogreader))
+		return true;
+
+	for (block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader); block_id++)
 	{
-		snprintf(failure, failure_len,
-					"unsupported DB Branch full-page image target");
-		return false;
-	}
+		DecodedBkpBlock *block;
 
-	if (forknum == MAIN_FORKNUM)
-		snprintf(path, sizeof(path), "%s/%u", clone_path, rlocator.relNumber);
-	else
-		snprintf(path, sizeof(path), "%s/%u_%s", clone_path,
-					rlocator.relNumber, forkNames[forknum]);
+		if (!XLogRecHasBlockRef(xlogreader, block_id))
+			continue;
 
-	if (segno > 0)
-	{
-		int         len;
-
-		path_len = strlen(path);
-		if (path_len >= sizeof(path))
+		block = XLogRecGetBlock(xlogreader, block_id);
+		if (block->rlocator.dbOid == source_dboid)
 		{
-			snprintf(failure, failure_len,
-					"DB Branch replay path is too long");
-			return false;
+			saved_dbids[block_id] = block->rlocator.dbOid;
+			block->rlocator.dbOid = branch_dboid;
+			remapped[block_id] = true;
+			touches_source = true;
 		}
-		len = snprintf(path + path_len, sizeof(path) - path_len, ".%u",
-					(unsigned int) segno);
-		if (len < 0 || len >= sizeof(path) - path_len)
+		else
+			touches_non_source = true;
+	}
+
+	if (!touches_source)
+		return true;
+
+	if (touches_non_source)
+	{
+		for (block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader); block_id++)
 		{
-			snprintf(failure, failure_len,
-					"DB Branch replay path is too long");
-			return false;
+			if (remapped[block_id])
+				XLogRecGetBlock(xlogreader, block_id)->rlocator.dbOid =
+					saved_dbids[block_id];
 		}
-	}
-
-	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
-	if (fd < 0)
-	{
 		snprintf(failure, failure_len,
-					"could not open DB Branch replay file \"%s\": %s",
-					path, strerror(errno));
+				 "DB Branch rmgr replay does not support mixed WAL records yet");
 		return false;
 	}
 
-	errno = 0;
-	nbytes = pg_pwrite(fd, page, BLCKSZ, offset);
-	if (nbytes != BLCKSZ)
+	rmgr = GetRmgr(XLogRecGetRmid(xlogreader));
+	if (rmgr.rm_redo == NULL)
 	{
-		int         save_errno = errno ? errno : ENOSPC;
-
-		CloseTransientFile(fd);
 		snprintf(failure, failure_len,
-					"could not write DB Branch replay file \"%s\": %s",
-					path, strerror(save_errno));
+				 "DB Branch WAL record has no redo handler");
 		return false;
 	}
 
-	if (pg_fsync(fd) != 0)
+	saved_InRecovery = InRecovery;
+	oldcontext = CurrentMemoryContext;
+	PG_TRY();
 	{
-		int         save_errno = errno;
+		MemoryContextSwitchTo(TopMemoryContext);
+		/* ponytail: TopMemoryContext avoids redo-local context churn; tighten after rmgr matrix. */
+		InRecovery = true;
+		DBBranchReplayInProgress = true;
+		rmgr.rm_redo(xlogreader);
+		DBBranchReplayInProgress = false;
+		InRecovery = saved_InRecovery;
+		MemoryContextSwitchTo(oldcontext);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
 
-		CloseTransientFile(fd);
+		DBBranchReplayInProgress = false;
+		InRecovery = saved_InRecovery;
+		MemoryContextSwitchTo(TopMemoryContext);
+		edata = CopyErrorData();
+		FlushErrorState();
 		snprintf(failure, failure_len,
-					"could not fsync DB Branch replay file \"%s\": %s",
-					path, strerror(save_errno));
-		return false;
+				 "could not replay DB Branch WAL at %X/%X: %s",
+				 LSN_FORMAT_ARGS(xlogreader->ReadRecPtr),
+				 edata->message ? edata->message : "unknown error");
+		FreeErrorData(edata);
+		replay_ok = false;
+		MemoryContextSwitchTo(oldcontext);
+	}
+	PG_END_TRY();
+
+	for (block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader); block_id++)
+	{
+		if (remapped[block_id])
+			XLogRecGetBlock(xlogreader, block_id)->rlocator.dbOid =
+				saved_dbids[block_id];
 	}
 
-	if (CloseTransientFile(fd) != 0)
-	{
-		snprintf(failure, failure_len,
-					"could not close DB Branch replay file \"%s\": %s",
-					path, strerror(errno));
-		return false;
-	}
-
-	return true;
+	return replay_ok;
 }
 
 static bool
-ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
-					XLogRecPtr start_lsn, XLogRecPtr end_lsn,
-					char *failure, Size failure_len)
+ReplayDBBranchWal(Oid source_dboid, Oid branch_dboid,
+				  XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+				  char *failure, Size failure_len)
 {
 	ReadLocalXLogPageNoWaitPrivate *private_data;
 	XLogReaderState *xlogreader;
-	XLogRecPtr  first_valid_record;
-	char       *errormsg;
+	XLogRecPtr	first_valid_record;
+	char	   *errormsg;
 
 	if (XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(end_lsn) ||
 		end_lsn <= start_lsn || start_lsn < XLOG_BLCKSZ)
@@ -3169,15 +3181,15 @@ ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
 
 	private_data = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
 	xlogreader = XLogReaderAllocate(wal_segment_size, NULL,
-					XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
-					.segment_open = &wal_segment_open,
-					.segment_close = &wal_segment_close),
-					private_data);
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								private_data);
 	if (xlogreader == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
-					errmsg("out of memory"),
-					errdetail("Failed while allocating a WAL reading processor.")));
+				 errmsg("out of memory"),
+				 errdetail("Failed while allocating a WAL reading processor.")));
 
 	first_valid_record = XLogFindNextRecord(xlogreader, start_lsn);
 	if (XLogRecPtrIsInvalid(first_valid_record) || first_valid_record >= end_lsn)
@@ -3187,7 +3199,8 @@ ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
 		return true;
 	}
 
-	/* ponytail: FPI-only replay; rmgr-specific redo comes later. */
+	RmgrStartup();
+
 	for (;;)
 	{
 		XLogRecord *record;
@@ -3200,12 +3213,13 @@ ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
 				break;
 			if (errormsg)
 				snprintf(failure, failure_len,
-					"could not read WAL at %X/%X: %s",
-					LSN_FORMAT_ARGS(xlogreader->EndRecPtr), errormsg);
+						 "could not read WAL at %X/%X: %s",
+						 LSN_FORMAT_ARGS(xlogreader->EndRecPtr), errormsg);
 			else
 				snprintf(failure, failure_len,
-					"could not read WAL at %X/%X",
-					LSN_FORMAT_ARGS(xlogreader->EndRecPtr));
+						 "could not read WAL at %X/%X",
+						 LSN_FORMAT_ARGS(xlogreader->EndRecPtr));
+			RmgrCleanup();
 			XLogReaderFree(xlogreader);
 			pfree(private_data);
 			return false;
@@ -3216,64 +3230,32 @@ ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
 		if (xlogreader->EndRecPtr > end_lsn)
 		{
 			snprintf(failure, failure_len,
-					"DB Branch WAL replay endpoint is not a record boundary");
+					 "DB Branch WAL replay endpoint is not a record boundary");
+			RmgrCleanup();
 			XLogReaderFree(xlogreader);
 			pfree(private_data);
 			return false;
 		}
 
-		if (XLogRecHasAnyBlockRefs(xlogreader))
+		if (!ReplayDBBranchWalRecord(source_dboid, branch_dboid, xlogreader,
+									 failure, failure_len))
 		{
-			uint8       block_id;
-
-			for (block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader); block_id++)
-			{
-				RelFileLocator rlocator;
-				ForkNumber  forknum;
-				BlockNumber blkno;
-				PGAlignedBlock page;
-
-				if (!XLogRecGetBlockTagExtended(xlogreader, block_id, &rlocator,
-					&forknum, &blkno, NULL))
-					continue;
-				if (rlocator.dbOid != source_dboid ||
-					!XLogRecBlockImageApply(xlogreader, block_id))
-					continue;
-
-				if (!RestoreBlockImage(xlogreader, block_id, page.data))
-				{
-					snprintf(failure, failure_len,
-					"could not restore DB Branch full-page image at %X/%X",
-					LSN_FORMAT_ARGS(xlogreader->ReadRecPtr));
-					XLogReaderFree(xlogreader);
-					pfree(private_data);
-					return false;
-				}
-				if (!PageIsNew((Page) page.data))
-				{
-					PageSetLSN((Page) page.data, xlogreader->EndRecPtr);
-					PageSetChecksumInplace((Page) page.data, blkno);
-				}
-				if (!WriteDBBranchFullPageImage(clone_path, rlocator, forknum,
-					blkno, page.data, failure,
-					failure_len))
-				{
-					XLogReaderFree(xlogreader);
-					pfree(private_data);
-					return false;
-				}
-			}
+			RmgrCleanup();
+			XLogReaderFree(xlogreader);
+			pfree(private_data);
+			return false;
 		}
 
 		if (xlogreader->EndRecPtr >= end_lsn)
 			break;
 	}
 
+	RmgrCleanup();
+
 	XLogReaderFree(xlogreader);
 	pfree(private_data);
 	return true;
 }
-
 
 static bool
 CleanupDBBranchClonePath(const char *clone_path)
@@ -3805,23 +3787,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		XLogFlush(branch_lsn);
 		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, &wal_scan);
 
-		if (wal_scan.source_non_fpi_records > 0)
-		{
-			const char *fpi_failure =
-				"db_branch FPI replay requires source WAL full-page images";
-
-			ReleaseDBBranchWalPin();
-			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  redo_ptr, branch_lsn, clone_path,
-						  "released",
-						  "not_started", "not_started", "fpi_restore",
-						  &wal_scan,
-						  "CREATING,REPLAYING,FAILED", "FAILED", fpi_failure);
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("%s", fpi_failure)));
-		}
-
 		if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
 		{
 			bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
@@ -3849,23 +3814,29 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			}
 		}
 
-		if (!ReplayDBBranchFullPageImages(source_dboid, clone_path,
-											 redo_ptr, branch_lsn, failure, sizeof(failure)))
+		if (!ReplayDBBranchWal(source_dboid, branch_dboid,
+								  redo_ptr, branch_lsn, failure, sizeof(failure)))
 		{
-			bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+			bool		cleanup_ok;
+
+			DropDatabaseBuffers(branch_dboid);
+			ForgetDatabaseSyncRequests(branch_dboid);
+			cleanup_ok = CleanupDBBranchClonePath(clone_path);
 
 			ReleaseDBBranchWalPin();
 			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
 						  clone_result, cleanup_ok ? "done" : "failed",
-						  "fpi_restore",
+						  "rmgr_redo",
 						  &wal_scan,
 						  "CREATING,COPYING,REPLAYING,FAILED", "FAILED", failure);
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("%s", failure)));
 		}
+
+		FlushDatabaseBuffers(branch_dboid);
 
 		InstallDBBranchDatabase(source_dboid, branch_dboid, branch_name, clone_path,
 									   source_encoding, source_hasloginevt,
@@ -3877,14 +3848,14 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
-						  &wal_scan, "fpi_restore", "READY", "");
+						  &wal_scan, "rmgr_redo", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 		ReleaseDBBranchWalPin();
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
-						  clone_result, "not_needed", "fpi_restore",
+						  clone_result, "not_needed", "rmgr_redo",
 						  &wal_scan,
 						  "CREATING,COPYING,REPLAYING,READY", "READY", "");
 	}

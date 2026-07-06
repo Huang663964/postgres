@@ -33,6 +33,9 @@
 /* GUC variable */
 bool		ignore_invalid_pages = false;
 
+/* ponytail: DB Branch reuses rmgr redo against already-cloned forks. */
+bool		DBBranchReplayInProgress = false;
+
 /*
  * Are we doing recovery from XLOG?
  *
@@ -487,7 +490,8 @@ XLogReadBufferExtended(RelFileLocator rlocator, ForkNumber forknum,
 	 * filesystem loses an inode during a crash.  Better to write the data
 	 * until we are actually told to delete the file.)
 	 */
-	smgrcreate(smgr, forknum, true);
+	if (!DBBranchReplayInProgress || !smgrexists(smgr, forknum))
+		smgrcreate(smgr, forknum, true);
 
 	lastblock = smgrnblocks(smgr, forknum);
 

@@ -84,6 +84,8 @@ typedef struct ReadLocalXLogPageNoWaitPrivate
 	bool		end_of_wal;		/* true, when end of WAL is reached */
 } ReadLocalXLogPageNoWaitPrivate;
 
+extern PGDLLIMPORT bool DBBranchReplayInProgress;
+
 extern XLogRedoAction XLogReadBufferForRedo(XLogReaderState *record,
 											uint8 block_id, Buffer *buf);
 extern Buffer XLogInitBufferForRedo(XLogReaderState *record, uint8 block_id);
