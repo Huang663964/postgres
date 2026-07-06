@@ -619,6 +619,51 @@ is($partition_index_lookup, 'high-redo',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_partition_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_partition_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_source;');
+$node->safe_psql(
+	'dbbranch_drop_source',
+	q[
+CREATE TABLE drop_rows (id int PRIMARY KEY, payload text NOT NULL);
+INSERT INTO drop_rows VALUES (1, 'before');
+CHECKPOINT;
+INSERT INTO drop_rows VALUES (2, 'after');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_target FROM DATABASE dbbranch_drop_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch can be created before dropping source database');
+
+my $drop_source_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_drop_source';]);
+my $drop_branch_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_drop_target';]);
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_source;]);
+
+my $drop_branch_rows = $node->safe_psql(
+	'dbbranch_drop_target',
+	q[SELECT string_agg(id || ':' || payload, ',' ORDER BY id) FROM drop_rows;]);
+is($drop_branch_rows, '1:before,2:after',
+	'branch remains readable after source database is dropped');
+
+my $drop_catalog_rows = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_dbbranch WHERE source_db_oid = ]
+	  . $drop_source_oid
+	  . q[ OR branch_db_oid = ]
+	  . $drop_branch_oid
+	  . q[;]);
+is($drop_catalog_rows, '0',
+	'dropping source removes pg_dbbranch catalog metadata');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_target;]);
+
 $node->append_conf('postgresql.conf', 'full_page_writes = off');
 $node->reload;
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_nonfpi_source;');
