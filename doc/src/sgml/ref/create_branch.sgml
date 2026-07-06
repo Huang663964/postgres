@@ -83,7 +83,8 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
 
   <para>
    <command>CREATE BRANCH</command> requires <xref linkend="guc-wal-level"/>
-   to be <literal>replica</literal> or higher.
+   to be <literal>replica</literal> or higher and
+   <xref linkend="guc-max-replication-slots"/> to be greater than zero.
   </para>
 
   <para>

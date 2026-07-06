@@ -3828,6 +3828,12 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				 errmsg("CREATE BRANCH can only be used if \"wal_level\" >= \"replica\""),
 				 errhint("\"wal_level\" must be set to \"replica\" or \"logical\" at server start.")));
 
+	if (max_replication_slots <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CREATE BRANCH can only be used if \"max_replication_slots\" > 0"),
+				 errhint("\"max_replication_slots\" must be increased at server start.")));
+
 	INSTR_TIME_SET_CURRENT(source_block_start);
 
 	if (!get_db_info(source_name, ShareLock,

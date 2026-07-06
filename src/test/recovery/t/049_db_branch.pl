@@ -1358,4 +1358,41 @@ is(scalar @minimal_metadata_files, 0, 'wal_level rejection writes no metadata fi
 
 $minimal_node->stop;
 
+my $slotless_node = PostgreSQL::Test::Cluster->new('slotless');
+$slotless_node->init;
+$slotless_node->append_conf('postgresql.conf', qq[
+wal_level = replica
+max_replication_slots = 0
+]);
+$slotless_node->start;
+$slotless_node->safe_psql('postgres', q[CREATE DATABASE dbbranch_slotless_source;]);
+$slotless_node->safe_psql(
+	'dbbranch_slotless_source',
+	q[
+CREATE TABLE slotless_rows (id int PRIMARY KEY);
+INSERT INTO slotless_rows VALUES (1);
+]);
+
+$stderr = '';
+$result = $slotless_node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_slotless_target FROM DATABASE dbbranch_slotless_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects max_replication_slots=0');
+like(
+	$stderr,
+	qr/CREATE BRANCH can only be used if "max_replication_slots" > 0/,
+	'db branch reports WAL pin replication slot requirement');
+
+my $slotless_branch_count = $slotless_node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_slotless_target';]);
+is($slotless_branch_count, '0', 'slotless WAL pin rejection creates no branch database');
+
+my @slotless_metadata_files = glob $slotless_node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @slotless_metadata_files, 0, 'slotless WAL pin rejection writes no metadata file');
+
+$slotless_node->stop;
+
 done_testing();
