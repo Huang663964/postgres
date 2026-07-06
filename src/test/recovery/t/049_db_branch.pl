@@ -1171,6 +1171,9 @@ my $nonfpi_rows = $node->safe_psql(
 is($nonfpi_rows, '1', 'non-FPI branch reads rmgr-replayed rows');
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_nonfpi_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_nonfpi_source;]);
+$node->append_conf('postgresql.conf', 'full_page_writes = on');
+$node->reload;
 
 $node->safe_psql('postgres', q[
 CREATE ROLE dbbranch_template_createdb LOGIN CREATEDB;
