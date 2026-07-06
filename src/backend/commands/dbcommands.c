@@ -3866,6 +3866,35 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				 errmsg("source database \"%s\" is not accepting connections",
 						source_name)));
 
+	if (source_collversion)
+	{
+		char	   *actual_versionstr;
+		const char *locale;
+
+		if (source_locprovider == COLLPROVIDER_LIBC)
+			locale = source_collate;
+		else
+			locale = source_locale;
+
+		actual_versionstr = get_collation_actual_version(source_locprovider, locale);
+		if (!actual_versionstr)
+			ereport(ERROR,
+					(errmsg("source database \"%s\" has a collation version, but no actual collation version could be determined",
+							source_name)));
+
+		if (strcmp(actual_versionstr, source_collversion) != 0)
+			ereport(ERROR,
+					(errmsg("source database \"%s\" has a collation version mismatch",
+							source_name),
+					 errdetail("The source database was created using collation version %s, "
+							   "but the operating system provides version %s.",
+							   source_collversion, actual_versionstr),
+					 errhint("Rebuild all objects in the source database that use the default collation and run "
+							 "ALTER DATABASE %s REFRESH COLLATION VERSION, "
+							 "or build PostgreSQL with the right library version.",
+							 quote_identifier(source_name))));
+	}
+
 	if (OidIsValid(get_database_oid(branch_name, true)))
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_DATABASE),

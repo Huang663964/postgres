@@ -489,6 +489,33 @@ ALTER DATABASE dbbranch_no_conn_source WITH ALLOW_CONNECTIONS true;
 DROP DATABASE dbbranch_no_conn_source;
 ]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_collversion_source;]);
+$node->safe_psql(
+	'postgres',
+	q[UPDATE pg_database SET datcollversion = 'dbbranch-bogus-version' WHERE datname = 'dbbranch_collversion_source';]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_collversion_target FROM DATABASE dbbranch_collversion_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects source database with collation version mismatch');
+like(
+	$stderr,
+	qr/source database "dbbranch_collversion_source" has a collation version/,
+	'db branch reports source collation version mismatch');
+
+my $collversion_branch_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_collversion_target';]);
+is($collversion_branch_count, '0', 'collation version rejection creates no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, $metadata_file_count, 'collation version rejection writes no metadata file');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_collversion_source;]);
+
 my $func_lookup = $node->safe_psql(
 	'postgres',
 	q[SELECT to_regprocedure('pg_create_database_branch(name,name)') IS NULL;]);
