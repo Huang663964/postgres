@@ -106,6 +106,21 @@ if ($result == 0)
 		qr/CREATE_FILE_COPY.*copy dir \Q$source_locator\E to \Q$branch_locator\E/,
 		'db branch creation records database file-copy WAL');
 
+	$node->restart;
+	my $branch_rows_after_restart = $node->safe_psql(
+		'dbbranch_target',
+		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
+	is($branch_rows_after_restart, '1:alice,2:bob', 'ready branch survives restart');
+	my $catalog_state_after_restart = $node->safe_psql(
+		'postgres',
+		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = ]
+		  . $branch_oid
+		  . q[;]);
+	is(
+		$catalog_state_after_restart,
+		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|',
+		'pg_dbbranch READY metadata survives restart');
+
 	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (3, 'dora');]);
 	my $source_after_branch_write = $node->safe_psql(
 		'dbbranch_source',
