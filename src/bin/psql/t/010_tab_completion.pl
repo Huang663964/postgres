@@ -45,6 +45,7 @@ $node->safe_psql('postgres',
 	  . "CREATE TABLE \"mixedName\" (f1 int, f2 text);\n"
 	  . "CREATE TYPE enum1 AS ENUM ('foo', 'bar', 'baz', 'BLACK');\n"
 	  . "CREATE PUBLICATION some_publication;\n");
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_tab_source;');
 
 # In a VPATH build, we'll be started in the source directory, but we want
 # to run in the build directory so that we can use relative paths to
@@ -345,6 +346,27 @@ check_completion(
 	"CREATE TABLE mytab\t\t",
 	qr/mytab123 +mytab246/,
 	"check words_after_create");
+
+clear_query();
+
+check_completion(
+	"CREATE BR\t",
+	qr/CREATE BRANCH /,
+	"complete CREATE BRANCH command");
+
+clear_query();
+
+check_completion(
+	"CREATE BRANCH dbbranch_tab_target \t",
+	qr/FROM DATABASE /,
+	"complete CREATE BRANCH target with FROM DATABASE");
+
+clear_query();
+
+check_completion(
+	"CREATE BRANCH dbbranch_tab_target FROM DATABASE dbbranch_tab\t",
+	qr/dbbranch_tab_source /,
+	"complete CREATE BRANCH source database name");
 
 clear_query();
 

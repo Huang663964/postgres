@@ -1276,6 +1276,7 @@ static const char *const Keywords_for_user_thing[] = {
 static const pgsql_thing_t words_after_create[] = {
 	{"ACCESS METHOD", NULL, NULL, NULL, NULL, THING_NO_ALTER},
 	{"AGGREGATE", NULL, NULL, Query_for_list_of_aggregates},
+	{"BRANCH", NULL, NULL, NULL, NULL, THING_NO_DROP | THING_NO_ALTER},
 	{"CAST", NULL, NULL, NULL}, /* Casts have complex structures for names, so
 								 * skip it */
 	{"COLLATION", NULL, NULL, &Query_for_list_of_collations},
@@ -3356,6 +3357,12 @@ match_previous_words(int pattern_id,
 		else if (TailMatches("DETERMINISTIC", "="))
 			COMPLETE_WITH("true", "false");
 	}
+
+	/* CREATE BRANCH */
+	else if (Matches("CREATE", "BRANCH", MatchAny))
+		COMPLETE_WITH("FROM DATABASE");
+	else if (Matches("CREATE", "BRANCH", MatchAny, "FROM", "DATABASE"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_databases);
 
 	/* CREATE DATABASE */
 	else if (Matches("CREATE", "DATABASE", MatchAny))
