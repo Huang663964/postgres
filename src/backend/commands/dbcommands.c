@@ -3399,37 +3399,39 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	}
 
 	redo_ptr = PinDBBranchWal(wal_pin_name);
-	branch_lsn = GetXLogInsertEndRecPtr();
-	XLogFlush(branch_lsn);
-	FlushDatabaseBuffers(source_dboid);
-
-	if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
+	PG_TRY();
 	{
-		bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+		branch_lsn = GetXLogInsertEndRecPtr();
+		XLogFlush(branch_lsn);
+		FlushDatabaseBuffers(source_dboid);
 
-		if (strncmp(failure, ficlone_required, strlen(ficlone_required)) == 0 &&
-			cleanup_ok)
+		if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
 		{
-			/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
-			copydir(srcpath, clone_path, false);
-			clone_result = "copy_fallback";
-		}
-		else
-		{
-			ReleaseDBBranchWalPin();
-			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+			bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+
+			if (strncmp(failure, ficlone_required, strlen(ficlone_required)) == 0 &&
+				cleanup_ok)
+			{
+				/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
+				copydir(srcpath, clone_path, false);
+				clone_result = "copy_fallback";
+			}
+			else
+			{
+				ReleaseDBBranchWalPin();
+				WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 							  redo_ptr, branch_lsn, clone_path,
 							  "released",
 							  "failed", cleanup_ok ? "done" : "failed",
 							  "not_started",
 							  "CREATING,COPYING,FAILED", "FAILED", failure);
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("%s", failure)));
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("%s", failure)));
+			}
 		}
-	}
 
-	branch_dboid = InstallDBBranchDatabase(source_dboid, branch_name, clone_path,
+		branch_dboid = InstallDBBranchDatabase(source_dboid, branch_name, clone_path,
 									   source_encoding, source_hasloginevt,
 									   source_frozenxid, source_minmxid,
 									   source_deftablespace, source_collate,
@@ -3437,17 +3439,24 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 									   source_icurules, source_locprovider,
 									   source_collversion);
 
-	LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
-	InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
-					  "source_flush", "READY", "");
-	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
-					  CHECKPOINT_WAIT);
-	ReleaseDBBranchWalPin();
-	WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-					  redo_ptr, branch_lsn, clone_path,
-					  "released",
-					  clone_result, "not_needed", "source_flush",
-					  "CREATING,COPYING,READY", "READY", "");
+		LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
+		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
+						  "source_flush", "READY", "");
+		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
+						  CHECKPOINT_WAIT);
+		ReleaseDBBranchWalPin();
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "released",
+						  clone_result, "not_needed", "source_flush",
+						  "CREATING,COPYING,READY", "READY", "");
+	}
+	PG_CATCH();
+	{
+		ReleaseDBBranchWalPin();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	return branch_dboid;
 }
