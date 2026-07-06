@@ -10,7 +10,7 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('node');
-$node->init;
+$node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf', 'max_prepared_transactions = 10');
 $node->start;
 
@@ -1188,5 +1188,42 @@ my $cmdtag_rows = $node->safe_psql(
 is($cmdtag_rows, '1', 'command-tag branch copies source data');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_source;]);
+
+my $minimal_node = PostgreSQL::Test::Cluster->new('minimal');
+$minimal_node->init;
+$minimal_node->append_conf('postgresql.conf', qq[
+wal_level = minimal
+max_wal_senders = 0
+]);
+$minimal_node->start;
+$minimal_node->safe_psql('postgres', q[CREATE DATABASE dbbranch_minimal_source;]);
+$minimal_node->safe_psql(
+	'dbbranch_minimal_source',
+	q[
+CREATE TABLE minimal_rows (id int PRIMARY KEY);
+INSERT INTO minimal_rows VALUES (1);
+]);
+
+$stderr = '';
+$result = $minimal_node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_minimal_target FROM DATABASE dbbranch_minimal_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects wal_level=minimal');
+like(
+	$stderr,
+	qr/CREATE BRANCH can only be used if "wal_level" >= "replica"/,
+	'db branch reports wal_level requirement');
+
+my $minimal_branch_count = $minimal_node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_minimal_target';]);
+is($minimal_branch_count, '0', 'wal_level rejection creates no branch database');
+
+my @minimal_metadata_files = glob $minimal_node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @minimal_metadata_files, 0, 'wal_level rejection writes no metadata file');
+
+$minimal_node->stop;
 
 done_testing();

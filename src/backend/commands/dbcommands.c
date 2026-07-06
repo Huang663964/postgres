@@ -3803,6 +3803,12 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	volatile bool source_lock_held = false;
 
 
+	if (wal_level < WAL_LEVEL_REPLICA)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CREATE BRANCH can only be used if \"wal_level\" >= \"replica\""),
+				 errhint("\"wal_level\" must be set to \"replica\" or \"logical\" at server start.")));
+
 	if (!get_db_info(source_name, ShareLock,
 					 &source_dboid, NULL, &source_encoding,
 					 &source_istemplate, &source_allowconn, &source_connlimit,
