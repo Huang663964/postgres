@@ -3667,6 +3667,16 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 		Int64GetDatum((int64) wal_scan->records);
 	values[Anum_pg_dbbranch_wal_source_records - 1] =
 		Int64GetDatum((int64) wal_scan->source_records);
+	values[Anum_pg_dbbranch_wal_other_db_records - 1] =
+		Int64GetDatum((int64) wal_scan->other_db_records);
+	values[Anum_pg_dbbranch_wal_mixed_records - 1] =
+		Int64GetDatum((int64) wal_scan->mixed_records);
+	values[Anum_pg_dbbranch_wal_global_records - 1] =
+		Int64GetDatum((int64) wal_scan->global_records);
+	values[Anum_pg_dbbranch_wal_source_fpi_blocks - 1] =
+		Int64GetDatum((int64) wal_scan->source_fpi_blocks);
+	values[Anum_pg_dbbranch_wal_source_non_fpi_records - 1] =
+		Int64GetDatum((int64) wal_scan->source_non_fpi_records);
 	values[Anum_pg_dbbranch_clone_elapsed_ms - 1] =
 		Float8GetDatum(clone_elapsed_ms);
 	values[Anum_pg_dbbranch_replay_elapsed_ms - 1] =
