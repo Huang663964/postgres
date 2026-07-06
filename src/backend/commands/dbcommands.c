@@ -35,6 +35,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogreader.h"
 #include "access/xlogrecovery.h"
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
@@ -118,6 +119,12 @@ typedef struct CreateDBRelInfo
 	bool		permanent;		/* relation is permanent or unlogged */
 } CreateDBRelInfo;
 
+typedef struct DBBranchWalScan
+{
+	uint64		records;
+	uint64		source_records;
+} DBBranchWalScan;
+
 
 /* non-export function prototypes */
 static void createdb_failure_callback(int code, Datum arg);
@@ -154,8 +161,11 @@ static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *wal_pin,
 								  const char *clone_result, const char *cleanup,
 								  const char *replay_method,
+								  const DBBranchWalScan *wal_scan,
 								  const char *status_history, const char *status,
 								  const char *failure);
+static void ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
+								 XLogRecPtr end_lsn, DBBranchWalScan *wal_scan);
 static bool CleanupDBBranchClonePath(const char *clone_path);
 static Oid InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
 								   const char *clone_path,
@@ -2833,6 +2843,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 					  const char *wal_pin,
 					  const char *clone_result, const char *cleanup,
 					  const char *replay_method,
+					  const DBBranchWalScan *wal_scan,
 					  const char *status_history, const char *status,
 					  const char *failure)
 {
@@ -2840,6 +2851,8 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 	FILE	   *file;
 	uint32		branch_hash;
 	uint64		wal_range_bytes = 0;
+	uint64		wal_records_scanned = wal_scan ? wal_scan->records : 0;
+	uint64		wal_source_records = wal_scan ? wal_scan->source_records : 0;
 	bool		ok;
 
 	if (!XLogRecPtrIsInvalid(redo_ptr) &&
@@ -2864,6 +2877,8 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "redo_ptr=%X/%X\n"
 			 "branch_lsn=%X/%X\n"
 			 "wal_range_bytes=" UINT64_FORMAT "\n"
+			 "wal_records_scanned=" UINT64_FORMAT "\n"
+			 "wal_source_records=" UINT64_FORMAT "\n"
 			 "clone_path=%s\n"
 			 "wal_pin=%s\n"
 			 "clone_result=%s\n"
@@ -2874,7 +2889,8 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "failure=%s\n",
 			 source_dboid, source_name, branch_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
-			 wal_range_bytes, clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
+			 wal_range_bytes, wal_records_scanned, wal_source_records,
+			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
 			 replay_method, status_history, status, failure) >= 0;
 
 	if (ferror(file))
@@ -2890,6 +2906,105 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 	fsync_fname(path, false);
 	fsync_fname("global", true);
 }
+
+static void
+ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
+					 XLogRecPtr end_lsn, DBBranchWalScan *wal_scan)
+{
+	ReadLocalXLogPageNoWaitPrivate *private_data;
+	XLogReaderState *xlogreader;
+	XLogRecPtr	first_valid_record;
+	char	   *errormsg;
+
+	Assert(wal_scan != NULL);
+	wal_scan->records = 0;
+	wal_scan->source_records = 0;
+
+	if (XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(end_lsn) ||
+		end_lsn <= start_lsn || start_lsn < XLOG_BLCKSZ)
+		return;
+
+	private_data = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	xlogreader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								private_data);
+	if (xlogreader == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory"),
+				 errdetail("Failed while allocating a WAL reading processor.")));
+
+	first_valid_record = XLogFindNextRecord(xlogreader, start_lsn);
+	if (XLogRecPtrIsInvalid(first_valid_record) || first_valid_record >= end_lsn)
+	{
+		XLogReaderFree(xlogreader);
+		pfree(private_data);
+		return;
+	}
+
+	/* ponytail: scan only; branch-local redo will reuse this source DB filter. */
+	for (;;)
+	{
+		XLogRecord *record;
+		bool		touches_source = false;
+
+		errormsg = NULL;
+		record = XLogReadRecord(xlogreader, &errormsg);
+		if (record == NULL)
+		{
+			if (private_data->end_of_wal)
+				break;
+			if (errormsg)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read WAL at %X/%X: %s",
+								LSN_FORMAT_ARGS(xlogreader->EndRecPtr), errormsg)));
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read WAL at %X/%X",
+							LSN_FORMAT_ARGS(xlogreader->EndRecPtr))));
+		}
+
+		if (xlogreader->ReadRecPtr >= end_lsn)
+			break;
+		if (xlogreader->EndRecPtr > end_lsn)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("DB Branch WAL scan endpoint is not a record boundary")));
+
+		wal_scan->records++;
+
+		if (XLogRecHasAnyBlockRefs(xlogreader))
+		{
+			uint8		block_id;
+
+			for (block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader); block_id++)
+			{
+				RelFileLocator rlocator;
+
+				if (!XLogRecGetBlockTagExtended(xlogreader, block_id, &rlocator,
+											NULL, NULL, NULL))
+					continue;
+				if (rlocator.dbOid == source_dboid)
+				{
+					touches_source = true;
+					break;
+				}
+			}
+		}
+
+		if (touches_source)
+			wal_scan->source_records++;
+		if (xlogreader->EndRecPtr >= end_lsn)
+			break;
+	}
+
+	XLogReaderFree(xlogreader);
+	pfree(private_data);
+}
+
 
 static bool
 CleanupDBBranchClonePath(const char *clone_path)
@@ -3279,6 +3394,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	int		npreparedxacts;
 	XLogRecPtr redo_ptr;
 	XLogRecPtr branch_lsn;
+	DBBranchWalScan wal_scan;
 	uint32		branch_hash;
 	char		srcpath[MAXPGPATH];
 	char		clone_path[MAXPGPATH];
@@ -3338,6 +3454,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
 						  "not_started",
 						  "not_started", "not_started", "not_started",
+						  NULL,
 						  "CREATING,FAILED", "FAILED", busy_failure);
 		if (npreparedxacts > 0 && notherbackends == 0)
 			ereport(ERROR,
@@ -3368,6 +3485,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
 						  "not_started",
 						  "not_started", "not_started", "not_started",
+						  NULL,
 						  "CREATING,FAILED", "FAILED", tablespace_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3383,6 +3501,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
 						  "not_started",
 						  "not_started", "not_started", "not_started",
+						  NULL,
 						  "CREATING,FAILED", "FAILED", unlogged_failure);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3398,6 +3517,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
 						  "not_started",
 						  "not_started", "failed", "not_started",
+						  NULL,
 						  "CREATING,FAILED", "FAILED", cleanup_failure);
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -3410,6 +3530,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		branch_lsn = GetXLogInsertEndRecPtr();
 		XLogFlush(branch_lsn);
 		FlushDatabaseBuffers(source_dboid);
+		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, &wal_scan);
 
 		if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
 		{
@@ -3430,6 +3551,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 							  "released",
 							  "failed", cleanup_ok ? "done" : "failed",
 							  "not_started",
+							  NULL,
 							  "CREATING,COPYING,FAILED", "FAILED", failure);
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3455,6 +3577,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
 						  clone_result, "not_needed", "source_flush",
+						  &wal_scan,
 						  "CREATING,COPYING,READY", "READY", "");
 	}
 	PG_CATCH();

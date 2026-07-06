@@ -50,6 +50,8 @@ unlike($metadata, qr/^redo_ptr=0\/0$/m, 'redo pointer is valid');
 like($metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m, 'metadata records branch LSN');
 unlike($metadata, qr/^branch_lsn=0\/0$/m, 'branch LSN is valid');
 like($metadata, qr/^wal_range_bytes=[0-9]+$/m, 'metadata records WAL range size');
+like($metadata, qr/^wal_records_scanned=[0-9]+$/m, 'metadata records scanned WAL count');
+like($metadata, qr/^wal_source_records=[0-9]+$/m, 'metadata records source WAL count');
 like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
 like($metadata, qr/^wal_pin=released$/m, 'metadata records released WAL pin');
 like($metadata, qr/^replay_method=source_flush$/m, 'metadata records source flush replay method');
@@ -257,6 +259,8 @@ for my $path (@metadata_files)
 }
 
 like($tablespace_metadata, qr/^wal_range_bytes=0$/m, 'tablespace metadata records zero WAL range');
+like($tablespace_metadata, qr/^wal_records_scanned=0$/m, 'tablespace metadata records zero scanned WAL count');
+like($tablespace_metadata, qr/^wal_source_records=0$/m, 'tablespace metadata records zero source WAL count');
 like($tablespace_metadata, qr/^wal_pin=not_started$/m, 'tablespace metadata records WAL pin not started');
 like($tablespace_metadata, qr/^clone_result=not_started$/m, 'tablespace metadata records clone not started');
 like($tablespace_metadata, qr/^cleanup=not_started$/m, 'tablespace metadata records cleanup not started');
