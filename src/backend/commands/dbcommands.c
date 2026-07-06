@@ -2839,7 +2839,12 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 	char		path[MAXPGPATH];
 	FILE	   *file;
 	uint32		branch_hash;
+	uint64		wal_range_bytes = 0;
 	bool		ok;
+
+	if (!XLogRecPtrIsInvalid(redo_ptr) &&
+		!XLogRecPtrIsInvalid(branch_lsn) && branch_lsn >= redo_ptr)
+		wal_range_bytes = branch_lsn - redo_ptr;
 
 	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
 	snprintf(path, sizeof(path), "global/pg_dbbranch_%u_%08x.state",
@@ -2858,6 +2863,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "branch_name=%s\n"
 			 "redo_ptr=%X/%X\n"
 			 "branch_lsn=%X/%X\n"
+			 "wal_range_bytes=" UINT64_FORMAT "\n"
 			 "clone_path=%s\n"
 			 "wal_pin=%s\n"
 			 "clone_result=%s\n"
@@ -2868,7 +2874,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "failure=%s\n",
 			 source_dboid, source_name, branch_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
-			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
+			 wal_range_bytes, clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
 			 replay_method, status_history, status, failure) >= 0;
 
 	if (ferror(file))
