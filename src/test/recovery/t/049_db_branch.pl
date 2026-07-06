@@ -58,6 +58,8 @@ like($metadata, qr/^wal_mixed_records=[0-9]+$/m, 'metadata records mixed WAL cou
 like($metadata, qr/^wal_global_records=[0-9]+$/m, 'metadata records global WAL count');
 like($metadata, qr/^wal_source_fpi_blocks=[0-9]+$/m, 'metadata records source FPI block count');
 like($metadata, qr/^wal_source_non_fpi_records=[0-9]+$/m, 'metadata records source non-FPI record count');
+like($metadata, qr/^clone_elapsed_ms=[0-9]+(\.[0-9]+)?$/m, 'metadata records clone elapsed time');
+like($metadata, qr/^replay_elapsed_ms=[0-9]+(\.[0-9]+)?$/m, 'metadata records replay elapsed time');
 my ($wal_records_scanned) = $metadata =~ /^wal_records_scanned=([0-9]+)$/m;
 my ($wal_source_records) = $metadata =~ /^wal_source_records=([0-9]+)$/m;
 my ($wal_other_db_records) = $metadata =~ /^wal_other_db_records=([0-9]+)$/m;
