@@ -152,6 +152,15 @@ if ($result == 0)
 		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
 	is($source_after_branch_write, '1:alice,2:bob,3:carol', 'branch writes do not affect source');
 
+	$node->safe_psql('dbbranch_source', q[INSERT INTO users VALUES (6, 'frank');]);
+	my $branch_after_source_write = $node->safe_psql(
+		'dbbranch_target',
+		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
+	is(
+		$branch_after_source_write,
+		'1:alice,2:bob,3:carol,4:dora',
+		'source writes after branch creation do not affect branch');
+
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_target;]);
 	my $catalog_after_drop = $node->safe_psql(
 		'postgres',
