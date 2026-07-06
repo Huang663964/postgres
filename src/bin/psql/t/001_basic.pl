@@ -75,6 +75,11 @@ $node->start;
 psql_like($node, '\copyright', qr/Copyright/, '\copyright');
 psql_like($node, '\help', qr/ALTER/, '\help without arguments');
 psql_like($node, '\help SELECT', qr/SELECT/, '\help with argument');
+psql_like(
+	$node,
+	'\help CREATE BRANCH',
+	qr/create a database branch.*CREATE BRANCH .*FROM DATABASE/s,
+	'\help CREATE BRANCH');
 
 # Test clean handling of unsupported replication command responses
 psql_fails_like(
