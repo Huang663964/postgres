@@ -207,9 +207,10 @@ static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  const DBBranchWalScan *wal_scan,
 								  const char *replay_method,
 								  const char *status, const char *failure);
-static bool SourceDatabaseHasUnloggedRelations(Oid source_dboid,
-										 Oid source_deftablespace,
-										 char *srcpath);
+static bool ScanDBBranchSourceRelations(Oid source_dboid,
+										Oid source_deftablespace,
+										char *srcpath,
+										List **tablespace_oids);
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -3616,24 +3617,26 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 }
 
 static bool
-SourceDatabaseHasUnloggedRelations(Oid source_dboid, Oid source_deftablespace,
-								   char *srcpath)
+ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
+										char *srcpath, List **tablespace_oids)
 {
 	List	   *rlocatorlist;
 	ListCell   *cell;
 	bool		has_unlogged = false;
 
+	*tablespace_oids = list_make1_oid(source_deftablespace);
 	rlocatorlist = ScanSourceDatabasePgClass(source_deftablespace,
 										 source_dboid, srcpath);
 	foreach(cell, rlocatorlist)
 	{
 		CreateDBRelInfo *relinfo = (CreateDBRelInfo *) lfirst(cell);
 
+		if (!list_member_oid(*tablespace_oids, relinfo->rlocator.spcOid))
+			*tablespace_oids = lappend_oid(*tablespace_oids,
+										 relinfo->rlocator.spcOid);
+
 		if (!relinfo->permanent)
-		{
 			has_unlogged = true;
-			break;
-		}
 	}
 	list_free_deep(rlocatorlist);
 
@@ -3659,6 +3662,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	char	   *source_collversion;
 	Oid		branch_dboid;
 	const char *clone_result = "done";
+	List	   *tablespace_oids = NIL;
+	ListCell   *cell;
 	bool		source_has_unlogged;
 	int		notherbackends;
 	int		npreparedxacts;
@@ -3746,8 +3751,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	MakeDBBranchWalPinName(source_dboid, branch_hash, wal_pin_name,
 						   sizeof(wal_pin_name));
 
-	source_has_unlogged = SourceDatabaseHasUnloggedRelations(source_dboid,
-										   source_deftablespace, srcpath);
+	source_has_unlogged = ScanDBBranchSourceRelations(source_dboid,
+										   source_deftablespace, srcpath,
+										   &tablespace_oids);
 	branch_dboid = AllocateDBBranchDatabaseOid();
 	/* ponytail: final path avoids a DB-branch-only relpath hook. */
 	pfree(clone_path);
@@ -3766,31 +3772,53 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			FlushDatabaseBuffers(source_dboid);
 		}
 
-		if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
+		foreach(cell, tablespace_oids)
 		{
-			bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+			Oid			tablespace_oid = lfirst_oid(cell);
+			char	   *frompath = GetDatabasePath(source_dboid, tablespace_oid);
+			char	   *topath = GetDatabasePath(branch_dboid, tablespace_oid);
 
-			if (strncmp(failure, ficlone_required, strlen(ficlone_required)) == 0 &&
-				cleanup_ok)
+			if (!CloneDBBranchDirectory(frompath, topath, failure, sizeof(failure)))
 			{
-				/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
-				copydir(srcpath, clone_path, false);
-				clone_result = "copy_fallback";
+				bool		cleanup_ok = CleanupDBBranchClonePath(topath);
+
+				if (strncmp(failure, ficlone_required,
+							strlen(ficlone_required)) == 0 && cleanup_ok)
+				{
+					/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
+					copydir(frompath, topath, false);
+					clone_result = "copy_fallback";
+				}
+				else
+				{
+					foreach(cell, tablespace_oids)
+					{
+						char	   *path = GetDatabasePath(branch_dboid,
+													  lfirst_oid(cell));
+
+						if (!CleanupDBBranchClonePath(path))
+							cleanup_ok = false;
+						pfree(path);
+					}
+
+					pfree(frompath);
+					pfree(topath);
+					ReleaseDBBranchWalPin();
+					WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+								  redo_ptr, branch_lsn, clone_path,
+								  "released",
+								  "failed", cleanup_ok ? "done" : "failed",
+								  "not_started",
+								  NULL,
+								  "CREATING,COPYING,FAILED", "FAILED", failure);
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("%s", failure)));
+				}
 			}
-			else
-			{
-				ReleaseDBBranchWalPin();
-				WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-							  redo_ptr, branch_lsn, clone_path,
-							  "released",
-							  "failed", cleanup_ok ? "done" : "failed",
-							  "not_started",
-							  NULL,
-							  "CREATING,COPYING,FAILED", "FAILED", failure);
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("%s", failure)));
-			}
+
+			pfree(frompath);
+			pfree(topath);
 		}
 
 		if (!ReplayDBBranchWal(source_dboid, branch_dboid,
@@ -3800,7 +3828,15 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 			DropDatabaseBuffers(branch_dboid);
 			ForgetDatabaseSyncRequests(branch_dboid);
-			cleanup_ok = CleanupDBBranchClonePath(clone_path);
+			cleanup_ok = true;
+			foreach(cell, tablespace_oids)
+			{
+				char	   *path = GetDatabasePath(branch_dboid, lfirst_oid(cell));
+
+				if (!CleanupDBBranchClonePath(path))
+					cleanup_ok = false;
+				pfree(path);
+			}
 
 			ReleaseDBBranchWalPin();
 			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
@@ -3825,7 +3861,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 									   source_icurules, source_locprovider,
 									   source_collversion);
 
-		LogDBBranchCreateFileCopy(source_dboid, branch_dboid, source_deftablespace);
+		foreach(cell, tablespace_oids)
+			LogDBBranchCreateFileCopy(source_dboid, branch_dboid, lfirst_oid(cell));
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
 						  &wal_scan, "rmgr_redo", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |

@@ -480,6 +480,45 @@ is(scalar @metadata_files, 5, 'invalid source rejection writes no metadata file'
 
 $node->safe_psql('postgres', 'DROP DATABASE dbbranch_invalid_source;');
 
+my $rel_tablespace_dir = $node->basedir . '/dbbranch_rel_ts';
+mkdir($rel_tablespace_dir) or die "could not create $rel_tablespace_dir: $!";
+$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_rel_ts LOCATION '$rel_tablespace_dir';");
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_rel_ts_source;');
+$node->safe_psql(
+	'dbbranch_rel_ts_source',
+	q[
+CREATE TABLE rel_ts_rows (id int PRIMARY KEY, name text NOT NULL) TABLESPACE dbbranch_rel_ts;
+INSERT INTO rel_ts_rows VALUES (1, 'rel-ts');
+CHECKPOINT;
+INSERT INTO rel_ts_rows VALUES (2, 'redo');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_rel_ts_target FROM DATABASE dbbranch_rel_ts_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch supports relations in non-default tablespaces');
+
+my $rel_tablespace_rows = $node->safe_psql(
+	'dbbranch_rel_ts_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM rel_ts_rows;]);
+is($rel_tablespace_rows, '1:rel-ts,2:redo',
+	'relation tablespace branch reads cloned and replayed rows');
+
+my $rel_tablespace_path = $node->safe_psql(
+	'dbbranch_rel_ts_target',
+	q[SELECT pg_relation_filepath('rel_ts_rows');]);
+like($rel_tablespace_path, qr/^pg_tblspc\/[0-9]+\/[^\/]+\/[0-9]+\/[0-9]+$/,
+	'relation tablespace file stays under pg_tblspc');
+ok(-f $node->data_dir . '/' . $rel_tablespace_path,
+	'relation tablespace branch file exists');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_source;]);
+$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_rel_ts;]);
+
 $node->append_conf('postgresql.conf', 'full_page_writes = off');
 $node->reload;
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_nonfpi_source;');
