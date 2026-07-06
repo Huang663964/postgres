@@ -3801,8 +3801,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	volatile bool clone_paths_created = false;
 	int		notherbackends;
 	int		npreparedxacts;
-	XLogRecPtr redo_ptr;
-	XLogRecPtr branch_lsn;
+	XLogRecPtr redo_ptr = InvalidXLogRecPtr;
+	XLogRecPtr branch_lsn = InvalidXLogRecPtr;
 	DBBranchWalScan wal_scan;
 	uint32		branch_hash;
 	char	   *srcpath;
@@ -3942,8 +3942,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	}
 	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
 	srcpath = GetDatabasePath(source_dboid, source_deftablespace);
-	clone_path = psprintf("pg_dbbranch_%u_%08x",
-					   source_dboid, (unsigned int) branch_hash);
 	MakeDBBranchWalPinName(source_dboid, branch_hash, wal_pin_name,
 						   sizeof(wal_pin_name));
 
@@ -3952,10 +3950,52 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 										   &tablespace_oids, &source_has_sequence);
 	branch_dboid = AllocateDBBranchDatabaseOid();
 	/* ponytail: final path avoids a DB-branch-only relpath hook. */
-	pfree(clone_path);
 	clone_path = GetDatabasePath(branch_dboid, source_deftablespace);
 
-	redo_ptr = PinDBBranchWal(wal_pin_name);
+	{
+		MemoryContext oldcontext = CurrentMemoryContext;
+
+		PG_TRY();
+		{
+			redo_ptr = PinDBBranchWal(wal_pin_name);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+			int			sqlerrcode;
+
+			MemoryContextSwitchTo(oldcontext);
+			edata = CopyErrorData();
+			FlushErrorState();
+			sqlerrcode = edata->sqlerrcode;
+			snprintf(failure, sizeof(failure), "%s",
+					 edata->message ? edata->message : "could not pin DB Branch WAL");
+			FreeErrorData(edata);
+
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+			source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+
+			if (source_lock_held)
+			{
+				UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
+				source_lock_held = false;
+			}
+			ReleaseDBBranchWalPin();
+			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "failed",
+						  "not_started", "not_started", "not_started",
+						  NULL,
+						  source_blocking_ms, 0.0, 0.0,
+						  "CREATING,FAILED", "FAILED", failure);
+			ereport(ERROR,
+					(errcode(sqlerrcode),
+					 errmsg("%s", failure)));
+		}
+		PG_END_TRY();
+	}
+
 	PG_TRY();
 	{
 		branch_lsn = GetXLogInsertEndRecPtr();

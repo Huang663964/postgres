@@ -1395,4 +1395,64 @@ is(scalar @slotless_metadata_files, 0, 'slotless WAL pin rejection writes no met
 
 $slotless_node->stop;
 
+my $slotfull_node = PostgreSQL::Test::Cluster->new('slotfull');
+$slotfull_node->init;
+$slotfull_node->append_conf('postgresql.conf', qq[
+wal_level = replica
+max_replication_slots = 1
+]);
+$slotfull_node->start;
+$slotfull_node->safe_psql('postgres', q[CREATE DATABASE dbbranch_slotfull_source;]);
+$slotfull_node->safe_psql(
+	'dbbranch_slotfull_source',
+	q[
+CREATE TABLE slotfull_rows (id int PRIMARY KEY);
+INSERT INTO slotfull_rows VALUES (1);
+]);
+$slotfull_node->safe_psql(
+	'postgres',
+	q[SELECT pg_create_physical_replication_slot('dbbranch_busy_slot');]);
+
+$stderr = '';
+$result = $slotfull_node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_slotfull_target FROM DATABASE dbbranch_slotfull_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects exhausted replication slots');
+like(
+	$stderr,
+	qr/all replication slots are in use/,
+	'db branch reports exhausted replication slots');
+
+my $slotfull_branch_count = $slotfull_node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_slotfull_target';]);
+is($slotfull_branch_count, '0', 'exhausted WAL pin creates no branch database');
+
+my @slotfull_metadata_files = glob $slotfull_node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @slotfull_metadata_files, 1, 'exhausted WAL pin writes failure metadata');
+
+open my $slotfull_metadata_fh, '<', $slotfull_metadata_files[0]
+  or die "could not open $slotfull_metadata_files[0]: $!";
+my $slotfull_metadata = do { local $/; <$slotfull_metadata_fh> };
+close $slotfull_metadata_fh;
+
+like($slotfull_metadata, qr/^branch_name=dbbranch_slotfull_target$/m,
+	'exhausted WAL pin metadata records branch name');
+like($slotfull_metadata, qr/^wal_pin=failed$/m,
+	'exhausted WAL pin metadata records failed WAL pin');
+like($slotfull_metadata, qr/^clone_result=not_started$/m,
+	'exhausted WAL pin metadata records clone not started');
+like($slotfull_metadata, qr/^status=FAILED$/m,
+	'exhausted WAL pin metadata final state is FAILED');
+like($slotfull_metadata, qr/^failure=all replication slots are in use$/m,
+	'exhausted WAL pin metadata records failure reason');
+my ($slotfull_clone_path) = $slotfull_metadata =~ /^clone_path=(.*)$/m;
+ok(!-e $slotfull_node->data_dir . '/' . $slotfull_clone_path,
+	'exhausted WAL pin creates no clone path');
+
+$slotfull_node->safe_psql('postgres', q[SELECT pg_drop_replication_slot('dbbranch_busy_slot');]);
+$slotfull_node->stop;
+
 done_testing();
