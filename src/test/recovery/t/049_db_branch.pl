@@ -345,10 +345,15 @@ is($func_branch_count, '0', 'disabled SQL wrapper creates no branch database');
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 is(scalar @metadata_files, 1, 'disabled SQL wrapper writes no metadata file');
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_setting_role LOGIN;');
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_setting_source;');
 $node->safe_psql(
 	'postgres',
-	q[ALTER DATABASE dbbranch_setting_source SET work_mem = '64MB';]);
+	q[
+ALTER DATABASE dbbranch_setting_source SET work_mem = '64MB';
+ALTER ROLE dbbranch_setting_role IN DATABASE dbbranch_setting_source
+	SET maintenance_work_mem = '32MB';
+]);
 $node->safe_psql(
 	'dbbranch_setting_source',
 	q[
@@ -372,12 +377,18 @@ is($setting_work_mem, '64MB', 'branch applies copied database-level setting');
 my $setting_branch_oid = $node->safe_psql(
 	'postgres',
 	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_setting_target';]);
+my $setting_role_work_mem = $node->safe_psql(
+	'dbbranch_setting_target',
+	q[SHOW maintenance_work_mem;],
+	extra_params => [ '--username' => 'dbbranch_setting_role' ]);
+is($setting_role_work_mem, '32MB', 'branch applies copied role-in-database setting');
+
 my $setting_rows = $node->safe_psql(
 	'postgres',
 	q[SELECT count(*) FROM pg_db_role_setting WHERE setdatabase = ]
 	  . $setting_branch_oid
-	  . q[ AND setrole = 0;]);
-is($setting_rows, '1', 'branch has copied pg_db_role_setting row');
+	  . q[;]);
+is($setting_rows, '2', 'branch has copied database and role-in-database settings');
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_setting_target;]);
 my $setting_rows_after_drop = $node->safe_psql(
@@ -391,6 +402,7 @@ $node->safe_psql(
 	'postgres',
 	q[ALTER DATABASE dbbranch_setting_source RESET work_mem;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_setting_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_setting_role;]);
 
 my $tablespace_dir = $node->basedir . '/dbbranch_ts';
 mkdir($tablespace_dir) or die "could not create $tablespace_dir: $!";
