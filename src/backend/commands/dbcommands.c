@@ -178,6 +178,7 @@ static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *clone_result, const char *cleanup,
 								  const char *replay_method,
 								  const DBBranchWalScan *wal_scan,
+								  double source_blocking_ms,
 								  double clone_elapsed_ms, double replay_elapsed_ms,
 								  const char *status_history, const char *status,
 								  const char *failure);
@@ -216,6 +217,7 @@ static void DeleteDBBranchCatalogForDatabase(Oid dboid);
 static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 								  const DBBranchWalScan *wal_scan,
+								  double source_blocking_ms,
 								  double clone_elapsed_ms, double replay_elapsed_ms,
 								  TimestampTz created_at, TimestampTz ready_at,
 								  const char *clone_result,
@@ -2881,6 +2883,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 					  const char *clone_result, const char *cleanup,
 					  const char *replay_method,
 					  const DBBranchWalScan *wal_scan,
+					  double source_blocking_ms,
 					  double clone_elapsed_ms, double replay_elapsed_ms,
 					  const char *status_history, const char *status,
 					  const char *failure)
@@ -2929,6 +2932,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "wal_source_fpi_blocks=" UINT64_FORMAT "\n"
 			 "wal_source_non_fpi_records=" UINT64_FORMAT "\n"
 			 "wal_replayed_records=" UINT64_FORMAT "\n"
+			 "source_blocking_ms=%.3f\n"
 			 "clone_elapsed_ms=%.3f\n"
 			 "replay_elapsed_ms=%.3f\n"
 			 "clone_path=%s\n"
@@ -2944,7 +2948,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 wal_range_bytes, wal_records_scanned, wal_source_records,
 			 wal_other_db_records, wal_mixed_records, wal_global_records,
 			 wal_source_fpi_blocks, wal_source_non_fpi_records,
-			 wal_replayed_records,
+			 wal_replayed_records, source_blocking_ms,
 			 clone_elapsed_ms, replay_elapsed_ms,
 			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
 			 replay_method, status_history, status, failure) >= 0;
@@ -3672,6 +3676,7 @@ static void
 InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 					  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 					  const DBBranchWalScan *wal_scan,
+					  double source_blocking_ms,
 					  double clone_elapsed_ms, double replay_elapsed_ms,
 					  TimestampTz created_at, TimestampTz ready_at,
 					  const char *clone_result,
@@ -3707,6 +3712,8 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 		Int64GetDatum((int64) wal_scan->source_non_fpi_records);
 	values[Anum_pg_dbbranch_wal_replayed_records - 1] =
 		Int64GetDatum((int64) wal_scan->replayed_records);
+	values[Anum_pg_dbbranch_source_blocking_ms - 1] =
+		Float8GetDatum(source_blocking_ms);
 	values[Anum_pg_dbbranch_clone_elapsed_ms - 1] =
 		Float8GetDatum(clone_elapsed_ms);
 	values[Anum_pg_dbbranch_replay_elapsed_ms - 1] =
@@ -3793,9 +3800,11 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	char		wal_pin_name[NAMEDATALEN];
 	char		failure[MAXPGPATH * 2];
 	const char *ficlone_required = "db_branch storage clone requires FICLONE";
+	instr_time	source_block_start;
 	instr_time	clone_start;
 	instr_time	replay_start;
 	instr_time	elapsed;
+	double		source_blocking_ms = 0.0;
 	double		clone_elapsed_ms = 0.0;
 	double		replay_elapsed_ms = 0.0;
 	TimestampTz created_at = GetCurrentTimestamp();
@@ -3808,6 +3817,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("CREATE BRANCH can only be used if \"wal_level\" >= \"replica\""),
 				 errhint("\"wal_level\" must be set to \"replica\" or \"logical\" at server start.")));
+
+	INSTR_TIME_SET_CURRENT(source_block_start);
 
 	if (!get_db_info(source_name, ShareLock,
 					 &source_dboid, NULL, &source_encoding,
@@ -3858,12 +3869,16 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			"source database has prepared transactions" :
 			"source database is being accessed by other users";
 
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
 						  "not_started",
 						  "not_started", "not_started", "not_started",
 						  NULL,
-						  0.0, 0.0,
+						  source_blocking_ms, 0.0, 0.0,
 						  "CREATING,FAILED", "FAILED", busy_failure);
 		if (npreparedxacts > 0 && notherbackends == 0)
 			ereport(ERROR,
@@ -3943,6 +3958,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 					INSTR_TIME_SET_CURRENT(elapsed);
 					INSTR_TIME_SUBTRACT(elapsed, clone_start);
 					clone_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+					INSTR_TIME_SET_CURRENT(elapsed);
+					INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+					source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 					ReleaseDBBranchWalPin();
 					WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 								  redo_ptr, branch_lsn, clone_path,
@@ -3950,7 +3968,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 								  "failed", cleanup_ok ? "done" : "failed",
 								  "not_started",
 								  NULL,
-								  clone_elapsed_ms, replay_elapsed_ms,
+								  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 								  "CREATING,COPYING,FAILED", "FAILED", failure);
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -3965,6 +3983,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, clone_start);
 		clone_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 
 		/*
 		 * source freeze ends after branch_lsn is fixed and storage is cloned;
@@ -4005,7 +4026,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  clone_result, cleanup_ok ? "done" : "failed",
 						  "rmgr_redo",
 						  &wal_scan,
-						  clone_elapsed_ms, replay_elapsed_ms,
+						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 						  "CREATING,COPYING,REPLAYING,FAILED", "FAILED", failure);
 			ereport(ERROR,
 					(errcode_for_file_access(),
@@ -4031,7 +4052,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		ready_at = GetCurrentTimestamp();
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
 						  &wal_scan,
-						  clone_elapsed_ms, replay_elapsed_ms,
+						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 						  created_at, ready_at, clone_result,
 						  "rmgr_redo", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
@@ -4042,7 +4063,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  "released",
 						  clone_result, "not_needed", "rmgr_redo",
 						  &wal_scan,
-						  clone_elapsed_ms, replay_elapsed_ms,
+						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 						  "CREATING,COPYING,REPLAYING,READY", "READY", "");
 	}
 	PG_CATCH();

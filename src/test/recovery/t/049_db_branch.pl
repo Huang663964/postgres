@@ -59,6 +59,7 @@ like($metadata, qr/^wal_global_records=[0-9]+$/m, 'metadata records global WAL c
 like($metadata, qr/^wal_source_fpi_blocks=[0-9]+$/m, 'metadata records source FPI block count');
 like($metadata, qr/^wal_source_non_fpi_records=[0-9]+$/m, 'metadata records source non-FPI record count');
 like($metadata, qr/^wal_replayed_records=[0-9]+$/m, 'metadata records replayed WAL count');
+like($metadata, qr/^source_blocking_ms=[0-9]+(\.[0-9]+)?$/m, 'metadata records source blocking time');
 like($metadata, qr/^clone_elapsed_ms=[0-9]+(\.[0-9]+)?$/m, 'metadata records clone elapsed time');
 like($metadata, qr/^replay_elapsed_ms=[0-9]+(\.[0-9]+)?$/m, 'metadata records replay elapsed time');
 my ($wal_records_scanned) = $metadata =~ /^wal_records_scanned=([0-9]+)$/m;
@@ -121,10 +122,10 @@ if ($result == 0)
 	my $waldump = '';
 	my $catalog_state = $node->safe_psql(
 		'postgres',
-		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || (wal_records_scanned >= wal_source_records) || '|' || (clone_elapsed_ms >= 0) || '|' || (replay_elapsed_ms >= 0) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
+		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || (wal_records_scanned >= wal_source_records) || '|' || (source_blocking_ms >= 0) || '|' || (clone_elapsed_ms >= 0) || '|' || (replay_elapsed_ms >= 0) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
 	is(
 		$catalog_state,
-		'READY|rmgr_redo|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|true|true|',
+		'READY|rmgr_redo|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|true|true|true|',
 		'pg_dbbranch records READY metadata with replay method, WAL scan counts, and timings');
 
 	my $catalog_clone_result = $node->safe_psql(
@@ -194,12 +195,12 @@ if ($result == 0)
 	is($branch_rows_after_restart, '1:alice,2:bob,3:carol', 'ready branch survives restart');
 	my $catalog_state_after_restart = $node->safe_psql(
 		'postgres',
-		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || (wal_records_scanned >= wal_source_records) || '|' || (clone_elapsed_ms >= 0) || '|' || (replay_elapsed_ms >= 0) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = ]
+		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || (wal_records_scanned >= wal_source_records) || '|' || (source_blocking_ms >= 0) || '|' || (clone_elapsed_ms >= 0) || '|' || (replay_elapsed_ms >= 0) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = ]
 		  . $branch_oid
 		  . q[;]);
 	is(
 		$catalog_state_after_restart,
-		'READY|rmgr_redo|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|true|true|',
+		'READY|rmgr_redo|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|true|true|true|',
 		'pg_dbbranch READY metadata with WAL scan counts and timings survives restart');
 
 	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (4, 'dora');]);
