@@ -305,7 +305,12 @@ $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_ts;]);
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_unlogged_source;');
 $node->safe_psql(
 	'dbbranch_unlogged_source',
-	q[CREATE UNLOGGED TABLE cache_entries (id int PRIMARY KEY); INSERT INTO cache_entries VALUES (1);]);
+	q[
+CREATE UNLOGGED TABLE cache_entries (id int PRIMARY KEY);
+INSERT INTO cache_entries VALUES (1);
+CHECKPOINT;
+INSERT INTO cache_entries VALUES (2);
+]);
 
 $stderr = '';
 $result = $node->psql(
@@ -313,16 +318,13 @@ $result = $node->psql(
 	q[CREATE BRANCH dbbranch_unlogged_target FROM DATABASE dbbranch_unlogged_source],
 	stderr => \$stderr);
 
-is($result, 3, 'db branch rejects unlogged source relations');
-like(
-	$stderr,
-	qr/db_branch currently does not support unlogged relations/,
-	'db branch reports unlogged relation limitation before clone');
+is($result, 0, 'db branch supports unlogged source relations');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 3, 'unlogged rejection writes separate metadata file');
+is(scalar @metadata_files, 3, 'unlogged branch writes separate metadata file');
 
 my $unlogged_metadata = '';
+
 for my $path (@metadata_files)
 {
 	open my $fh, '<', $path or die "could not open $path: $!";
@@ -335,17 +337,22 @@ for my $path (@metadata_files)
 	}
 }
 
-like($unlogged_metadata, qr/^wal_pin=not_started$/m, 'unlogged metadata records WAL pin not started');
-like($unlogged_metadata, qr/^clone_result=not_started$/m, 'unlogged metadata records clone not started');
-like($unlogged_metadata, qr/^cleanup=not_started$/m, 'unlogged metadata records cleanup not started');
-like($unlogged_metadata, qr/^replay_method=not_started$/m, 'unlogged metadata records replay not started');
-like($unlogged_metadata, qr/^status=FAILED$/m, 'unlogged metadata final state is FAILED');
-like(
-	$unlogged_metadata,
-	qr/^failure=db_branch currently does not support unlogged relations$/m,
-	'unlogged metadata records limitation');
+like($unlogged_metadata, qr/^wal_pin=released$/m, 'unlogged metadata records released WAL pin');
+like($unlogged_metadata, qr/^clone_result=(done|copy_fallback)$/m, 'unlogged metadata records clone success');
+like($unlogged_metadata, qr/^cleanup=not_needed$/m, 'unlogged metadata records no cleanup');
+like($unlogged_metadata, qr/^replay_method=rmgr_redo$/m, 'unlogged metadata records rmgr replay');
+like($unlogged_metadata, qr/^status=READY$/m, 'unlogged metadata final state is READY');
+like($unlogged_metadata, qr/^failure=$/m, 'unlogged metadata records no failure');
 my ($unlogged_clone_path) = $unlogged_metadata =~ /^clone_path=(.+)$/m;
-ok(!-e $node->data_dir . '/' . $unlogged_clone_path, 'unlogged rejection does not create clone staging path');
+ok(-d $node->data_dir . '/' . $unlogged_clone_path, 'unlogged branch storage path is installed');
+
+my $unlogged_rows = $node->safe_psql(
+	'dbbranch_unlogged_target',
+	q[SELECT string_agg(id::text, ',' ORDER BY id) FROM cache_entries;]);
+is($unlogged_rows, '1,2', 'unlogged branch reads flushed unlogged rows');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_unlogged_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_unlogged_source;]);
 
 my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
 $writer->query_safe(q[BEGIN; INSERT INTO users VALUES (5, 'erin');]);

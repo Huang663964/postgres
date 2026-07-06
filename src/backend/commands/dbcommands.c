@@ -3659,6 +3659,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	char	   *source_collversion;
 	Oid		branch_dboid;
 	const char *clone_result = "done";
+	bool		source_has_unlogged;
 	int		notherbackends;
 	int		npreparedxacts;
 	XLogRecPtr redo_ptr;
@@ -3745,21 +3746,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	MakeDBBranchWalPinName(source_dboid, branch_hash, wal_pin_name,
 						   sizeof(wal_pin_name));
 
-	if (SourceDatabaseHasUnloggedRelations(source_dboid, source_deftablespace, srcpath))
-	{
-		const char *unlogged_failure =
-			"db_branch currently does not support unlogged relations";
-
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
-						  "not_started",
-						  "not_started", "not_started", "not_started",
-						  NULL,
-						  "CREATING,FAILED", "FAILED", unlogged_failure);
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("%s", unlogged_failure)));
-	}
+	source_has_unlogged = SourceDatabaseHasUnloggedRelations(source_dboid,
+										   source_deftablespace, srcpath);
 	branch_dboid = AllocateDBBranchDatabaseOid();
 	/* ponytail: final path avoids a DB-branch-only relpath hook. */
 	pfree(clone_path);
@@ -3771,6 +3759,12 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		branch_lsn = GetXLogInsertEndRecPtr();
 		XLogFlush(branch_lsn);
 		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, &wal_scan);
+
+		if (source_has_unlogged)
+		{
+			/* ponytail: unlogged data has no WAL, so copy must see disk. */
+			FlushDatabaseBuffers(source_dboid);
+		}
 
 		if (!CloneDBBranchDirectory(srcpath, clone_path, failure, sizeof(failure)))
 		{
