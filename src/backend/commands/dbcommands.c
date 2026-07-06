@@ -121,6 +121,7 @@ typedef struct CreateDBRelInfo
 	RelFileLocator rlocator;	/* physical relation identifier */
 	Oid			reloid;			/* relation oid */
 	bool		permanent;		/* relation is permanent or unlogged */
+	bool		sequence;		/* relation is a sequence */
 } CreateDBRelInfo;
 
 typedef struct DBBranchWalScan
@@ -210,7 +211,8 @@ static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 static bool ScanDBBranchSourceRelations(Oid source_dboid,
 										Oid source_deftablespace,
 										char *srcpath,
-										List **tablespace_oids);
+										List **tablespace_oids,
+										bool *has_sequence);
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -512,6 +514,7 @@ ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
 	relinfo->rlocator.dbOid = dbid;
 	relinfo->rlocator.relNumber = relfilenumber;
 	relinfo->reloid = classForm->oid;
+	relinfo->sequence = classForm->relkind == RELKIND_SEQUENCE;
 
 	/* Temporary relations were rejected above. */
 	Assert(classForm->relpersistence != RELPERSISTENCE_TEMP);
@@ -3104,7 +3107,7 @@ ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 	if (!touches_source)
 		return true;
 
-	if (touches_non_source)
+	if (touches_non_source || XLogRecGetRmid(xlogreader) == RM_SEQ_ID)
 	{
 		for (block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader); block_id++)
 		{
@@ -3112,9 +3115,15 @@ ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 				XLogRecGetBlock(xlogreader, block_id)->rlocator.dbOid =
 					saved_dbids[block_id];
 		}
-		snprintf(failure, failure_len,
-				 "DB Branch rmgr replay does not support mixed WAL records yet");
-		return false;
+		if (touches_non_source)
+		{
+			snprintf(failure, failure_len,
+					 "DB Branch rmgr replay does not support mixed WAL records yet");
+			return false;
+		}
+
+		/* ponytail: sequence WAL prelogs future values; cloned page has live state. */
+		return true;
 	}
 
 	rmgr = GetRmgr(XLogRecGetRmid(xlogreader));
@@ -3618,13 +3627,15 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 
 static bool
 ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
-										char *srcpath, List **tablespace_oids)
+								char *srcpath, List **tablespace_oids,
+								bool *has_sequence)
 {
 	List	   *rlocatorlist;
 	ListCell   *cell;
 	bool		has_unlogged = false;
 
 	*tablespace_oids = list_make1_oid(source_deftablespace);
+	*has_sequence = false;
 	rlocatorlist = ScanSourceDatabasePgClass(source_deftablespace,
 										 source_dboid, srcpath);
 	foreach(cell, rlocatorlist)
@@ -3637,6 +3648,8 @@ ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
 
 		if (!relinfo->permanent)
 			has_unlogged = true;
+		if (relinfo->sequence)
+			*has_sequence = true;
 	}
 	list_free_deep(rlocatorlist);
 
@@ -3665,6 +3678,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	List	   *tablespace_oids = NIL;
 	ListCell   *cell;
 	bool		source_has_unlogged;
+	bool		source_has_sequence;
 	int		notherbackends;
 	int		npreparedxacts;
 	XLogRecPtr redo_ptr;
@@ -3753,7 +3767,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 	source_has_unlogged = ScanDBBranchSourceRelations(source_dboid,
 										   source_deftablespace, srcpath,
-										   &tablespace_oids);
+										   &tablespace_oids, &source_has_sequence);
 	branch_dboid = AllocateDBBranchDatabaseOid();
 	/* ponytail: final path avoids a DB-branch-only relpath hook. */
 	pfree(clone_path);
@@ -3766,9 +3780,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		XLogFlush(branch_lsn);
 		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, &wal_scan);
 
-		if (source_has_unlogged)
+		if (source_has_unlogged || source_has_sequence)
 		{
-			/* ponytail: unlogged data has no WAL, so copy must see disk. */
+			/* ponytail: unlogged and sequence data need disk state, not WAL replay. */
 			FlushDatabaseBuffers(source_dboid);
 		}
 

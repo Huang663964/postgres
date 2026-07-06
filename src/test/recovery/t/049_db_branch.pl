@@ -519,6 +519,58 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_rel_ts;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_wal_source;');
+$node->safe_psql(
+	'dbbranch_wal_source',
+	q[
+CREATE TABLE wal_rows (id int PRIMARY KEY, payload text NOT NULL);
+CREATE SEQUENCE wal_seq CACHE 1;
+INSERT INTO wal_rows VALUES (1, repeat('a', 9000)), (2, repeat('b', 9000));
+SELECT nextval('wal_seq');
+CHECKPOINT;
+UPDATE wal_rows SET payload = repeat('c', 9000) WHERE id = 1;
+DELETE FROM wal_rows WHERE id = 2;
+INSERT INTO wal_rows VALUES (3, repeat('d', 9000));
+SELECT nextval('wal_seq');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_wal_target FROM DATABASE dbbranch_wal_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch handles heap, toast, btree, and sequence state');
+
+my $wal_rows = $node->safe_psql(
+	'dbbranch_wal_target',
+	q[
+SELECT string_agg(id || ':' || substr(payload, 1, 1) || ':' || length(payload), ',' ORDER BY id)
+FROM wal_rows;
+]);
+is($wal_rows, '1:c:9000,3:d:9000',
+	'branch sees replayed update, delete, insert, and TOAST values');
+
+my $wal_index_lookup = $node->safe_psql(
+	'dbbranch_wal_target',
+	q[
+SET enable_seqscan = off;
+SELECT substr(payload, 1, 1) || ':' || length(payload) FROM wal_rows WHERE id = 3;
+]);
+is($wal_index_lookup, 'd:9000', 'branch btree index lookup sees replayed row');
+
+my $source_sequence = $node->safe_psql(
+	'dbbranch_wal_source',
+	q[SELECT last_value FROM wal_seq;]);
+my $branch_sequence = $node->safe_psql(
+	'dbbranch_wal_target',
+	q[SELECT last_value FROM wal_seq;]);
+is($branch_sequence, $source_sequence,
+	'branch sequence durable state matches source');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_source;]);
+
 $node->append_conf('postgresql.conf', 'full_page_writes = off');
 $node->reload;
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_nonfpi_source;');
