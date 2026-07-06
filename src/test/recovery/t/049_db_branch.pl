@@ -242,6 +242,64 @@ my $slot_count = $node->safe_psql(
 	q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%']);
 is($slot_count, '0', 'db branch releases WAL pin slot');
 
+SKIP:
+{
+	skip 'Injection points not supported by this build', 4
+	  if ($ENV{enable_injection_points} // '') ne 'yes'
+	  || !$node->check_extension('injection_points');
+
+	$node->safe_psql('postgres', q[CREATE EXTENSION IF NOT EXISTS injection_points;]);
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_gate_source;]);
+	$node->safe_psql(
+		'dbbranch_replay_gate_source',
+		q[
+CREATE TABLE gate_rows (id int PRIMARY KEY);
+INSERT INTO gate_rows VALUES (1);
+CHECKPOINT;
+UPDATE gate_rows SET id = 1 WHERE id = 1;
+]);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-before-replay', 'wait');]);
+
+	my $gate_branch = $node->background_psql('postgres', on_error_stop => 1);
+	$gate_branch->query_until(
+		qr/start_gate_branch/,
+		q(\echo start_gate_branch
+CREATE BRANCH dbbranch_replay_gate_target FROM DATABASE dbbranch_replay_gate_source;
+\echo finish_gate_branch
+));
+	$node->wait_for_event('client backend', 'db-branch-before-replay');
+
+	my $pin_active = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) = 1 AND bool_and(active) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($pin_active, 't', 'db branch WAL pin is active before replay');
+
+	$node->safe_psql('dbbranch_replay_gate_source', q[INSERT INTO gate_rows VALUES (2);]);
+	my $gate_source_rows = $node->safe_psql(
+		'dbbranch_replay_gate_source',
+		q[SELECT count(*) FROM gate_rows;]);
+	is($gate_source_rows, '2', 'source accepts writes after clone before replay');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-replay');]);
+	$gate_branch->query_until(qr/finish_gate_branch/, '');
+	$gate_branch->quit;
+
+	my $gate_branch_rows = $node->safe_psql(
+		'dbbranch_replay_gate_target',
+		q[SELECT count(*) FROM gate_rows;]);
+	is($gate_branch_rows, '1', 'branch excludes source writes after branch LSN');
+
+	my $gate_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($gate_slot_count, '0', 'db branch releases WAL pin after replay resumes');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_source;]);
+}
+
 $stderr = '';
 $result = $node->psql(
 	'postgres',

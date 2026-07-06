@@ -78,6 +78,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/pg_locale.h"
@@ -107,6 +108,7 @@ typedef struct
 	Oid			src_dboid;		/* source (template) DB */
 	Oid			dest_dboid;		/* DB we are trying to create */
 	CreateDBStrategy strategy;	/* create db strategy */
+	bool		release_src_lock;
 } createdb_failure_params;
 
 typedef struct
@@ -1617,6 +1619,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	fparms.src_dboid = src_dboid;
 	fparms.dest_dboid = dboid;
 	fparms.strategy = dbstrategy;
+	fparms.release_src_lock = true;
 
 	PG_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
 							PointerGetDatum(&fparms));
@@ -1743,7 +1746,8 @@ createdb_failure_callback(int code, Datum arg)
 	 * not essential but it seems desirable to release the lock as soon as
 	 * possible.
 	 */
-	UnlockSharedObject(DatabaseRelationId, fparms->src_dboid, 0, ShareLock);
+	if (fparms->release_src_lock)
+		UnlockSharedObject(DatabaseRelationId, fparms->src_dboid, 0, ShareLock);
 
 	/* Throw away any successfully copied subdirectories */
 	remove_dbtablespaces(fparms->dest_dboid);
@@ -3370,6 +3374,7 @@ InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_n
 	fparms.src_dboid = source_dboid;
 	fparms.dest_dboid = dboid;
 	fparms.strategy = CREATEDB_FILE_COPY;
+	fparms.release_src_lock = false;
 
 	PG_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
 							PointerGetDatum(&fparms));
@@ -3777,6 +3782,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	double		replay_elapsed_ms = 0.0;
 	TimestampTz created_at = GetCurrentTimestamp();
 	TimestampTz ready_at;
+	volatile bool source_lock_held = false;
 
 
 	if (!get_db_info(source_name, ShareLock,
@@ -3790,6 +3796,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("source database \"%s\" does not exist", source_name)));
+	source_lock_held = true;
 
 	if (database_is_invalid_oid(source_dboid))
 		ereport(ERROR,
@@ -3935,6 +3942,15 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		INSTR_TIME_SUBTRACT(elapsed, clone_start);
 		clone_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 
+		/*
+		 * source freeze ends after branch_lsn is fixed and storage is cloned;
+		 * replay must not keep source connections blocked.
+		 */
+		UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
+		source_lock_held = false;
+
+		INJECTION_POINT("db-branch-before-replay", NULL);
+
 		INSTR_TIME_SET_CURRENT(replay_start);
 		if (!ReplayDBBranchWal(source_dboid, branch_dboid,
 								  redo_ptr, branch_lsn, failure, sizeof(failure)))
@@ -4006,6 +4022,11 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	}
 	PG_CATCH();
 	{
+		if (source_lock_held)
+		{
+			UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
+			source_lock_held = false;
+		}
 		ReleaseDBBranchWalPin();
 		PG_RE_THROW();
 	}
