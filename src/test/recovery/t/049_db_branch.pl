@@ -223,6 +223,47 @@ is($xact_branch_count, '0', 'transaction-block rejection creates no branch datab
 is(scalar @metadata_files, 1, 'transaction-block rejection writes no metadata file');
 
 $node->safe_psql('postgres', q[
+CREATE ROLE dbbranch_no_createdb LOGIN;
+CREATE ROLE dbbranch_createdb LOGIN CREATEDB;
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_no_createdb_target FROM DATABASE dbbranch_source],
+	stderr => \$stderr,
+	extra_params => [ '--username' => 'dbbranch_no_createdb' ]);
+
+is($result, 3, 'db branch requires CREATEDB privilege');
+like(
+	$stderr,
+	qr/permission denied to create database/,
+	'db branch reports missing CREATEDB privilege');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_not_owner_target FROM DATABASE dbbranch_source],
+	stderr => \$stderr,
+	extra_params => [ '--username' => 'dbbranch_createdb' ]);
+
+is($result, 3, 'db branch requires source database ownership');
+like(
+	$stderr,
+	qr/permission denied to copy database "dbbranch_source"/,
+	'db branch reports missing source ownership');
+
+my $permission_branch_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname IN ('dbbranch_no_createdb_target', 'dbbranch_not_owner_target');]);
+is($permission_branch_count, '0', 'permission failures create no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 1, 'permission failures write no metadata file');
+
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_no_createdb, dbbranch_createdb;]);
+
+$node->safe_psql('postgres', q[
 CREATE FUNCTION dbbranch_wrapper() RETURNS oid LANGUAGE sql AS $$
   SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_func_target')
 $$;]);
