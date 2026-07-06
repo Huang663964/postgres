@@ -1010,4 +1010,40 @@ is($nonfpi_rows, '1', 'non-FPI branch reads rmgr-replayed rows');
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_nonfpi_target;]);
 
+$node->safe_psql('postgres', q[
+CREATE ROLE dbbranch_template_createdb LOGIN CREATEDB;
+CREATE DATABASE dbbranch_template_source;
+ALTER DATABASE dbbranch_template_source IS_TEMPLATE true;
+]);
+$node->safe_psql(
+	'dbbranch_template_source',
+	q[
+CREATE TABLE template_rows (id int PRIMARY KEY);
+INSERT INTO template_rows VALUES (1);
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_template_target FROM DATABASE dbbranch_template_source],
+	stderr => \$stderr,
+	extra_params => [ '--username' => 'dbbranch_template_createdb' ]);
+
+is($result, 0, 'db branch allows CREATEDB role to copy template source');
+
+my $template_branch_owner = $node->safe_psql(
+	'postgres',
+	q[SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'dbbranch_template_target';]);
+is($template_branch_owner, 'dbbranch_template_createdb', 'template branch is owned by creator');
+
+my $template_rows = $node->safe_psql(
+	'dbbranch_template_target',
+	q[SELECT count(*) FROM template_rows;]);
+is($template_rows, '1', 'template branch copies source data');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_template_target;]);
+$node->safe_psql('postgres', q[ALTER DATABASE dbbranch_template_source IS_TEMPLATE false;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_template_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_template_createdb;]);
+
 done_testing();
