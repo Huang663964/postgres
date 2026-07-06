@@ -571,6 +571,54 @@ is($branch_sequence, $source_sequence,
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_partition_source;');
+$node->safe_psql(
+	'dbbranch_partition_source',
+	q[
+CREATE TABLE part_rows (
+	id int,
+	bucket int,
+	payload text NOT NULL,
+	PRIMARY KEY (bucket, id)
+) PARTITION BY RANGE (bucket);
+CREATE TABLE part_rows_low PARTITION OF part_rows FOR VALUES FROM (0) TO (10);
+CREATE TABLE part_rows_high PARTITION OF part_rows FOR VALUES FROM (10) TO (20);
+INSERT INTO part_rows VALUES (1, 1, 'low-before'), (2, 11, 'high-before');
+CHECKPOINT;
+INSERT INTO part_rows VALUES (3, 2, 'low-redo'), (4, 12, 'high-redo');
+UPDATE part_rows SET payload = 'high-updated' WHERE bucket = 11 AND id = 2;
+DELETE FROM part_rows WHERE bucket = 1 AND id = 1;
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_partition_target FROM DATABASE dbbranch_partition_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch supports partitioned table WAL replay');
+
+my $partition_rows = $node->safe_psql(
+	'dbbranch_partition_target',
+	q[
+SELECT string_agg(tableoid::regclass::text || ':' || id || ':' || payload, ',' ORDER BY id)
+FROM part_rows;
+]);
+is($partition_rows, 'part_rows_high:2:high-updated,part_rows_low:3:low-redo,part_rows_high:4:high-redo',
+	'branch reads replayed rows from both partitions');
+
+my $partition_index_lookup = $node->safe_psql(
+	'dbbranch_partition_target',
+	q[
+SET enable_seqscan = off;
+SELECT payload FROM part_rows WHERE bucket = 12 AND id = 4;
+]);
+is($partition_index_lookup, 'high-redo',
+	'branch partition index lookup sees replayed row');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_partition_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_partition_source;]);
+
 $node->append_conf('postgresql.conf', 'full_page_writes = off');
 $node->reload;
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_nonfpi_source;');
