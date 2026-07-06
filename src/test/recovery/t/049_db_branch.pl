@@ -75,7 +75,7 @@ ok($wal_mixed_records <= $wal_source_records, 'metadata mixed WAL count is bound
 ok(
 	$wal_records_scanned >= $wal_source_records + $wal_other_db_records + $wal_global_records,
 	'metadata WAL scan count covers classified WAL counts');
-like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
+like($metadata, qr/^clone_path=base\/[0-9]+$/m, 'metadata records branch storage path');
 like($metadata, qr/^wal_pin=released$/m, 'metadata records released WAL pin');
 like($metadata, qr/^replay_method=fpi_restore$/m, 'metadata records FPI restore replay method');
 
@@ -87,7 +87,7 @@ if ($result == 0)
 	like($metadata, qr/^status_history=CREATING,COPYING,REPLAYING,READY$/m, 'metadata records READY transition');
 	like($metadata, qr/^status=READY$/m, 'metadata final state is READY');
 	like($metadata, qr/^failure=$/m, 'metadata records no failure');
-	ok(!-e $node->data_dir . '/' . $clone_path, 'clone staging path is installed, not left behind');
+	ok(-d $node->data_dir . '/' . $clone_path, 'branch storage path is installed');
 
 	my $branch_count = $node->safe_psql(
 		'postgres',
@@ -105,6 +105,7 @@ if ($result == 0)
 	my $branch_oid = $node->safe_psql(
 		'postgres',
 		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_target';]);
+	is($clone_path, 'base/' . $branch_oid, 'branch storage path uses branch database OID');
 	my $source_locator = $node->safe_psql(
 		'postgres',
 		q[SELECT dattablespace || '/' || oid FROM pg_database WHERE datname = 'dbbranch_source';]);
@@ -161,19 +162,7 @@ if ($result == 0)
 		  . $branch_oid
 		  . q[;]);
 	is($catalog_after_drop, '0', 'dropping branch removes pg_dbbranch metadata');
-
-	mkdir($node->data_dir . '/' . $clone_path)
-	  or die "could not create stale clone path $clone_path: $!";
-	$result = $node->psql(
-		'postgres',
-		q[CREATE BRANCH dbbranch_target FROM DATABASE dbbranch_source],
-		stderr => \$stderr);
-	is($result, 0, 'db branch removes stale clone staging path before retry');
-	my $retry_branch_rows = $node->safe_psql(
-		'dbbranch_target',
-		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
-	is($retry_branch_rows, '1:alice,2:bob,3:carol', 'retried branch reads cloned source rows');
-	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_target;]);
+	ok(!-e $node->data_dir . '/' . $clone_path, 'dropping branch removes branch storage path');
 }
 else
 {
@@ -190,7 +179,7 @@ else
 		$metadata,
 		qr/^failure=.+$/m,
 		'metadata records storage clone failure');
-	ok(!-e $node->data_dir . '/' . $clone_path, 'failed branch cleanup removes clone staging path');
+	ok(!-e $node->data_dir . '/' . $clone_path, 'failed branch cleanup removes branch storage path');
 
 	my $branch_count = $node->safe_psql(
 		'postgres',

@@ -3370,7 +3370,8 @@ InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_n
 	PG_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
 							PointerGetDatum(&fparms));
 	{
-		if (rename(clone_path, dstpath) != 0)
+		if (strcmp(clone_path, dstpath) != 0 &&
+			rename(clone_path, dstpath) != 0)
 		{
 			int			save_errno = errno;
 
@@ -3793,24 +3794,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("%s", unlogged_failure)));
 	}
-
-	if (!CleanupDBBranchClonePath(clone_path))
-	{
-		const char *cleanup_failure =
-			"could not remove stale db_branch clone path";
-
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  InvalidXLogRecPtr, InvalidXLogRecPtr, clone_path,
-						  "not_started",
-						  "not_started", "failed", "not_started",
-						  NULL,
-						  "CREATING,FAILED", "FAILED", cleanup_failure);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("%s \"%s\"", cleanup_failure, clone_path)));
-	}
-
 	branch_dboid = AllocateDBBranchDatabaseOid();
+	/* ponytail: final path avoids a DB-branch-only relpath hook. */
+	snprintf(clone_path, sizeof(clone_path), "base/%u", branch_dboid);
 
 	redo_ptr = PinDBBranchWal(wal_pin_name);
 	PG_TRY();
