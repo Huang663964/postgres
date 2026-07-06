@@ -345,6 +345,53 @@ is($func_branch_count, '0', 'disabled SQL wrapper creates no branch database');
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 is(scalar @metadata_files, 1, 'disabled SQL wrapper writes no metadata file');
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_setting_source;');
+$node->safe_psql(
+	'postgres',
+	q[ALTER DATABASE dbbranch_setting_source SET work_mem = '64MB';]);
+$node->safe_psql(
+	'dbbranch_setting_source',
+	q[
+CREATE TABLE setting_rows (id int PRIMARY KEY);
+INSERT INTO setting_rows VALUES (1);
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_setting_target FROM DATABASE dbbranch_setting_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch copies database-level settings');
+
+my $setting_work_mem = $node->safe_psql(
+	'dbbranch_setting_target',
+	q[SHOW work_mem;]);
+is($setting_work_mem, '64MB', 'branch applies copied database-level setting');
+
+my $setting_branch_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_setting_target';]);
+my $setting_rows = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_db_role_setting WHERE setdatabase = ]
+	  . $setting_branch_oid
+	  . q[ AND setrole = 0;]);
+is($setting_rows, '1', 'branch has copied pg_db_role_setting row');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_setting_target;]);
+my $setting_rows_after_drop = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_db_role_setting WHERE setdatabase = ]
+	  . $setting_branch_oid
+	  . q[;]);
+is($setting_rows_after_drop, '0', 'dropping branch removes copied database settings');
+
+$node->safe_psql(
+	'postgres',
+	q[ALTER DATABASE dbbranch_setting_source RESET work_mem;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_setting_source;]);
+
 my $tablespace_dir = $node->basedir . '/dbbranch_ts';
 mkdir($tablespace_dir) or die "could not create $tablespace_dir: $!";
 $node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_ts LOCATION '$tablespace_dir';");
@@ -367,7 +414,7 @@ $result = $node->psql(
 is($result, 0, 'db branch supports non-default source tablespace');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 2, 'tablespace branch writes separate metadata file');
+is(scalar @metadata_files, 3, 'tablespace branch writes separate metadata file');
 
 my $tablespace_metadata = '';
 for my $path (@metadata_files)
@@ -430,7 +477,7 @@ $result = $node->psql(
 is($result, 0, 'db branch supports unlogged source relations');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 3, 'unlogged branch writes separate metadata file');
+is(scalar @metadata_files, 4, 'unlogged branch writes separate metadata file');
 
 my $unlogged_metadata = '';
 
@@ -482,7 +529,7 @@ $writer->query_safe('ROLLBACK;');
 $writer->quit;
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 4, 'busy branch attempt writes separate metadata file');
+is(scalar @metadata_files, 5, 'busy branch attempt writes separate metadata file');
 
 my $busy_metadata = '';
 for my $path (@metadata_files)
@@ -532,7 +579,7 @@ like(
 $node->safe_psql('dbbranch_prepared_source', q[ROLLBACK PREPARED 'dbbranch_prepared_xact';]);
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 5, 'prepared transaction rejection writes separate metadata file');
+is(scalar @metadata_files, 6, 'prepared transaction rejection writes separate metadata file');
 
 my $prepared_metadata = '';
 for my $path (@metadata_files)
@@ -585,7 +632,7 @@ my $invalid_branch_count = $node->safe_psql(
 is($invalid_branch_count, '0', 'invalid source rejection creates no branch database');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 5, 'invalid source rejection writes no metadata file');
+is(scalar @metadata_files, 6, 'invalid source rejection writes no metadata file');
 
 $node->safe_psql('postgres', 'DROP DATABASE dbbranch_invalid_source;');
 

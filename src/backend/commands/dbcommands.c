@@ -204,6 +204,7 @@ static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
 static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
 									  Oid tablespace_oid);
+static void CopyDBBranchDatabaseSettings(Oid source_dboid, Oid branch_dboid);
 static void DeleteDBBranchCatalogForDatabase(Oid dboid);
 static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
@@ -3359,6 +3360,7 @@ InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_n
 
 	recordDependencyOnOwner(DatabaseRelationId, dboid, GetUserId());
 	copyTemplateDependencies(source_dboid, dboid);
+	CopyDBBranchDatabaseSettings(source_dboid, dboid);
 	InvokeObjectPostCreateHook(DatabaseRelationId, dboid, 0);
 
 	fparms.src_dboid = source_dboid;
@@ -3564,6 +3566,48 @@ LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
 	XLogRegisterData(&xlrec, sizeof(xl_dbase_create_file_copy_rec));
 	(void) XLogInsert(RM_DBASE_ID,
 						  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
+}
+
+static void
+CopyDBBranchDatabaseSettings(Oid source_dboid, Oid branch_dboid)
+{
+	Relation	relsetting;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	relsetting = table_open(DbRoleSettingRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_db_role_setting_setdatabase,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(source_dboid));
+	scan = systable_beginscan(relsetting, DbRoleSettingDatidRolidIndexId,
+							  true, NULL, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Datum		repl_val[Natts_pg_db_role_setting] = {0};
+		bool		repl_null[Natts_pg_db_role_setting] = {0};
+		bool		repl_repl[Natts_pg_db_role_setting] = {0};
+		Form_pg_db_role_setting form;
+		HeapTuple	newtuple;
+
+		form = (Form_pg_db_role_setting) GETSTRUCT(tuple);
+		repl_val[Anum_pg_db_role_setting_setdatabase - 1] =
+			ObjectIdGetDatum(branch_dboid);
+		repl_repl[Anum_pg_db_role_setting_setdatabase - 1] = true;
+
+		newtuple = heap_modify_tuple(tuple, RelationGetDescr(relsetting),
+									 repl_val, repl_null, repl_repl);
+		CatalogTupleInsert(relsetting, newtuple);
+		heap_freetuple(newtuple);
+
+		InvokeObjectPostAlterHookArg(DbRoleSettingRelationId,
+									 branch_dboid, 0, form->setrole, false);
+	}
+	systable_endscan(scan);
+
+	table_close(relsetting, NoLock);
 }
 
 static void
