@@ -501,6 +501,8 @@ $node->safe_psql(
 	q[
 ALTER DATABASE dbbranch_setting_source SET work_mem = '64MB';
 ALTER DATABASE dbbranch_setting_source CONNECTION LIMIT 7;
+REVOKE CONNECT ON DATABASE dbbranch_setting_source FROM PUBLIC;
+GRANT CONNECT ON DATABASE dbbranch_setting_source TO dbbranch_setting_role;
 ALTER ROLE dbbranch_setting_role IN DATABASE dbbranch_setting_source
 	SET maintenance_work_mem = '32MB';
 ]);
@@ -564,6 +566,14 @@ my $setting_connlimit = $node->safe_psql(
 	'postgres',
 	q[SELECT datconnlimit FROM pg_database WHERE datname = 'dbbranch_setting_target';]);
 is($setting_connlimit, '7', 'branch copies source connection limit');
+
+my $setting_acl = $node->safe_psql(
+	'postgres',
+	q[SELECT (s.datacl IS NOT NULL) || '|' || (t.datacl IS NULL)
+FROM pg_database s, pg_database t
+WHERE s.datname = 'dbbranch_setting_source'
+  AND t.datname = 'dbbranch_setting_target';]);
+is($setting_acl, 'true|true', 'branch keeps default database ACL instead of copying source ACL');
 
 my $setting_role_work_mem = $node->safe_psql(
 	'dbbranch_setting_target',
