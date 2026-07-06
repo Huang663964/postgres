@@ -728,6 +728,48 @@ is($partition_index_lookup, 'high-redo',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_partition_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_partition_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_toast_source;');
+$node->safe_psql(
+	'dbbranch_toast_source',
+	q[
+CREATE TABLE toast_rows (id int PRIMARY KEY, payload text NOT NULL);
+ALTER TABLE toast_rows ALTER COLUMN payload SET STORAGE EXTERNAL;
+INSERT INTO toast_rows
+SELECT 1, string_agg(md5(g::text), '') FROM generate_series(1, 256) g;
+CHECKPOINT;
+INSERT INTO toast_rows
+SELECT 2, string_agg(md5(g::text), '') FROM generate_series(257, 512) g;
+UPDATE toast_rows SET payload = payload || md5('dbbranch-toast-update') WHERE id = 1;
+]);
+
+my $toast_expected = $node->safe_psql(
+	'dbbranch_toast_source',
+	q[SELECT string_agg(id || ':' || length(payload) || ':' || md5(payload), ',' ORDER BY id) FROM toast_rows;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_toast_target FROM DATABASE dbbranch_toast_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch supports TOAST WAL replay');
+
+my $toast_rows = $node->safe_psql(
+	'dbbranch_toast_target',
+	q[SELECT string_agg(id || ':' || length(payload) || ':' || md5(payload), ',' ORDER BY id) FROM toast_rows;]);
+is($toast_rows, $toast_expected, 'branch reads cloned and replayed TOAST values');
+
+my $toast_index_lookup = $node->safe_psql(
+	'dbbranch_toast_target',
+	q[
+SET enable_seqscan = off;
+SELECT length(payload) > 8000 FROM toast_rows WHERE id = 2;
+]);
+is($toast_index_lookup, 't', 'branch index lookup fetches replayed TOAST value');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_toast_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_toast_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_source;');
 $node->safe_psql(
 	'dbbranch_drop_source',
