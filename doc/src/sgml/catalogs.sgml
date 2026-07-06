@@ -121,6 +121,11 @@
      </row>
 
      <row>
+      <entry><link linkend="catalog-pg-dbbranch"><structname>pg_dbbranch</structname></link></entry>
+      <entry>database branch metadata</entry>
+     </row>
+
+     <row>
       <entry><link linkend="catalog-pg-db-role-setting"><structname>pg_db_role_setting</structname></link></entry>
       <entry>per-role and per-database settings</entry>
      </row>
@@ -3210,6 +3215,252 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
       </para>
       <para>
        Access privileges; see <xref linkend="ddl-priv"/> for details
+      </para></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+ </sect1>
+
+
+ <sect1 id="catalog-pg-dbbranch">
+  <title><structname>pg_dbbranch</structname></title>
+
+  <indexterm zone="catalog-pg-dbbranch">
+   <primary>pg_dbbranch</primary>
+  </indexterm>
+
+  <para>
+   The catalog <structname>pg_dbbranch</structname> records committed
+   <link linkend="sql-createbranch"><command>CREATE BRANCH</command></link>
+   operations.
+  </para>
+
+  <para>
+   Unlike most system catalogs, <structname>pg_dbbranch</structname>
+   is shared across all databases of a cluster: there is only one
+   copy of <structname>pg_dbbranch</structname> per cluster, not one per
+   database.
+  </para>
+
+  <table>
+   <title><structname>pg_dbbranch</structname> Columns</title>
+   <tgroup cols="1">
+    <thead>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       Column Type
+      </para>
+      <para>
+       Description
+      </para></entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>source_db_oid</structfield> <type>oid</type>
+       (references <link linkend="catalog-pg-database"><structname>pg_database</structname></link>.<structfield>oid</structfield>)
+      </para>
+      <para>
+       OID of the source database used to create the branch.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>branch_db_oid</structfield> <type>oid</type>
+       (references <link linkend="catalog-pg-database"><structname>pg_database</structname></link>.<structfield>oid</structfield>)
+      </para>
+      <para>
+       OID of the branch database.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>redo_ptr</structfield> <type>pg_lsn</type>
+      </para>
+      <para>
+       WAL replay start location used for branch recovery.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>branch_lsn</structfield> <type>pg_lsn</type>
+      </para>
+      <para>
+       WAL location at which the branch becomes consistent.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_range_bytes</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of WAL bytes between <structfield>redo_ptr</structfield> and
+       <structfield>branch_lsn</structfield>.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_records_scanned</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of WAL records scanned while creating the branch.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_source_records</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of scanned WAL records that belong to the source database.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_other_db_records</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of scanned WAL records that belong only to other databases.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_mixed_records</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of scanned WAL records that reference the source database and
+       another database or shared state.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_global_records</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of scanned WAL records that have no database-specific target.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_source_fpi_blocks</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of full-page image blocks replayed for the source database.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_source_non_fpi_records</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of source database WAL records that require rmgr redo replay.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>wal_replayed_records</structfield> <type>int8</type>
+      </para>
+      <para>
+       Number of WAL records applied to the branch storage.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>source_blocking_ms</structfield> <type>float8</type>
+      </para>
+      <para>
+       Elapsed time, in milliseconds, spent while the source database was
+       blocked for branch setup.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>clone_elapsed_ms</structfield> <type>float8</type>
+      </para>
+      <para>
+       Elapsed time, in milliseconds, spent cloning source storage.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>replay_elapsed_ms</structfield> <type>float8</type>
+      </para>
+      <para>
+       Elapsed time, in milliseconds, spent replaying WAL into the branch.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>created_at</structfield> <type>timestamptz</type>
+      </para>
+      <para>
+       Time at which branch creation began.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>ready_at</structfield> <type>timestamptz</type>
+      </para>
+      <para>
+       Time at which branch creation reached the ready state.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>clone_result</structfield> <type>text</type>
+      </para>
+      <para>
+       Storage clone result, such as <literal>done</literal> or
+       <literal>copy_fallback</literal>.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>replay_method</structfield> <type>text</type>
+      </para>
+      <para>
+       Method used for branch WAL replay.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>status</structfield> <type>text</type>
+      </para>
+      <para>
+       Final branch status for the committed catalog row.  Currently this is
+       <literal>READY</literal>.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>failure</structfield> <type>text</type>
+      </para>
+      <para>
+       Failure text for the committed catalog row.  Ready rows store an empty
+       string; failed attempts are recorded in a diagnostic state file instead.
       </para></entry>
      </row>
     </tbody>
