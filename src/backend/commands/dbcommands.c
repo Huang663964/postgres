@@ -123,6 +123,9 @@ typedef struct DBBranchWalScan
 {
 	uint64		records;
 	uint64		source_records;
+	uint64		other_db_records;
+	uint64		mixed_records;
+	uint64		global_records;
 } DBBranchWalScan;
 
 
@@ -2854,6 +2857,9 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 	uint64		wal_range_bytes = 0;
 	uint64		wal_records_scanned = wal_scan ? wal_scan->records : 0;
 	uint64		wal_source_records = wal_scan ? wal_scan->source_records : 0;
+	uint64		wal_other_db_records = wal_scan ? wal_scan->other_db_records : 0;
+	uint64		wal_mixed_records = wal_scan ? wal_scan->mixed_records : 0;
+	uint64		wal_global_records = wal_scan ? wal_scan->global_records : 0;
 	bool		ok;
 
 	if (!XLogRecPtrIsInvalid(redo_ptr) &&
@@ -2880,6 +2886,9 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "wal_range_bytes=" UINT64_FORMAT "\n"
 			 "wal_records_scanned=" UINT64_FORMAT "\n"
 			 "wal_source_records=" UINT64_FORMAT "\n"
+			 "wal_other_db_records=" UINT64_FORMAT "\n"
+			 "wal_mixed_records=" UINT64_FORMAT "\n"
+			 "wal_global_records=" UINT64_FORMAT "\n"
 			 "clone_path=%s\n"
 			 "wal_pin=%s\n"
 			 "clone_result=%s\n"
@@ -2891,6 +2900,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 source_dboid, source_name, branch_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
 			 wal_range_bytes, wal_records_scanned, wal_source_records,
+			 wal_other_db_records, wal_mixed_records, wal_global_records,
 			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
 			 replay_method, status_history, status, failure) >= 0;
 
@@ -2920,6 +2930,9 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 	Assert(wal_scan != NULL);
 	wal_scan->records = 0;
 	wal_scan->source_records = 0;
+	wal_scan->other_db_records = 0;
+	wal_scan->mixed_records = 0;
+	wal_scan->global_records = 0;
 
 	if (XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(end_lsn) ||
 		end_lsn <= start_lsn || start_lsn < XLOG_BLCKSZ)
@@ -2950,6 +2963,8 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 	{
 		XLogRecord *record;
 		bool		touches_source = false;
+		bool		touches_other_db = false;
+		bool		touches_global = false;
 
 		errormsg = NULL;
 		record = XLogReadRecord(xlogreader, &errormsg);
@@ -2989,15 +3004,24 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 											NULL, NULL, NULL))
 					continue;
 				if (rlocator.dbOid == source_dboid)
-				{
 					touches_source = true;
-					break;
-				}
+				else if (OidIsValid(rlocator.dbOid))
+					touches_other_db = true;
+				else
+					touches_global = true;
 			}
 		}
 
 		if (touches_source)
+		{
 			wal_scan->source_records++;
+			if (touches_other_db || touches_global)
+				wal_scan->mixed_records++;
+		}
+		else if (touches_other_db)
+			wal_scan->other_db_records++;
+		else if (touches_global)
+			wal_scan->global_records++;
 		if (xlogreader->EndRecPtr >= end_lsn)
 			break;
 	}

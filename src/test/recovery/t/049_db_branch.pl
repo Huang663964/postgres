@@ -52,11 +52,21 @@ unlike($metadata, qr/^branch_lsn=0\/0$/m, 'branch LSN is valid');
 like($metadata, qr/^wal_range_bytes=[0-9]+$/m, 'metadata records WAL range size');
 like($metadata, qr/^wal_records_scanned=[0-9]+$/m, 'metadata records scanned WAL count');
 like($metadata, qr/^wal_source_records=[0-9]+$/m, 'metadata records source WAL count');
+like($metadata, qr/^wal_other_db_records=[0-9]+$/m, 'metadata records other DB WAL count');
+like($metadata, qr/^wal_mixed_records=[0-9]+$/m, 'metadata records mixed WAL count');
+like($metadata, qr/^wal_global_records=[0-9]+$/m, 'metadata records global WAL count');
 my ($wal_records_scanned) = $metadata =~ /^wal_records_scanned=([0-9]+)$/m;
 my ($wal_source_records) = $metadata =~ /^wal_source_records=([0-9]+)$/m;
+my ($wal_other_db_records) = $metadata =~ /^wal_other_db_records=([0-9]+)$/m;
+my ($wal_mixed_records) = $metadata =~ /^wal_mixed_records=([0-9]+)$/m;
+my ($wal_global_records) = $metadata =~ /^wal_global_records=([0-9]+)$/m;
 ok(
 	$wal_records_scanned >= $wal_source_records,
 	'metadata WAL scan count covers source WAL count');
+ok($wal_mixed_records <= $wal_source_records, 'metadata mixed WAL count is bounded by source WAL count');
+ok(
+	$wal_records_scanned >= $wal_source_records + $wal_other_db_records + $wal_global_records,
+	'metadata WAL scan count covers classified WAL counts');
 like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
 like($metadata, qr/^wal_pin=released$/m, 'metadata records released WAL pin');
 like($metadata, qr/^replay_method=source_flush$/m, 'metadata records source flush replay method');
@@ -266,6 +276,9 @@ for my $path (@metadata_files)
 like($tablespace_metadata, qr/^wal_range_bytes=0$/m, 'tablespace metadata records zero WAL range');
 like($tablespace_metadata, qr/^wal_records_scanned=0$/m, 'tablespace metadata records zero scanned WAL count');
 like($tablespace_metadata, qr/^wal_source_records=0$/m, 'tablespace metadata records zero source WAL count');
+like($tablespace_metadata, qr/^wal_other_db_records=0$/m, 'tablespace metadata records zero other DB WAL count');
+like($tablespace_metadata, qr/^wal_mixed_records=0$/m, 'tablespace metadata records zero mixed WAL count');
+like($tablespace_metadata, qr/^wal_global_records=0$/m, 'tablespace metadata records zero global WAL count');
 like($tablespace_metadata, qr/^wal_pin=not_started$/m, 'tablespace metadata records WAL pin not started');
 like($tablespace_metadata, qr/^clone_result=not_started$/m, 'tablespace metadata records clone not started');
 like($tablespace_metadata, qr/^cleanup=not_started$/m, 'tablespace metadata records cleanup not started');
