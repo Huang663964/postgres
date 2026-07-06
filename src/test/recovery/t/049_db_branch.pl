@@ -489,30 +489,10 @@ ALTER DATABASE dbbranch_no_conn_source WITH ALLOW_CONNECTIONS true;
 DROP DATABASE dbbranch_no_conn_source;
 ]);
 
-$node->safe_psql('postgres', q[
-CREATE FUNCTION dbbranch_wrapper() RETURNS oid LANGUAGE sql AS $$
-  SELECT pg_create_database_branch('dbbranch_source', 'dbbranch_func_target')
-$$;]);
-
-$stderr = '';
-$result = $node->psql(
+my $func_lookup = $node->safe_psql(
 	'postgres',
-	q[SELECT dbbranch_wrapper();],
-	stderr => \$stderr);
-
-is($result, 3, 'disabled SQL wrapper cannot create a branch');
-like(
-	$stderr,
-	qr/pg_create_database_branch\(\) is disabled; use CREATE BRANCH instead/,
-	'disabled SQL wrapper reports CREATE BRANCH replacement');
-
-my $func_branch_count = $node->safe_psql(
-	'postgres',
-	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_func_target';]);
-is($func_branch_count, '0', 'disabled SQL wrapper creates no branch database');
-
-@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, $metadata_file_count, 'disabled SQL wrapper writes no metadata file');
+	q[SELECT to_regprocedure('pg_create_database_branch(name,name)') IS NULL;]);
+is($func_lookup, 't', 'CREATE BRANCH has no SQL wrapper function');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_setting_role LOGIN;');
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_setting_source;');

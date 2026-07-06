@@ -4107,17 +4107,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 }
 
 Datum
-pg_create_database_branch(PG_FUNCTION_ARGS)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_create_database_branch() is disabled; use CREATE BRANCH instead")));
-
-	PG_RETURN_OID(InvalidOid);
-}
-
-
-Datum
 pg_database_collation_actual_version(PG_FUNCTION_ARGS)
 {
 	Oid			dbid = PG_GETARG_OID(0);
