@@ -92,11 +92,11 @@ if ($result == 0)
 	my $waldump = '';
 	my $catalog_state = $node->safe_psql(
 		'postgres',
-		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
+		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
 	is(
 		$catalog_state,
-		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|',
-		'pg_dbbranch records READY metadata with replay method');
+		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|',
+		'pg_dbbranch records READY metadata with replay method and WAL scan counts');
 
 	ok(
 		PostgreSQL::Test::Utils::run_log(
@@ -115,13 +115,13 @@ if ($result == 0)
 	is($branch_rows_after_restart, '1:alice,2:bob', 'ready branch survives restart');
 	my $catalog_state_after_restart = $node->safe_psql(
 		'postgres',
-		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = ]
+		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = ]
 		  . $branch_oid
 		  . q[;]);
 	is(
 		$catalog_state_after_restart,
-		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|',
-		'pg_dbbranch READY metadata survives restart');
+		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|',
+		'pg_dbbranch READY metadata with WAL scan counts survives restart');
 
 	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (3, 'dora');]);
 	my $source_after_branch_write = $node->safe_psql(
