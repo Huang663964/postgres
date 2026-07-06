@@ -143,7 +143,8 @@ static void movedb(const char *dbname, const char *tblspcname);
 static void movedb_failure_callback(int code, Datum arg);
 static bool get_db_info(const char *name, LOCKMODE lockmode,
 						Oid *dbIdP, Oid *ownerIdP,
-						int *encodingP, bool *dbIsTemplateP, bool *dbAllowConnP, bool *dbHasLoginEvtP,
+						int *encodingP, bool *dbIsTemplateP, bool *dbAllowConnP,
+			int *dbConnLimitP, bool *dbHasLoginEvtP,
 						TransactionId *dbFrozenXidP, MultiXactId *dbMinMultiP,
 						Oid *dbTablespace, char **dbCollate, char **dbCtype, char **dbLocale,
 						char **dbIcurules,
@@ -188,7 +189,7 @@ static bool CleanupDBBranchClonePath(const char *clone_path);
 static Oid AllocateDBBranchDatabaseOid(void);
 static void InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_name,
 								   const char *clone_path,
-								   int src_encoding, bool src_hasloginevt,
+								   int src_encoding, bool src_hasloginevt, int src_connlimit,
 								   TransactionId src_frozenxid, MultiXactId src_minmxid,
 								   Oid src_deftablespace, char *src_collate,
 								   char *src_ctype, char *src_locale,
@@ -1074,7 +1075,7 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 
 	if (!get_db_info(dbtemplate, ShareLock,
 					 &src_dboid, &src_owner, &src_encoding,
-					 &src_istemplate, &src_allowconn, &src_hasloginevt,
+					 &src_istemplate, &src_allowconn, NULL, &src_hasloginevt,
 					 &src_frozenxid, &src_minmxid, &src_deftablespace,
 					 &src_collate, &src_ctype, &src_locale, &src_icurules, &src_locprovider,
 					 &src_collversion))
@@ -1775,7 +1776,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	pgdbrel = table_open(DatabaseRelationId, RowExclusiveLock);
 
 	if (!get_db_info(dbname, AccessExclusiveLock, &db_id, NULL, NULL,
-					 &db_istemplate, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
+					 &db_istemplate, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
 	{
 		if (!missing_ok)
 		{
@@ -2001,7 +2002,7 @@ RenameDatabase(const char *oldname, const char *newname)
 	rel = table_open(DatabaseRelationId, RowExclusiveLock);
 
 	if (!get_db_info(oldname, AccessExclusiveLock, &db_id, NULL, NULL, NULL,
-					 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
+					 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("database \"%s\" does not exist", oldname)));
@@ -2113,7 +2114,7 @@ movedb(const char *dbname, const char *tblspcname)
 	pgdbrel = table_open(DatabaseRelationId, RowExclusiveLock);
 
 	if (!get_db_info(dbname, AccessExclusiveLock, &db_id, NULL, NULL, NULL,
-					 NULL, NULL, NULL, NULL, &src_tblspcoid, NULL, NULL, NULL, NULL, NULL, NULL))
+					 NULL, NULL, NULL, NULL, NULL, &src_tblspcoid, NULL, NULL, NULL, NULL, NULL, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("database \"%s\" does not exist", dbname)));
@@ -3307,7 +3308,7 @@ AllocateDBBranchDatabaseOid(void)
 static void
 InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_name,
 						const char *clone_path,
-						int src_encoding, bool src_hasloginevt,
+						int src_encoding, bool src_hasloginevt, int src_connlimit,
 						TransactionId src_frozenxid, MultiXactId src_minmxid,
 						Oid src_deftablespace, char *src_collate, char *src_ctype,
 						char *src_locale, char *src_icurules,
@@ -3333,7 +3334,7 @@ InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_n
 	new_record[Anum_pg_database_datistemplate - 1] = BoolGetDatum(false);
 	new_record[Anum_pg_database_datallowconn - 1] = BoolGetDatum(true);
 	new_record[Anum_pg_database_dathasloginevt - 1] = BoolGetDatum(src_hasloginevt);
-	new_record[Anum_pg_database_datconnlimit - 1] = Int32GetDatum(DATCONNLIMIT_UNLIMITED);
+	new_record[Anum_pg_database_datconnlimit - 1] = Int32GetDatum(src_connlimit);
 	new_record[Anum_pg_database_datfrozenxid - 1] = TransactionIdGetDatum(src_frozenxid);
 	new_record[Anum_pg_database_datminmxid - 1] = TransactionIdGetDatum(src_minmxid);
 	new_record[Anum_pg_database_dattablespace - 1] = ObjectIdGetDatum(src_deftablespace);
@@ -3720,6 +3721,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	bool		source_istemplate;
 	bool		source_allowconn;
 	bool		source_hasloginevt;
+	int			source_connlimit;
 	TransactionId source_frozenxid;
 	MultiXactId source_minmxid;
 	Oid		source_deftablespace;
@@ -3755,7 +3757,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 	if (!get_db_info(source_name, ShareLock,
 					 &source_dboid, NULL, &source_encoding,
-					 &source_istemplate, &source_allowconn, &source_hasloginevt,
+					 &source_istemplate, &source_allowconn, &source_connlimit,
+					 &source_hasloginevt,
 					 &source_frozenxid, &source_minmxid,
 					 &source_deftablespace, &source_collate, &source_ctype,
 					 &source_locale, &source_icurules, &source_locprovider,
@@ -3951,7 +3954,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		FlushDatabaseBuffers(branch_dboid);
 
 		InstallDBBranchDatabase(source_dboid, branch_dboid, branch_name, clone_path,
-									   source_encoding, source_hasloginevt,
+									   source_encoding, source_hasloginevt, source_connlimit,
 									   source_frozenxid, source_minmxid,
 									   source_deftablespace, source_collate,
 									   source_ctype, source_locale,
@@ -4043,7 +4046,8 @@ pg_database_collation_actual_version(PG_FUNCTION_ARGS)
 static bool
 get_db_info(const char *name, LOCKMODE lockmode,
 			Oid *dbIdP, Oid *ownerIdP,
-			int *encodingP, bool *dbIsTemplateP, bool *dbAllowConnP, bool *dbHasLoginEvtP,
+			int *encodingP, bool *dbIsTemplateP, bool *dbAllowConnP,
+						int *dbConnLimitP, bool *dbHasLoginEvtP,
 			TransactionId *dbFrozenXidP, MultiXactId *dbMinMultiP,
 			Oid *dbTablespace, char **dbCollate, char **dbCtype, char **dbLocale,
 			char **dbIcurules,
@@ -4134,6 +4138,9 @@ get_db_info(const char *name, LOCKMODE lockmode,
 				/* allowing connections? */
 				if (dbAllowConnP)
 					*dbAllowConnP = dbform->datallowconn;
+				/* connection limit */
+				if (dbConnLimitP)
+					*dbConnLimitP = dbform->datconnlimit;
 				/* limit of frozen XIDs */
 				if (dbFrozenXidP)
 					*dbFrozenXidP = dbform->datfrozenxid;

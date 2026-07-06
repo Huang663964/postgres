@@ -351,6 +351,7 @@ $node->safe_psql(
 	'postgres',
 	q[
 ALTER DATABASE dbbranch_setting_source SET work_mem = '64MB';
+ALTER DATABASE dbbranch_setting_source CONNECTION LIMIT 7;
 ALTER ROLE dbbranch_setting_role IN DATABASE dbbranch_setting_source
 	SET maintenance_work_mem = '32MB';
 ]);
@@ -377,6 +378,11 @@ is($setting_work_mem, '64MB', 'branch applies copied database-level setting');
 my $setting_branch_oid = $node->safe_psql(
 	'postgres',
 	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_setting_target';]);
+my $setting_connlimit = $node->safe_psql(
+	'postgres',
+	q[SELECT datconnlimit FROM pg_database WHERE datname = 'dbbranch_setting_target';]);
+is($setting_connlimit, '7', 'branch copies source connection limit');
+
 my $setting_role_work_mem = $node->safe_psql(
 	'dbbranch_setting_target',
 	q[SHOW maintenance_work_mem;],
