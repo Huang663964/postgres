@@ -3901,6 +3901,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				 errmsg("database \"%s\" already exists", branch_name)));
 
 	/* ponytail: full backend drain first; relax to writer-only gate later. */
+	INJECTION_POINT("db-branch-before-drain", NULL);
+
 	if (CountOtherDBBackends(source_dboid, &notherbackends, &npreparedxacts))
 	{
 		const char *busy_failure =
