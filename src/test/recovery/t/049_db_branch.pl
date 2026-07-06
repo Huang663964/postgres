@@ -38,6 +38,7 @@ my $result = $node->psql(
 
 my @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 is(scalar @metadata_files, 1, 'branch creation writes one metadata file');
+my $metadata_file_count = scalar @metadata_files;
 
 open my $metadata_fh, '<', $metadata_files[0]
   or die "could not open $metadata_files[0]: $!";
@@ -259,7 +260,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 4
+	skip 'Injection points not supported by this build', 9
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -313,7 +314,62 @@ CREATE BRANCH dbbranch_replay_gate_target FROM DATABASE dbbranch_replay_gate_sou
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_install_fail_source;]);
+	$node->safe_psql(
+		'dbbranch_install_fail_source',
+		q[
+CREATE TABLE install_fail_rows (id int PRIMARY KEY);
+INSERT INTO install_fail_rows VALUES (1);
+CHECKPOINT;
+INSERT INTO install_fail_rows VALUES (2);
+]);
+
+	my %base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-before-install', 'wait');]);
+
+	my $install_branch = $node->background_psql('postgres', on_error_stop => 0);
+	$install_branch->query_until(
+		qr/start_install_branch/,
+		q(\echo start_install_branch
+CREATE BRANCH dbbranch_install_fail_target FROM DATABASE dbbranch_install_fail_source;
+\echo finish_install_branch
+));
+	$node->wait_for_event('client backend', 'db-branch-before-install');
+	my @install_clone_paths = grep { !$base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @install_clone_paths, 1, 'install failure creates one branch storage path before catalog install');
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_install_fail_target;]);
+	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-install');]);
+	$install_branch->query_until(qr/finish_install_branch/, '');
+	like(
+		$install_branch->{stderr},
+		qr/(duplicate key value violates unique constraint|already exists)/,
+		'db branch install failure is reported to the client');
+	$install_branch->quit;
+
+	my $install_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($install_slot_count, '0', 'install failure releases DB Branch WAL pin');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-install');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_install_fail_target;]);
+
+	my @install_clone_left = grep { -e $_ } @install_clone_paths;
+	is(scalar @install_clone_left, 0, 'install failure removes cloned branch storage path');
+
+	my $install_catalog_rows = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_dbbranch WHERE branch_db_oid NOT IN (SELECT oid FROM pg_database);]);
+	is($install_catalog_rows, '0', 'install failure leaves no orphan pg_dbbranch rows');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_install_fail_source;]);
 }
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count = scalar @metadata_files;
 
 $stderr = '';
 $result = $node->psql(
@@ -333,7 +389,7 @@ my $xact_branch_count = $node->safe_psql(
 is($xact_branch_count, '0', 'transaction-block rejection creates no branch database');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 1, 'transaction-block rejection writes no metadata file');
+is(scalar @metadata_files, $metadata_file_count, 'transaction-block rejection writes no metadata file');
 
 $node->safe_psql('postgres', q[
 CREATE ROLE dbbranch_no_createdb LOGIN;
@@ -372,7 +428,7 @@ my $permission_branch_count = $node->safe_psql(
 is($permission_branch_count, '0', 'permission failures create no branch database');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 1, 'permission failures write no metadata file');
+is(scalar @metadata_files, $metadata_file_count, 'permission failures write no metadata file');
 
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_no_createdb, dbbranch_createdb;]);
 
@@ -425,7 +481,7 @@ my $control_reject_branch_count = $node->safe_psql(
 is($control_reject_branch_count, '0', 'control validation failures create no branch database');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 1, 'control validation failures write no metadata file');
+is(scalar @metadata_files, $metadata_file_count, 'control validation failures write no metadata file');
 
 $node->safe_psql('postgres', q[
 DROP DATABASE dbbranch_existing_target;
@@ -456,7 +512,7 @@ my $func_branch_count = $node->safe_psql(
 is($func_branch_count, '0', 'disabled SQL wrapper creates no branch database');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 1, 'disabled SQL wrapper writes no metadata file');
+is(scalar @metadata_files, $metadata_file_count, 'disabled SQL wrapper writes no metadata file');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_setting_role LOGIN;');
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_setting_source;');
@@ -490,6 +546,10 @@ $result = $node->psql(
 	stderr => \$stderr);
 
 is($result, 0, 'db branch copies database-level settings');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count, 'settings branch writes separate metadata file');
 
 my $setting_login_flag = $node->safe_psql(
 	'postgres',
@@ -574,7 +634,8 @@ $result = $node->psql(
 is($result, 0, 'db branch supports non-default source tablespace');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 3, 'tablespace branch writes separate metadata file');
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count, 'tablespace branch writes separate metadata file');
 
 my $tablespace_metadata = '';
 for my $path (@metadata_files)
@@ -637,7 +698,8 @@ $result = $node->psql(
 is($result, 0, 'db branch supports unlogged source relations');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 4, 'unlogged branch writes separate metadata file');
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count, 'unlogged branch writes separate metadata file');
 
 my $unlogged_metadata = '';
 
@@ -689,7 +751,8 @@ $writer->query_safe('ROLLBACK;');
 $writer->quit;
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 5, 'busy branch attempt writes separate metadata file');
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count, 'busy branch attempt writes separate metadata file');
 
 my $busy_metadata = '';
 for my $path (@metadata_files)
@@ -739,7 +802,8 @@ like(
 $node->safe_psql('dbbranch_prepared_source', q[ROLLBACK PREPARED 'dbbranch_prepared_xact';]);
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 6, 'prepared transaction rejection writes separate metadata file');
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count, 'prepared transaction rejection writes separate metadata file');
 
 my $prepared_metadata = '';
 for my $path (@metadata_files)
@@ -792,7 +856,7 @@ my $invalid_branch_count = $node->safe_psql(
 is($invalid_branch_count, '0', 'invalid source rejection creates no branch database');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 6, 'invalid source rejection writes no metadata file');
+is(scalar @metadata_files, $metadata_file_count, 'invalid source rejection writes no metadata file');
 
 $node->safe_psql('postgres', 'DROP DATABASE dbbranch_invalid_source;');
 

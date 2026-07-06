@@ -3789,6 +3789,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	ListCell   *cell;
 	bool		source_has_unlogged;
 	bool		source_has_sequence;
+	volatile bool clone_paths_created = false;
 	int		notherbackends;
 	int		npreparedxacts;
 	XLogRecPtr redo_ptr;
@@ -3928,6 +3929,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			char	   *frompath = GetDatabasePath(source_dboid, tablespace_oid);
 			char	   *topath = GetDatabasePath(branch_dboid, tablespace_oid);
 
+			clone_paths_created = true;
 			if (!CloneDBBranchDirectory(frompath, topath, failure, sizeof(failure)))
 			{
 				bool		cleanup_ok = CleanupDBBranchClonePath(topath);
@@ -4037,6 +4039,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		INSTR_TIME_SUBTRACT(elapsed, replay_start);
 		replay_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 
+		INJECTION_POINT("db-branch-before-install", NULL);
+
 		FlushDatabaseBuffers(branch_dboid);
 
 		InstallDBBranchDatabase(source_dboid, branch_dboid, branch_name, clone_path,
@@ -4072,6 +4076,18 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		{
 			UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
 			source_lock_held = false;
+		}
+		if (clone_paths_created)
+		{
+			DropDatabaseBuffers(branch_dboid);
+			ForgetDatabaseSyncRequests(branch_dboid);
+			foreach(cell, tablespace_oids)
+			{
+				char	   *path = GetDatabasePath(branch_dboid, lfirst_oid(cell));
+
+				(void) CleanupDBBranchClonePath(path);
+				pfree(path);
+			}
 		}
 		ReleaseDBBranchWalPin();
 		PG_RE_THROW();
