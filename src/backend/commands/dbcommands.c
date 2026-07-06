@@ -58,6 +58,7 @@
 #include "common/file_utils.h"
 #include "common/file_perm.h"
 #include "common/hashfn.h"
+#include "common/relpath.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -65,6 +66,7 @@
 #include "replication/slot.h"
 #include "storage/copydir.h"
 #include "storage/bufmgr.h"
+#include "storage/bufpage.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -126,6 +128,8 @@ typedef struct DBBranchWalScan
 	uint64		other_db_records;
 	uint64		mixed_records;
 	uint64		global_records;
+	uint64		source_fpi_blocks;
+	uint64		source_non_fpi_records;
 } DBBranchWalScan;
 
 
@@ -169,6 +173,12 @@ static void WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 								  const char *failure);
 static void ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 								 XLogRecPtr end_lsn, DBBranchWalScan *wal_scan);
+static bool ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
+										 XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+										 char *failure, Size failure_len);
+static bool WriteDBBranchFullPageImage(const char *clone_path, RelFileLocator rlocator,
+									  ForkNumber forknum, BlockNumber blkno,
+									  const char *page, char *failure, Size failure_len);
 static bool CleanupDBBranchClonePath(const char *clone_path);
 static Oid InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
 								   const char *clone_path,
@@ -2860,6 +2870,8 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 	uint64		wal_other_db_records = wal_scan ? wal_scan->other_db_records : 0;
 	uint64		wal_mixed_records = wal_scan ? wal_scan->mixed_records : 0;
 	uint64		wal_global_records = wal_scan ? wal_scan->global_records : 0;
+	uint64		wal_source_fpi_blocks = wal_scan ? wal_scan->source_fpi_blocks : 0;
+	uint64		wal_source_non_fpi_records = wal_scan ? wal_scan->source_non_fpi_records : 0;
 	bool		ok;
 
 	if (!XLogRecPtrIsInvalid(redo_ptr) &&
@@ -2889,6 +2901,8 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "wal_other_db_records=" UINT64_FORMAT "\n"
 			 "wal_mixed_records=" UINT64_FORMAT "\n"
 			 "wal_global_records=" UINT64_FORMAT "\n"
+			 "wal_source_fpi_blocks=" UINT64_FORMAT "\n"
+			 "wal_source_non_fpi_records=" UINT64_FORMAT "\n"
 			 "clone_path=%s\n"
 			 "wal_pin=%s\n"
 			 "clone_result=%s\n"
@@ -2901,6 +2915,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 LSN_FORMAT_ARGS(redo_ptr), LSN_FORMAT_ARGS(branch_lsn),
 			 wal_range_bytes, wal_records_scanned, wal_source_records,
 			 wal_other_db_records, wal_mixed_records, wal_global_records,
+			 wal_source_fpi_blocks, wal_source_non_fpi_records,
 			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
 			 replay_method, status_history, status, failure) >= 0;
 
@@ -2933,6 +2948,8 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 	wal_scan->other_db_records = 0;
 	wal_scan->mixed_records = 0;
 	wal_scan->global_records = 0;
+	wal_scan->source_fpi_blocks = 0;
+	wal_scan->source_non_fpi_records = 0;
 
 	if (XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(end_lsn) ||
 		end_lsn <= start_lsn || start_lsn < XLOG_BLCKSZ)
@@ -2965,6 +2982,8 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 		bool		touches_source = false;
 		bool		touches_other_db = false;
 		bool		touches_global = false;
+		bool		source_without_fpi = false;
+		uint64		source_fpi_blocks = 0;
 
 		errormsg = NULL;
 		record = XLogReadRecord(xlogreader, &errormsg);
@@ -3004,7 +3023,13 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 											NULL, NULL, NULL))
 					continue;
 				if (rlocator.dbOid == source_dboid)
+				{
 					touches_source = true;
+					if (XLogRecBlockImageApply(xlogreader, block_id))
+						source_fpi_blocks++;
+					else
+						source_without_fpi = true;
+				}
 				else if (OidIsValid(rlocator.dbOid))
 					touches_other_db = true;
 				else
@@ -3015,8 +3040,11 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 		if (touches_source)
 		{
 			wal_scan->source_records++;
+			wal_scan->source_fpi_blocks += source_fpi_blocks;
 			if (touches_other_db || touches_global)
 				wal_scan->mixed_records++;
+			if (source_without_fpi)
+				wal_scan->source_non_fpi_records++;
 		}
 		else if (touches_other_db)
 			wal_scan->other_db_records++;
@@ -3028,6 +3056,221 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 
 	XLogReaderFree(xlogreader);
 	pfree(private_data);
+}
+
+
+static bool
+WriteDBBranchFullPageImage(const char *clone_path, RelFileLocator rlocator,
+					ForkNumber forknum, BlockNumber blkno,
+					const char *page, char *failure, Size failure_len)
+{
+	char        path[MAXPGPATH * 2];
+	size_t      path_len;
+	BlockNumber segno = blkno / ((BlockNumber) RELSEG_SIZE);
+	BlockNumber segblk = blkno % ((BlockNumber) RELSEG_SIZE);
+	off_t       offset = (off_t) BLCKSZ * segblk;
+	int         fd;
+	ssize_t     nbytes;
+
+	if (rlocator.spcOid != DEFAULTTABLESPACE_OID ||
+		!RelFileNumberIsValid(rlocator.relNumber) ||
+		forknum < MAIN_FORKNUM || forknum > MAX_FORKNUM)
+	{
+		snprintf(failure, failure_len,
+					"unsupported DB Branch full-page image target");
+		return false;
+	}
+
+	if (forknum == MAIN_FORKNUM)
+		snprintf(path, sizeof(path), "%s/%u", clone_path, rlocator.relNumber);
+	else
+		snprintf(path, sizeof(path), "%s/%u_%s", clone_path,
+					rlocator.relNumber, forkNames[forknum]);
+
+	if (segno > 0)
+	{
+		int         len;
+
+		path_len = strlen(path);
+		if (path_len >= sizeof(path))
+		{
+			snprintf(failure, failure_len,
+					"DB Branch replay path is too long");
+			return false;
+		}
+		len = snprintf(path + path_len, sizeof(path) - path_len, ".%u",
+					(unsigned int) segno);
+		if (len < 0 || len >= sizeof(path) - path_len)
+		{
+			snprintf(failure, failure_len,
+					"DB Branch replay path is too long");
+			return false;
+		}
+	}
+
+	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
+	if (fd < 0)
+	{
+		snprintf(failure, failure_len,
+					"could not open DB Branch replay file \"%s\": %s",
+					path, strerror(errno));
+		return false;
+	}
+
+	errno = 0;
+	nbytes = pg_pwrite(fd, page, BLCKSZ, offset);
+	if (nbytes != BLCKSZ)
+	{
+		int         save_errno = errno ? errno : ENOSPC;
+
+		CloseTransientFile(fd);
+		snprintf(failure, failure_len,
+					"could not write DB Branch replay file \"%s\": %s",
+					path, strerror(save_errno));
+		return false;
+	}
+
+	if (pg_fsync(fd) != 0)
+	{
+		int         save_errno = errno;
+
+		CloseTransientFile(fd);
+		snprintf(failure, failure_len,
+					"could not fsync DB Branch replay file \"%s\": %s",
+					path, strerror(save_errno));
+		return false;
+	}
+
+	if (CloseTransientFile(fd) != 0)
+	{
+		snprintf(failure, failure_len,
+					"could not close DB Branch replay file \"%s\": %s",
+					path, strerror(errno));
+		return false;
+	}
+
+	return true;
+}
+
+static bool
+ReplayDBBranchFullPageImages(Oid source_dboid, const char *clone_path,
+					XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+					char *failure, Size failure_len)
+{
+	ReadLocalXLogPageNoWaitPrivate *private_data;
+	XLogReaderState *xlogreader;
+	XLogRecPtr  first_valid_record;
+	char       *errormsg;
+
+	if (XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(end_lsn) ||
+		end_lsn <= start_lsn || start_lsn < XLOG_BLCKSZ)
+		return true;
+
+	private_data = palloc0(sizeof(ReadLocalXLogPageNoWaitPrivate));
+	xlogreader = XLogReaderAllocate(wal_segment_size, NULL,
+					XL_ROUTINE(.page_read = &read_local_xlog_page_no_wait,
+					.segment_open = &wal_segment_open,
+					.segment_close = &wal_segment_close),
+					private_data);
+	if (xlogreader == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+					errmsg("out of memory"),
+					errdetail("Failed while allocating a WAL reading processor.")));
+
+	first_valid_record = XLogFindNextRecord(xlogreader, start_lsn);
+	if (XLogRecPtrIsInvalid(first_valid_record) || first_valid_record >= end_lsn)
+	{
+		XLogReaderFree(xlogreader);
+		pfree(private_data);
+		return true;
+	}
+
+	/* ponytail: FPI-only replay; rmgr-specific redo comes later. */
+	for (;;)
+	{
+		XLogRecord *record;
+
+		errormsg = NULL;
+		record = XLogReadRecord(xlogreader, &errormsg);
+		if (record == NULL)
+		{
+			if (private_data->end_of_wal)
+				break;
+			if (errormsg)
+				snprintf(failure, failure_len,
+					"could not read WAL at %X/%X: %s",
+					LSN_FORMAT_ARGS(xlogreader->EndRecPtr), errormsg);
+			else
+				snprintf(failure, failure_len,
+					"could not read WAL at %X/%X",
+					LSN_FORMAT_ARGS(xlogreader->EndRecPtr));
+			XLogReaderFree(xlogreader);
+			pfree(private_data);
+			return false;
+		}
+
+		if (xlogreader->ReadRecPtr >= end_lsn)
+			break;
+		if (xlogreader->EndRecPtr > end_lsn)
+		{
+			snprintf(failure, failure_len,
+					"DB Branch WAL replay endpoint is not a record boundary");
+			XLogReaderFree(xlogreader);
+			pfree(private_data);
+			return false;
+		}
+
+		if (XLogRecHasAnyBlockRefs(xlogreader))
+		{
+			uint8       block_id;
+
+			for (block_id = 0; block_id <= XLogRecMaxBlockId(xlogreader); block_id++)
+			{
+				RelFileLocator rlocator;
+				ForkNumber  forknum;
+				BlockNumber blkno;
+				PGAlignedBlock page;
+
+				if (!XLogRecGetBlockTagExtended(xlogreader, block_id, &rlocator,
+					&forknum, &blkno, NULL))
+					continue;
+				if (rlocator.dbOid != source_dboid ||
+					!XLogRecBlockImageApply(xlogreader, block_id))
+					continue;
+
+				if (!RestoreBlockImage(xlogreader, block_id, page.data))
+				{
+					snprintf(failure, failure_len,
+					"could not restore DB Branch full-page image at %X/%X",
+					LSN_FORMAT_ARGS(xlogreader->ReadRecPtr));
+					XLogReaderFree(xlogreader);
+					pfree(private_data);
+					return false;
+				}
+				if (!PageIsNew((Page) page.data))
+				{
+					PageSetLSN((Page) page.data, xlogreader->EndRecPtr);
+					PageSetChecksumInplace((Page) page.data, blkno);
+				}
+				if (!WriteDBBranchFullPageImage(clone_path, rlocator, forknum,
+					blkno, page.data, failure,
+					failure_len))
+				{
+					XLogReaderFree(xlogreader);
+					pfree(private_data);
+					return false;
+				}
+			}
+		}
+
+		if (xlogreader->EndRecPtr >= end_lsn)
+			break;
+	}
+
+	XLogReaderFree(xlogreader);
+	pfree(private_data);
+	return true;
 }
 
 
@@ -3591,6 +3834,24 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			}
 		}
 
+		if (!ReplayDBBranchFullPageImages(source_dboid, clone_path,
+											 redo_ptr, branch_lsn, failure, sizeof(failure)))
+		{
+			bool		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+
+			ReleaseDBBranchWalPin();
+			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "released",
+						  clone_result, cleanup_ok ? "done" : "failed",
+						  "fpi_restore+source_flush",
+						  &wal_scan,
+						  "CREATING,COPYING,REPLAYING,FAILED", "FAILED", failure);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("%s", failure)));
+		}
+
 		branch_dboid = InstallDBBranchDatabase(source_dboid, branch_name, clone_path,
 									   source_encoding, source_hasloginevt,
 									   source_frozenxid, source_minmxid,
@@ -3601,16 +3862,16 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		LogDBBranchCreateFileCopy(source_dboid, branch_dboid);
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
-						  &wal_scan, "source_flush", "READY", "");
+						  &wal_scan, "fpi_restore+source_flush", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 		ReleaseDBBranchWalPin();
 		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
-						  clone_result, "not_needed", "source_flush",
+						  clone_result, "not_needed", "fpi_restore+source_flush",
 						  &wal_scan,
-						  "CREATING,COPYING,READY", "READY", "");
+						  "CREATING,COPYING,REPLAYING,READY", "READY", "");
 	}
 	PG_CATCH();
 	{

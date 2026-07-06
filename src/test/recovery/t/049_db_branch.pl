@@ -56,29 +56,35 @@ like($metadata, qr/^wal_source_records=[0-9]+$/m, 'metadata records source WAL c
 like($metadata, qr/^wal_other_db_records=[0-9]+$/m, 'metadata records other DB WAL count');
 like($metadata, qr/^wal_mixed_records=[0-9]+$/m, 'metadata records mixed WAL count');
 like($metadata, qr/^wal_global_records=[0-9]+$/m, 'metadata records global WAL count');
+like($metadata, qr/^wal_source_fpi_blocks=[0-9]+$/m, 'metadata records source FPI block count');
+like($metadata, qr/^wal_source_non_fpi_records=[0-9]+$/m, 'metadata records source non-FPI record count');
 my ($wal_records_scanned) = $metadata =~ /^wal_records_scanned=([0-9]+)$/m;
 my ($wal_source_records) = $metadata =~ /^wal_source_records=([0-9]+)$/m;
 my ($wal_other_db_records) = $metadata =~ /^wal_other_db_records=([0-9]+)$/m;
 my ($wal_mixed_records) = $metadata =~ /^wal_mixed_records=([0-9]+)$/m;
 my ($wal_global_records) = $metadata =~ /^wal_global_records=([0-9]+)$/m;
+my ($wal_source_fpi_blocks) = $metadata =~ /^wal_source_fpi_blocks=([0-9]+)$/m;
+my ($wal_source_non_fpi_records) = $metadata =~ /^wal_source_non_fpi_records=([0-9]+)$/m;
 ok(
 	$wal_records_scanned >= $wal_source_records,
 	'metadata WAL scan count covers source WAL count');
 ok($wal_source_records > 0, 'metadata records source WAL after last checkpoint');
+ok($wal_source_fpi_blocks > 0, 'metadata records restored source full-page images');
+ok($wal_source_non_fpi_records <= $wal_source_records, 'metadata source non-FPI count is bounded by source WAL count');
 ok($wal_mixed_records <= $wal_source_records, 'metadata mixed WAL count is bounded by source WAL count');
 ok(
 	$wal_records_scanned >= $wal_source_records + $wal_other_db_records + $wal_global_records,
 	'metadata WAL scan count covers classified WAL counts');
 like($metadata, qr/^clone_path=base\/pg_dbbranch_[0-9]+_[0-9a-f]+$/m, 'metadata records clone staging path');
 like($metadata, qr/^wal_pin=released$/m, 'metadata records released WAL pin');
-like($metadata, qr/^replay_method=source_flush$/m, 'metadata records source flush replay method');
+like($metadata, qr/^replay_method=fpi_restore\+source_flush$/m, 'metadata records FPI restore replay method');
 
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
 if ($result == 0)
 {
 	like($metadata, qr/^clone_result=(done|copy_fallback)$/m, 'metadata records storage clone success');
 	like($metadata, qr/^cleanup=not_needed$/m, 'metadata records no failed clone cleanup needed');
-	like($metadata, qr/^status_history=CREATING,COPYING,READY$/m, 'metadata records READY transition');
+	like($metadata, qr/^status_history=CREATING,COPYING,REPLAYING,READY$/m, 'metadata records READY transition');
 	like($metadata, qr/^status=READY$/m, 'metadata final state is READY');
 	like($metadata, qr/^failure=$/m, 'metadata records no failure');
 	ok(!-e $node->data_dir . '/' . $clone_path, 'clone staging path is installed, not left behind');
@@ -112,7 +118,7 @@ if ($result == 0)
 		q[SELECT status || '|' || replay_method || '|' || source_db_oid || '|' || branch_db_oid || '|' || (redo_ptr IS NOT NULL) || '|' || (branch_lsn IS NOT NULL) || '|' || (redo_ptr <= branch_lsn) || '|' || (wal_records_scanned >= 0) || '|' || (wal_source_records >= 0) || '|' || (wal_records_scanned >= wal_source_records) || '|' || failure FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_target');]);
 	is(
 		$catalog_state,
-		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
+		'READY|fpi_restore+source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
 		'pg_dbbranch records READY metadata with replay method and WAL scan counts');
 
 	ok(
@@ -137,7 +143,7 @@ if ($result == 0)
 		  . q[;]);
 	is(
 		$catalog_state_after_restart,
-		'READY|source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
+		'READY|fpi_restore+source_flush|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|',
 		'pg_dbbranch READY metadata with WAL scan counts survives restart');
 
 	$node->safe_psql('dbbranch_target', q[INSERT INTO users VALUES (4, 'dora');]);
@@ -281,6 +287,8 @@ like($tablespace_metadata, qr/^wal_source_records=0$/m, 'tablespace metadata rec
 like($tablespace_metadata, qr/^wal_other_db_records=0$/m, 'tablespace metadata records zero other DB WAL count');
 like($tablespace_metadata, qr/^wal_mixed_records=0$/m, 'tablespace metadata records zero mixed WAL count');
 like($tablespace_metadata, qr/^wal_global_records=0$/m, 'tablespace metadata records zero global WAL count');
+like($tablespace_metadata, qr/^wal_source_fpi_blocks=0$/m, 'tablespace metadata records zero source FPI block count');
+like($tablespace_metadata, qr/^wal_source_non_fpi_records=0$/m, 'tablespace metadata records zero source non-FPI record count');
 like($tablespace_metadata, qr/^wal_pin=not_started$/m, 'tablespace metadata records WAL pin not started');
 like($tablespace_metadata, qr/^clone_result=not_started$/m, 'tablespace metadata records clone not started');
 like($tablespace_metadata, qr/^cleanup=not_started$/m, 'tablespace metadata records cleanup not started');
