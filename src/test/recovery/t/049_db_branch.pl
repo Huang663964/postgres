@@ -294,9 +294,21 @@ like(
 	qr/source database "dbbranch_no_conn_source" is not accepting connections/,
 	'db branch reports source allow-connection restriction');
 
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_missing_target FROM DATABASE dbbranch_missing_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects missing source database');
+like(
+	$stderr,
+	qr/source database "dbbranch_missing_source" does not exist/,
+	'db branch reports missing source database');
+
 my $control_reject_branch_count = $node->safe_psql(
 	'postgres',
-	q[SELECT count(*) FROM pg_database WHERE datname IN ('dbbranch_no_conn_target')]);
+	q[SELECT count(*) FROM pg_database WHERE datname IN ('dbbranch_no_conn_target', 'dbbranch_missing_target')]);
 is($control_reject_branch_count, '0', 'control validation failures create no branch database');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
