@@ -180,7 +180,8 @@ static bool WriteDBBranchFullPageImage(const char *clone_path, RelFileLocator rl
 									  ForkNumber forknum, BlockNumber blkno,
 									  const char *page, char *failure, Size failure_len);
 static bool CleanupDBBranchClonePath(const char *clone_path);
-static Oid InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
+static Oid AllocateDBBranchDatabaseOid(void);
+static void InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_name,
 								   const char *clone_path,
 								   int src_encoding, bool src_hasloginevt,
 								   TransactionId src_frozenxid, MultiXactId src_minmxid,
@@ -3286,7 +3287,24 @@ CleanupDBBranchClonePath(const char *clone_path)
 }
 
 static Oid
-InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
+AllocateDBBranchDatabaseOid(void)
+{
+	Relation	pg_database_rel;
+	Oid			dboid;
+
+	pg_database_rel = table_open(DatabaseRelationId, RowExclusiveLock);
+	do
+	{
+		dboid = GetNewOidWithIndex(pg_database_rel, DatabaseOidIndexId,
+								   Anum_pg_database_oid);
+	} while (check_db_file_conflict(dboid));
+	table_close(pg_database_rel, RowExclusiveLock);
+
+	return dboid;
+}
+
+static void
+InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_name,
 						const char *clone_path,
 						int src_encoding, bool src_hasloginevt,
 						TransactionId src_frozenxid, MultiXactId src_minmxid,
@@ -3298,19 +3316,13 @@ InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
 	HeapTuple	tuple;
 	Datum		new_record[Natts_pg_database] = {0};
 	bool		new_record_nulls[Natts_pg_database] = {0};
-	Oid			dboid;
+	Oid			dboid = branch_dboid;
 	char	   *dstpath;
 	createdb_failure_params fparms;
 
 	Assert(src_deftablespace == DEFAULTTABLESPACE_OID);
 
 	pg_database_rel = table_open(DatabaseRelationId, RowExclusiveLock);
-	do
-	{
-		dboid = GetNewOidWithIndex(pg_database_rel, DatabaseOidIndexId,
-								   Anum_pg_database_oid);
-	} while (check_db_file_conflict(dboid));
-
 	dstpath = GetDatabasePath(dboid, src_deftablespace);
 
 	new_record[Anum_pg_database_oid - 1] = ObjectIdGetDatum(dboid);
@@ -3379,7 +3391,6 @@ InstallDBBranchDatabase(Oid source_dboid, const char *branch_name,
 								PointerGetDatum(&fparms));
 
 	pfree(dstpath);
-	return dboid;
 }
 
 
@@ -3799,6 +3810,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				 errmsg("%s \"%s\"", cleanup_failure, clone_path)));
 	}
 
+	branch_dboid = AllocateDBBranchDatabaseOid();
+
 	redo_ptr = PinDBBranchWal(wal_pin_name);
 	PG_TRY();
 	{
@@ -3868,7 +3881,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 					 errmsg("%s", failure)));
 		}
 
-		branch_dboid = InstallDBBranchDatabase(source_dboid, branch_name, clone_path,
+		InstallDBBranchDatabase(source_dboid, branch_dboid, branch_name, clone_path,
 									   source_encoding, source_hasloginevt,
 									   source_frozenxid, source_minmxid,
 									   source_deftablespace, source_collate,
