@@ -137,6 +137,7 @@ typedef struct DBBranchWalScan
 	uint64		global_records;
 	uint64		source_fpi_blocks;
 	uint64		source_non_fpi_records;
+	uint64		replayed_records;
 } DBBranchWalScan;
 
 
@@ -184,9 +185,11 @@ static void ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 								 XLogRecPtr end_lsn, DBBranchWalScan *wal_scan);
 static bool ReplayDBBranchWal(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+								  DBBranchWalScan *wal_scan,
 								  char *failure, Size failure_len);
 static bool ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 										XLogReaderState *xlogreader,
+										DBBranchWalScan *wal_scan,
 										char *failure, Size failure_len);
 static bool CleanupDBBranchClonePath(const char *clone_path);
 static Oid AllocateDBBranchDatabaseOid(void);
@@ -2893,6 +2896,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 	uint64		wal_global_records = wal_scan ? wal_scan->global_records : 0;
 	uint64		wal_source_fpi_blocks = wal_scan ? wal_scan->source_fpi_blocks : 0;
 	uint64		wal_source_non_fpi_records = wal_scan ? wal_scan->source_non_fpi_records : 0;
+	uint64		wal_replayed_records = wal_scan ? wal_scan->replayed_records : 0;
 	bool		ok;
 
 	if (!XLogRecPtrIsInvalid(redo_ptr) &&
@@ -2924,6 +2928,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 "wal_global_records=" UINT64_FORMAT "\n"
 			 "wal_source_fpi_blocks=" UINT64_FORMAT "\n"
 			 "wal_source_non_fpi_records=" UINT64_FORMAT "\n"
+			 "wal_replayed_records=" UINT64_FORMAT "\n"
 			 "clone_elapsed_ms=%.3f\n"
 			 "replay_elapsed_ms=%.3f\n"
 			 "clone_path=%s\n"
@@ -2939,6 +2944,7 @@ WriteDBBranchMetadata(Oid source_dboid, const char *source_name,
 			 wal_range_bytes, wal_records_scanned, wal_source_records,
 			 wal_other_db_records, wal_mixed_records, wal_global_records,
 			 wal_source_fpi_blocks, wal_source_non_fpi_records,
+			 wal_replayed_records,
 			 clone_elapsed_ms, replay_elapsed_ms,
 			 clone_path ? clone_path : "", wal_pin, clone_result, cleanup,
 			 replay_method, status_history, status, failure) >= 0;
@@ -2974,6 +2980,7 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 	wal_scan->global_records = 0;
 	wal_scan->source_fpi_blocks = 0;
 	wal_scan->source_non_fpi_records = 0;
+	wal_scan->replayed_records = 0;
 
 	if (XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(end_lsn) ||
 		end_lsn <= start_lsn || start_lsn < XLOG_BLCKSZ)
@@ -3086,6 +3093,7 @@ ScanDBBranchWalRange(Oid source_dboid, XLogRecPtr start_lsn,
 static bool
 ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 						XLogReaderState *xlogreader,
+						DBBranchWalScan *wal_scan,
 						char *failure, Size failure_len)
 {
 	RmgrData	rmgr;
@@ -3097,6 +3105,8 @@ ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 	MemoryContext oldcontext;
 	bool		saved_InRecovery;
 	uint8		block_id;
+
+	Assert(wal_scan != NULL);
 
 	if (!XLogRecHasAnyBlockRefs(xlogreader))
 		return true;
@@ -3189,18 +3199,24 @@ ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 				saved_dbids[block_id];
 	}
 
+	if (replay_ok)
+		wal_scan->replayed_records++;
+
 	return replay_ok;
 }
 
 static bool
 ReplayDBBranchWal(Oid source_dboid, Oid branch_dboid,
 				  XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+				  DBBranchWalScan *wal_scan,
 				  char *failure, Size failure_len)
 {
 	ReadLocalXLogPageNoWaitPrivate *private_data;
 	XLogReaderState *xlogreader;
 	XLogRecPtr	first_valid_record;
 	char	   *errormsg;
+
+	Assert(wal_scan != NULL);
 
 	if (XLogRecPtrIsInvalid(start_lsn) || XLogRecPtrIsInvalid(end_lsn) ||
 		end_lsn <= start_lsn || start_lsn < XLOG_BLCKSZ)
@@ -3265,7 +3281,7 @@ ReplayDBBranchWal(Oid source_dboid, Oid branch_dboid,
 		}
 
 		if (!ReplayDBBranchWalRecord(source_dboid, branch_dboid, xlogreader,
-									 failure, failure_len))
+								 wal_scan, failure, failure_len))
 		{
 			RmgrCleanup();
 			XLogReaderFree(xlogreader);
@@ -3689,6 +3705,8 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 		Int64GetDatum((int64) wal_scan->source_fpi_blocks);
 	values[Anum_pg_dbbranch_wal_source_non_fpi_records - 1] =
 		Int64GetDatum((int64) wal_scan->source_non_fpi_records);
+	values[Anum_pg_dbbranch_wal_replayed_records - 1] =
+		Int64GetDatum((int64) wal_scan->replayed_records);
 	values[Anum_pg_dbbranch_clone_elapsed_ms - 1] =
 		Float8GetDatum(clone_elapsed_ms);
 	values[Anum_pg_dbbranch_replay_elapsed_ms - 1] =
@@ -3953,7 +3971,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		INSTR_TIME_SET_CURRENT(replay_start);
 		if (!ReplayDBBranchWal(source_dboid, branch_dboid,
-								  redo_ptr, branch_lsn, failure, sizeof(failure)))
+							  redo_ptr, branch_lsn, &wal_scan,
+							  failure, sizeof(failure)))
 		{
 			bool		cleanup_ok;
 

@@ -58,6 +58,7 @@ like($metadata, qr/^wal_mixed_records=[0-9]+$/m, 'metadata records mixed WAL cou
 like($metadata, qr/^wal_global_records=[0-9]+$/m, 'metadata records global WAL count');
 like($metadata, qr/^wal_source_fpi_blocks=[0-9]+$/m, 'metadata records source FPI block count');
 like($metadata, qr/^wal_source_non_fpi_records=[0-9]+$/m, 'metadata records source non-FPI record count');
+like($metadata, qr/^wal_replayed_records=[0-9]+$/m, 'metadata records replayed WAL count');
 like($metadata, qr/^clone_elapsed_ms=[0-9]+(\.[0-9]+)?$/m, 'metadata records clone elapsed time');
 like($metadata, qr/^replay_elapsed_ms=[0-9]+(\.[0-9]+)?$/m, 'metadata records replay elapsed time');
 my ($wal_records_scanned) = $metadata =~ /^wal_records_scanned=([0-9]+)$/m;
@@ -67,10 +68,13 @@ my ($wal_mixed_records) = $metadata =~ /^wal_mixed_records=([0-9]+)$/m;
 my ($wal_global_records) = $metadata =~ /^wal_global_records=([0-9]+)$/m;
 my ($wal_source_fpi_blocks) = $metadata =~ /^wal_source_fpi_blocks=([0-9]+)$/m;
 my ($wal_source_non_fpi_records) = $metadata =~ /^wal_source_non_fpi_records=([0-9]+)$/m;
+my ($wal_replayed_records) = $metadata =~ /^wal_replayed_records=([0-9]+)$/m;
 ok(
 	$wal_records_scanned >= $wal_source_records,
 	'metadata WAL scan count covers source WAL count');
 ok($wal_source_records > 0, 'metadata records source WAL after last checkpoint');
+ok($wal_replayed_records > 0, 'metadata records replayed source WAL');
+ok($wal_replayed_records <= $wal_source_records, 'metadata replayed WAL count is bounded by source WAL count');
 ok($wal_source_fpi_blocks > 0, 'metadata records restored source full-page images');
 ok($wal_mixed_records <= $wal_source_records, 'metadata mixed WAL count is bounded by source WAL count');
 ok(
@@ -152,6 +156,16 @@ if ($result == 0)
 		$catalog_wal_range,
 		't',
 		'pg_dbbranch records WAL range bytes');
+
+	my $catalog_wal_replay = $node->safe_psql(
+		'postgres',
+		q[SELECT wal_replayed_records > 0 AND wal_replayed_records <= wal_source_records FROM pg_dbbranch WHERE branch_db_oid = ]
+		  . $branch_oid
+		  . q[;]);
+	is(
+		$catalog_wal_replay,
+		't',
+		'pg_dbbranch records replayed WAL count');
 
 	my $catalog_wal_classification = $node->safe_psql(
 		'postgres',

@@ -35,6 +35,7 @@ CATALOG(pg_dbbranch,8785,DbBranchRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	int64		wal_global_records;
 	int64		wal_source_fpi_blocks;
 	int64		wal_source_non_fpi_records;
+	int64		wal_replayed_records;
 	float8		clone_elapsed_ms;
 	float8		replay_elapsed_ms;
 
