@@ -123,6 +123,16 @@ if ($result == 0)
 		'READY|rmgr_redo|' . $source_oid . '|' . $branch_oid . '|true|true|true|true|true|true|true|true|',
 		'pg_dbbranch records READY metadata with replay method, WAL scan counts, and timings');
 
+	my $catalog_clone_result = $node->safe_psql(
+		'postgres',
+		q[SELECT clone_result IN ('done', 'copy_fallback') FROM pg_dbbranch WHERE branch_db_oid = ]
+		  . $branch_oid
+		  . q[;]);
+	is(
+		$catalog_clone_result,
+		't',
+		'pg_dbbranch records storage clone result');
+
 	my $catalog_wal_classification = $node->safe_psql(
 		'postgres',
 		q[SELECT (wal_other_db_records >= 0) || '|' || (wal_mixed_records >= 0) || '|' || (wal_global_records >= 0) || '|' || (wal_source_fpi_blocks >= 0) || '|' || (wal_source_non_fpi_records >= 0) || '|' || (wal_mixed_records <= wal_source_records) || '|' || (wal_records_scanned >= wal_source_records + wal_other_db_records + wal_global_records) FROM pg_dbbranch WHERE branch_db_oid = ]

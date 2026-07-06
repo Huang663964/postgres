@@ -38,6 +38,7 @@ CATALOG(pg_dbbranch,8785,DbBranchRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	float8		replay_elapsed_ms;
 
 #ifdef CATALOG_VARLEN
+	text		clone_result BKI_FORCE_NOT_NULL;
 	text		replay_method BKI_FORCE_NOT_NULL;
 	text		status BKI_FORCE_NOT_NULL;
 	text		failure BKI_FORCE_NOT_NULL;

@@ -211,6 +211,7 @@ static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 								  const DBBranchWalScan *wal_scan,
 								  double clone_elapsed_ms, double replay_elapsed_ms,
+								  const char *clone_result,
 								  const char *replay_method,
 								  const char *status, const char *failure);
 static bool ScanDBBranchSourceRelations(Oid source_dboid,
@@ -3649,6 +3650,7 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 					  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 					  const DBBranchWalScan *wal_scan,
 					  double clone_elapsed_ms, double replay_elapsed_ms,
+					  const char *clone_result,
 					  const char *replay_method,
 					  const char *status, const char *failure)
 {
@@ -3681,6 +3683,7 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 		Float8GetDatum(clone_elapsed_ms);
 	values[Anum_pg_dbbranch_replay_elapsed_ms - 1] =
 		Float8GetDatum(replay_elapsed_ms);
+	values[Anum_pg_dbbranch_clone_result - 1] = CStringGetTextDatum(clone_result);
 	values[Anum_pg_dbbranch_replay_method - 1] = CStringGetTextDatum(replay_method);
 	values[Anum_pg_dbbranch_status - 1] = CStringGetTextDatum(status);
 	values[Anum_pg_dbbranch_failure - 1] = CStringGetTextDatum(failure);
@@ -3976,7 +3979,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
 						  &wal_scan,
 						  clone_elapsed_ms, replay_elapsed_ms,
-						  "rmgr_redo", "READY", "");
+						  clone_result, "rmgr_redo", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 		ReleaseDBBranchWalPin();
