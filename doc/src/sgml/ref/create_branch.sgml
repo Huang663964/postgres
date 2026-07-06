@@ -36,9 +36,9 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   </para>
 
   <para>
-   The source database is locked while active backends are drained, WAL is
-   pinned, and the source storage is cloned.  WAL replay then runs against the
-   branch storage.
+   The source database is locked while PostgreSQL verifies that no other
+   backend is using it, pins WAL, and clones the source storage.  WAL replay
+   then runs against the branch storage after that source lock is released.
   </para>
  </refsect1>
 
