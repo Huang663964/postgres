@@ -360,6 +360,15 @@ $node->safe_psql(
 	q[
 CREATE TABLE setting_rows (id int PRIMARY KEY);
 INSERT INTO setting_rows VALUES (1);
+CREATE TABLE branch_login_events (who text NOT NULL);
+CREATE FUNCTION branch_login_proc() RETURNS event_trigger AS $$
+BEGIN
+  INSERT INTO branch_login_events VALUES (SESSION_USER);
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+CREATE EVENT TRIGGER branch_login_trigger
+	ON login EXECUTE PROCEDURE branch_login_proc();
+ALTER EVENT TRIGGER branch_login_trigger ENABLE ALWAYS;
 ]);
 
 $stderr = '';
@@ -369,6 +378,21 @@ $result = $node->psql(
 	stderr => \$stderr);
 
 is($result, 0, 'db branch copies database-level settings');
+
+my $setting_login_flag = $node->safe_psql(
+	'postgres',
+	q[
+SELECT s.dathasloginevt::text || '|' || t.dathasloginevt::text
+FROM pg_database s, pg_database t
+WHERE s.datname = 'dbbranch_setting_source'
+  AND t.datname = 'dbbranch_setting_target';
+]);
+is($setting_login_flag, 'true|true', 'branch copies source login event flag');
+
+my $setting_login_events = $node->safe_psql(
+	'dbbranch_setting_target',
+	q[SELECT count(*) FROM branch_login_events;]);
+is($setting_login_events, '1', 'branch fires copied login event trigger');
 
 my $setting_work_mem = $node->safe_psql(
 	'dbbranch_setting_target',
