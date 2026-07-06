@@ -84,6 +84,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/timestamp.h"
 
 /*
  * Create database strategy.
@@ -211,6 +212,7 @@ static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 								  const DBBranchWalScan *wal_scan,
 								  double clone_elapsed_ms, double replay_elapsed_ms,
+								  TimestampTz created_at, TimestampTz ready_at,
 								  const char *clone_result,
 								  const char *replay_method,
 								  const char *status, const char *failure);
@@ -3650,6 +3652,7 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 					  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 					  const DBBranchWalScan *wal_scan,
 					  double clone_elapsed_ms, double replay_elapsed_ms,
+					  TimestampTz created_at, TimestampTz ready_at,
 					  const char *clone_result,
 					  const char *replay_method,
 					  const char *status, const char *failure)
@@ -3683,6 +3686,10 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 		Float8GetDatum(clone_elapsed_ms);
 	values[Anum_pg_dbbranch_replay_elapsed_ms - 1] =
 		Float8GetDatum(replay_elapsed_ms);
+	values[Anum_pg_dbbranch_created_at - 1] =
+		TimestampTzGetDatum(created_at);
+	values[Anum_pg_dbbranch_ready_at - 1] =
+		TimestampTzGetDatum(ready_at);
 	values[Anum_pg_dbbranch_clone_result - 1] = CStringGetTextDatum(clone_result);
 	values[Anum_pg_dbbranch_replay_method - 1] = CStringGetTextDatum(replay_method);
 	values[Anum_pg_dbbranch_status - 1] = CStringGetTextDatum(status);
@@ -3766,6 +3773,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	instr_time	elapsed;
 	double		clone_elapsed_ms = 0.0;
 	double		replay_elapsed_ms = 0.0;
+	TimestampTz created_at = GetCurrentTimestamp();
+	TimestampTz ready_at;
 
 
 	if (!get_db_info(source_name, ShareLock,
@@ -3976,10 +3985,12 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		foreach(cell, tablespace_oids)
 			LogDBBranchCreateFileCopy(source_dboid, branch_dboid, lfirst_oid(cell));
+		ready_at = GetCurrentTimestamp();
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
 						  &wal_scan,
 						  clone_elapsed_ms, replay_elapsed_ms,
-						  clone_result, "rmgr_redo", "READY", "");
+						  created_at, ready_at, clone_result,
+						  "rmgr_redo", "READY", "");
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE |
 						  CHECKPOINT_WAIT);
 		ReleaseDBBranchWalPin();

@@ -133,6 +133,16 @@ if ($result == 0)
 		't',
 		'pg_dbbranch records storage clone result');
 
+	my $catalog_ready_times = $node->safe_psql(
+		'postgres',
+		q[SELECT created_at IS NOT NULL AND ready_at IS NOT NULL AND created_at <= ready_at FROM pg_dbbranch WHERE branch_db_oid = ]
+		  . $branch_oid
+		  . q[;]);
+	is(
+		$catalog_ready_times,
+		't',
+		'pg_dbbranch records creation and ready timestamps');
+
 	my $catalog_wal_classification = $node->safe_psql(
 		'postgres',
 		q[SELECT (wal_other_db_records >= 0) || '|' || (wal_mixed_records >= 0) || '|' || (wal_global_records >= 0) || '|' || (wal_source_fpi_blocks >= 0) || '|' || (wal_source_non_fpi_records >= 0) || '|' || (wal_mixed_records <= wal_source_records) || '|' || (wal_records_scanned >= wal_source_records + wal_other_db_records + wal_global_records) FROM pg_dbbranch WHERE branch_db_oid = ]
