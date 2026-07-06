@@ -3292,6 +3292,12 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("source database \"%s\" does not exist", source_name)));
 
+	if (database_is_invalid_oid(source_dboid))
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("cannot use invalid database \"%s\" as source", source_name),
+				errhint("Use DROP DATABASE to drop invalid databases."));
+
 	if (!have_createdb_privilege())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),

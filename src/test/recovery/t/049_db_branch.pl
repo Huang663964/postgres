@@ -395,4 +395,33 @@ my ($prepared_clone_path) = $prepared_metadata =~ /^clone_path=(.*)$/m;
 ok($prepared_clone_path eq '' || !-e $node->data_dir . '/' . $prepared_clone_path,
 	'prepared rejection does not create clone staging path');
 
+$node->safe_psql(
+	'postgres',
+	q[
+CREATE DATABASE dbbranch_invalid_source;
+UPDATE pg_database SET datconnlimit = -2 WHERE datname = 'dbbranch_invalid_source';
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_invalid_target FROM DATABASE dbbranch_invalid_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects invalid source database');
+like(
+	$stderr,
+	qr/cannot use invalid database "dbbranch_invalid_source" as source/,
+	'db branch reports invalid source database');
+
+my $invalid_branch_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_invalid_target';]);
+is($invalid_branch_count, '0', 'invalid source rejection creates no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, 5, 'invalid source rejection writes no metadata file');
+
+$node->safe_psql('postgres', 'DROP DATABASE dbbranch_invalid_source;');
+
 done_testing();
