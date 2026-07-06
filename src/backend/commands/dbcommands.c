@@ -3668,6 +3668,8 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 	values[Anum_pg_dbbranch_branch_db_oid - 1] = ObjectIdGetDatum(branch_dboid);
 	values[Anum_pg_dbbranch_redo_ptr - 1] = LSNGetDatum(redo_ptr);
 	values[Anum_pg_dbbranch_branch_lsn - 1] = LSNGetDatum(branch_lsn);
+	values[Anum_pg_dbbranch_wal_range_bytes - 1] =
+		Int64GetDatum((int64) (branch_lsn - redo_ptr));
 	values[Anum_pg_dbbranch_wal_records_scanned - 1] =
 		Int64GetDatum((int64) wal_scan->records);
 	values[Anum_pg_dbbranch_wal_source_records - 1] =

@@ -27,6 +27,7 @@ CATALOG(pg_dbbranch,8785,DbBranchRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 	Oid			branch_db_oid BKI_LOOKUP(pg_database);
 	XLogRecPtr	redo_ptr;
 	XLogRecPtr	branch_lsn;
+	int64		wal_range_bytes;
 	int64		wal_records_scanned;
 	int64		wal_source_records;
 	int64		wal_other_db_records;
