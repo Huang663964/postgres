@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 10
+	skip 'Injection points not supported by this build', 11
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -288,6 +288,14 @@ CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 \echo finish_drain_branch
 ));
 	$node->wait_for_event('client backend', 'db-branch-before-drain');
+	my $freeze_timed_out = 0;
+	$node->psql(
+		'dbbranch_drain_source',
+		q[SELECT 1],
+		timeout => 1,
+		timed_out => \$freeze_timed_out);
+	ok($freeze_timed_out, 'db branch freeze gate blocks new source connections');
+
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-drain');]);
 	usleep(200_000);
 	$drain_writer->query_safe('COMMIT;');
