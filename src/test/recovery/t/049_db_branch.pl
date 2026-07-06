@@ -1231,6 +1231,14 @@ my $cmdtag_rows = $node->safe_psql(
 	'dbbranch_cmdtag_target',
 	q[SELECT count(*) FROM cmdtag_rows;]);
 is($cmdtag_rows, '1', 'command-tag branch copies source data');
+
+$result = $node->psql(
+	'postgres',
+	q[SET debug_print_parse = on;
+CREATE BRANCH dbbranch_debug_target FROM DATABASE dbbranch_cmdtag_source;]);
+is($result, 0, 'CREATE BRANCH supports parse tree debug output');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_debug_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_source;]);
 

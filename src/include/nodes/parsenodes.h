@@ -3876,7 +3876,7 @@ typedef struct CreatedbStmt
  */
 typedef struct CreateDbBranchStmt
 {
-	pg_node_attr(nodetag_only, nodetag_number(8000))
+	pg_node_attr(nodetag_number(8000))
 
 	NodeTag		type;
 	char	   *branchname;		/* name of database branch to create */
