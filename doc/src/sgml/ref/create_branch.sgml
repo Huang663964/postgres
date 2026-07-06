@@ -1,0 +1,109 @@
+<!--
+doc/src/sgml/ref/create_branch.sgml
+PostgreSQL documentation
+-->
+
+<refentry id="sql-createbranch">
+ <indexterm zone="sql-createbranch">
+  <primary>CREATE BRANCH</primary>
+ </indexterm>
+
+ <refmeta>
+  <refentrytitle>CREATE BRANCH</refentrytitle>
+  <manvolnum>7</manvolnum>
+  <refmiscinfo>SQL - Language Statements</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>CREATE BRANCH</refname>
+  <refpurpose>create a database branch from an existing database</refpurpose>
+ </refnamediv>
+
+ <refsynopsisdiv>
+<synopsis>
+CREATE BRANCH <replaceable class="parameter">name</replaceable>
+    FROM DATABASE <replaceable class="parameter">source_database</replaceable>
+</synopsis>
+ </refsynopsisdiv>
+
+ <refsect1>
+  <title>Description</title>
+
+  <para>
+   <command>CREATE BRANCH</command> creates a connectable database by cloning
+   an existing source database and replaying source database WAL records needed
+   to make the branch consistent.
+  </para>
+
+  <para>
+   The source database is locked while active backends are drained, WAL is
+   pinned, and the source storage is cloned.  WAL replay then runs against the
+   branch storage.
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Parameters</title>
+
+   <variablelist>
+    <varlistentry>
+     <term><replaceable class="parameter">name</replaceable></term>
+     <listitem>
+      <para>
+       The name of the branch database to create.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><replaceable class="parameter">source_database</replaceable></term>
+     <listitem>
+      <para>
+       The database whose storage and WAL history are used as the branch
+       source.
+      </para>
+     </listitem>
+    </varlistentry>
+   </variablelist>
+ </refsect1>
+
+ <refsect1>
+  <title>Notes</title>
+
+  <para>
+   <command>CREATE BRANCH</command> cannot be executed inside a transaction
+   block.
+  </para>
+
+  <para>
+   To create a branch, you must be a superuser or have the
+   <literal>CREATEDB</literal> privilege.  The user must own the source
+   database unless the source is marked as a template database.
+  </para>
+
+  <para>
+   <command>CREATE BRANCH</command> requires <xref linkend="guc-wal-level"/>
+   to be <literal>replica</literal> or higher.
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Examples</title>
+
+  <para>
+   Create a branch named <literal>test_branch</literal> from
+   <literal>production</literal>:
+<programlisting>
+CREATE BRANCH test_branch FROM DATABASE production;
+</programlisting>
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Compatibility</title>
+
+  <para>
+   There is no <command>CREATE BRANCH</command> statement in the SQL standard.
+  </para>
+ </refsect1>
+</refentry>

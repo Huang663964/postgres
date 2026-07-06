@@ -89,6 +89,7 @@
    &createAccessMethod;
    &createAggregate;
    &createCast;
+   &createBranch;
    &createCollation;
    &createConversion;
    &createDatabase;
