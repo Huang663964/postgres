@@ -1181,6 +1181,69 @@ is($cast_count, '1', 'branch succeeds after source create cast drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_operator_drain_source;]);
+$node->safe_psql(
+	'dbbranch_operator_drain_source',
+	q[
+CREATE FUNCTION dbbranch_operator_eq(boolean, boolean) RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$ SELECT NULL::boolean; $$;
+CREATE OPERATOR === (
+	LEFTARG = boolean,
+	RIGHTARG = boolean,
+	PROCEDURE = dbbranch_operator_eq,
+	RESTRICT = contsel
+);
+CHECKPOINT;
+]);
+
+my $operator_locker = $node->background_psql('dbbranch_operator_drain_source', on_error_stop => 1);
+$operator_locker->query_safe(q[BEGIN; LOCK TABLE pg_operator IN ACCESS EXCLUSIVE MODE;]);
+my $operator_writer = $node->background_psql('dbbranch_operator_drain_source', on_error_stop => 1);
+$operator_writer->query_until(
+	qr/start_operator_drain_operator/,
+	q(\echo start_operator_drain_operator
+ALTER OPERATOR === (boolean, boolean) SET (RESTRICT = NONE);
+\echo finish_operator_drain_operator
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_operator_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER OPERATOR ===%';
+]), 'active source alter operator waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_operator_drain_target FROM DATABASE dbbranch_operator_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter operator');
+like($stderr, qr/source database "dbbranch_operator_drain_source" has active write transactions/,
+	'active source alter operator holds db branch writer gate');
+
+$operator_locker->query_safe(q[COMMIT;]);
+$operator_locker->quit;
+$operator_writer->query_until(qr/finish_operator_drain_operator/, '');
+$operator_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_operator_drain_target FROM DATABASE dbbranch_operator_drain_source]);
+my $operator_restrict_removed = $node->safe_psql(
+	'dbbranch_operator_drain_target',
+	q[
+SELECT oprrest = 0::oid
+FROM pg_operator
+WHERE oprname = '==='
+  AND oprleft = 'boolean'::regtype
+  AND oprright = 'boolean'::regtype;
+]);
+is($operator_restrict_removed, 't', 'branch succeeds after source alter operator drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_operator_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_operator_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_opfamily_drain_source;]);
 $node->safe_psql('dbbranch_opfamily_drain_source', q[CHECKPOINT;]);
 

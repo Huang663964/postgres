@@ -1863,6 +1863,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterOperatorStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterOperator((AlterOperatorStmt *) parsetree);
 				break;
 
