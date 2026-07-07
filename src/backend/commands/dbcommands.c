@@ -3172,6 +3172,7 @@ ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 		/* ponytail: TopMemoryContext avoids redo-local context churn; tighten after rmgr matrix. */
 		InRecovery = true;
 		DBBranchReplayInProgress = true;
+		INJECTION_POINT("db-branch-during-replay", NULL);
 		rmgr.rm_redo(xlogreader);
 		DBBranchReplayInProgress = false;
 		InRecovery = saved_InRecovery;

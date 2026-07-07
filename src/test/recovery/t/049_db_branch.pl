@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 67
+	skip 'Injection points not supported by this build', 82
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -658,6 +658,88 @@ SELECT count(*) FROM replay_fail_rows;
 
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_fail_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_redo_fail_source;]);
+	$node->safe_psql(
+		'dbbranch_replay_redo_fail_source',
+		q[
+CREATE TABLE replay_redo_fail_rows (id int PRIMARY KEY);
+INSERT INTO replay_redo_fail_rows VALUES (1);
+CHECKPOINT;
+UPDATE replay_redo_fail_rows SET id = 1 WHERE id = 1;
+]);
+
+	my %replay_redo_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @replay_redo_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-during-replay', 'error');]);
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_replay_redo_fail_target FROM DATABASE dbbranch_replay_redo_fail_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports injected rmgr replay failure');
+	like($stderr, qr/db-branch-during-replay/,
+		'db branch surfaces rmgr replay injection failure');
+
+	my $replay_redo_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_replay_redo_fail_target';]);
+	is($replay_redo_branch_count, '0', 'rmgr replay failure creates no branch database');
+
+	my $replay_redo_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($replay_redo_slot_count, '0', 'rmgr replay failure releases DB Branch WAL pin');
+
+	my @replay_redo_clone_left = grep { !$replay_redo_base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @replay_redo_clone_left, 0, 'rmgr replay failure removes cloned branch storage path');
+
+	my $replay_redo_source_rows = $node->safe_psql(
+		'dbbranch_replay_redo_fail_source',
+		q[
+INSERT INTO replay_redo_fail_rows VALUES (2);
+SELECT count(*) FROM replay_redo_fail_rows;
+]);
+	is($replay_redo_source_rows, '2', 'source accepts writes after rmgr replay failure');
+
+	my @replay_redo_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @replay_redo_metadata_files, scalar(@replay_redo_metadata_before) + 1,
+		'rmgr replay failure writes separate metadata file');
+
+	my $replay_redo_metadata = '';
+	for my $path (@replay_redo_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_replay_redo_fail_target$/m)
+		{
+			$replay_redo_metadata = $contents;
+			last;
+		}
+	}
+
+	like($replay_redo_metadata, qr/^wal_pin=released$/m,
+		'rmgr replay failure metadata records released WAL pin');
+	like($replay_redo_metadata, qr/^clone_result=(done|copy_fallback)$/m,
+		'rmgr replay failure metadata records clone result');
+	like($replay_redo_metadata, qr/^cleanup=done$/m,
+		'rmgr replay failure metadata records clone cleanup');
+	like($replay_redo_metadata, qr/^replay_method=rmgr_redo$/m,
+		'rmgr replay failure metadata records replay method');
+	like($replay_redo_metadata, qr/^wal_replayed_records=0$/m,
+		'rmgr replay failure metadata records no replayed records');
+	like($replay_redo_metadata, qr/^status_history=CREATING,COPYING,REPLAYING,FAILED$/m,
+		'rmgr replay failure metadata records failed transition');
+	like($replay_redo_metadata, qr/^status=FAILED$/m,
+		'rmgr replay failure metadata final state is FAILED');
+	like($replay_redo_metadata, qr/^failure=.+db-branch-during-replay.*$/m,
+		'rmgr replay failure metadata records failure reason');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-during-replay');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_redo_fail_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_install_fail_source;]);
 	$node->safe_psql(
