@@ -3820,6 +3820,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	TimestampTz created_at = GetCurrentTimestamp();
 	TimestampTz ready_at;
 	volatile bool source_lock_held = false;
+	volatile bool replay_finished = false;
+	volatile bool failure_metadata_written = false;
 
 
 	if (wal_level < WAL_LEVEL_REPLICA)
@@ -4050,6 +4052,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 					INSTR_TIME_SUBTRACT(elapsed, source_block_start);
 					source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 					ReleaseDBBranchWalPin();
+					failure_metadata_written = true;
 					WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 								  redo_ptr, branch_lsn, clone_path,
 								  "released",
@@ -4108,6 +4111,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			}
 
 			ReleaseDBBranchWalPin();
+			failure_metadata_written = true;
 			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
@@ -4124,6 +4128,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, replay_start);
 		replay_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+		replay_finished = true;
 
 		INJECTION_POINT("db-branch-before-install", NULL);
 
@@ -4158,6 +4163,16 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	}
 	PG_CATCH();
 	{
+		ErrorData  *edata = NULL;
+		bool		cleanup_ok = true;
+
+		if (replay_finished && !failure_metadata_written)
+		{
+			MemoryContextSwitchTo(TopMemoryContext);
+			edata = CopyErrorData();
+			snprintf(failure, sizeof(failure), "%s",
+					 edata->message ? edata->message : "DB Branch install failed");
+		}
 		if (source_lock_held)
 		{
 			UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
@@ -4171,11 +4186,24 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			{
 				char	   *path = GetDatabasePath(branch_dboid, lfirst_oid(cell));
 
-				(void) CleanupDBBranchClonePath(path);
+				if (!CleanupDBBranchClonePath(path))
+					cleanup_ok = false;
 				pfree(path);
 			}
 		}
 		ReleaseDBBranchWalPin();
+		if (edata != NULL)
+		{
+			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  redo_ptr, branch_lsn, clone_path,
+						  "released",
+						  clone_result, cleanup_ok ? "done" : "failed",
+						  "rmgr_redo",
+						  &wal_scan,
+						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
+						  "CREATING,COPYING,REPLAYING,FAILED", "FAILED", failure);
+			FreeErrorData(edata);
+		}
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

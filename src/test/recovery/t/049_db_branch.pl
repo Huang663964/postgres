@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 13
+	skip 'Injection points not supported by this build', 18
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -416,6 +416,7 @@ INSERT INTO install_fail_rows VALUES (2);
 ]);
 
 	my %base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @install_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_attach('db-branch-before-install', 'wait');]);
 
@@ -454,6 +455,32 @@ CREATE BRANCH dbbranch_install_fail_target FROM DATABASE dbbranch_install_fail_s
 		'postgres',
 		q[SELECT count(*) FROM pg_dbbranch WHERE branch_db_oid NOT IN (SELECT oid FROM pg_database);]);
 	is($install_catalog_rows, '0', 'install failure leaves no orphan pg_dbbranch rows');
+
+	my @install_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @install_metadata_files, scalar(@install_metadata_before) + 1,
+		'install failure writes separate metadata file');
+
+	my $install_metadata = '';
+	for my $path (@install_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_install_fail_target$/m)
+		{
+			$install_metadata = $contents;
+			last;
+		}
+	}
+
+	like($install_metadata, qr/^wal_pin=released$/m,
+		'install failure metadata records released WAL pin');
+	like($install_metadata, qr/^cleanup=done$/m,
+		'install failure metadata records clone cleanup');
+	like($install_metadata, qr/^status=FAILED$/m,
+		'install failure metadata final state is FAILED');
+	like($install_metadata, qr/^failure=.+$/m,
+		'install failure metadata records failure reason');
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_install_fail_source;]);
 }
