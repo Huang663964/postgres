@@ -1726,6 +1726,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateTrigStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateTrigger((CreateTrigStmt *) parsetree,
 										queryString, InvalidOid, InvalidOid,
 										InvalidOid, InvalidOid, InvalidOid,

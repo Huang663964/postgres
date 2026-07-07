@@ -280,6 +280,58 @@ my $slot_count = $node->safe_psql(
 	q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%']);
 is($slot_count, '0', 'db branch releases WAL pin slot');
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_trigger_drain_source;]);
+$node->safe_psql(
+	'dbbranch_trigger_drain_source',
+	q[
+CREATE TABLE trigger_rows (id int PRIMARY KEY, note text);
+CREATE FUNCTION trigger_touch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	NEW.note := coalesce(NEW.note, 'seen');
+	RETURN NEW;
+END
+$$;
+INSERT INTO trigger_rows VALUES (1, 'old');
+CHECKPOINT;
+]);
+
+my $trigger_locker = $node->background_psql('dbbranch_trigger_drain_source', on_error_stop => 1);
+$trigger_locker->query_safe(q[BEGIN; LOCK TABLE trigger_rows IN ROW EXCLUSIVE MODE;]);
+my $trigger_writer = $node->background_psql('dbbranch_trigger_drain_source', on_error_stop => 1);
+$trigger_writer->query_until(
+	qr/start_trigger_drain_trigger/,
+	q(\echo start_trigger_drain_trigger
+CREATE TRIGGER trigger_rows_bi BEFORE INSERT ON trigger_rows FOR EACH ROW EXECUTE FUNCTION trigger_touch();
+\echo finish_trigger_drain_trigger
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_trigger_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE TRIGGER trigger_rows_bi%';
+]), 'active source create trigger waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_trigger_drain_target FROM DATABASE dbbranch_trigger_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create trigger');
+like($stderr, qr/source database "dbbranch_trigger_drain_source" has active write transactions/,
+	'active source create trigger holds db branch writer gate');
+
+$trigger_locker->query_safe(q[COMMIT;]);
+$trigger_locker->quit;
+$trigger_writer->query_until(qr/finish_trigger_drain_trigger/, '');
+$trigger_writer->quit;
+
+my $trigger_exists = $node->safe_psql(
+	'dbbranch_trigger_drain_source',
+	q[SELECT count(*) FROM pg_trigger WHERE tgname = 'trigger_rows_bi';]);
+is($trigger_exists, '1', 'source create trigger finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_trigger_drain_source;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136
