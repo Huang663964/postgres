@@ -4750,6 +4750,62 @@ $node->safe_psql(
 	q[DROP SUBSCRIPTION dbbranch_alter_subscription_sub;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_subscription_drain_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_subscription_drain_source;');
+$node->safe_psql(
+	'dbbranch_drop_subscription_drain_source',
+	q[
+CREATE SUBSCRIPTION dbbranch_drop_subscription_sub
+CONNECTION 'dbname=dbbranch_subscription_missing'
+PUBLICATION dbbranch_subscription_pub
+WITH (slot_name = NONE, connect = false);
+CHECKPOINT;
+]);
+
+my $drop_subscription_locker =
+  $node->background_psql('dbbranch_drop_subscription_drain_source', on_error_stop => 1);
+my $drop_subscription_writer =
+  $node->background_psql('dbbranch_drop_subscription_drain_source', on_error_stop => 1);
+$drop_subscription_locker->query_safe(q[BEGIN; LOCK TABLE pg_subscription IN ACCESS EXCLUSIVE MODE;]);
+$drop_subscription_writer->query_until(
+	qr/start_drop_subscription_drain_subscription/,
+	q(\echo start_drop_subscription_drain_subscription
+DROP SUBSCRIPTION dbbranch_drop_subscription_sub;
+\echo finish_drop_subscription_drain_subscription
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_drop_subscription_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'DROP SUBSCRIPTION dbbranch_drop_subscription_sub%';
+]), 'active source drop subscription waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_subscription_drain_target FROM DATABASE dbbranch_drop_subscription_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source drop subscription');
+like($stderr, qr/source database "dbbranch_drop_subscription_drain_source" has active write transactions/,
+	'active source drop subscription holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source drop subscription writes separate metadata file');
+
+$drop_subscription_locker->query_safe(q[COMMIT;]);
+$drop_subscription_locker->quit;
+$drop_subscription_writer->query_until(qr/finish_drop_subscription_drain_subscription/, '');
+$drop_subscription_writer->quit;
+
+my $drop_subscription_exists = $node->safe_psql(
+	'dbbranch_drop_subscription_drain_source',
+	q[SELECT count(*) FROM pg_subscription WHERE subname = 'dbbranch_drop_subscription_sub';]);
+is($drop_subscription_exists, '0', 'source drop subscription completes after drain test');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_subscription_drain_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_subscription_source;');
 $node->safe_psql(
 	'dbbranch_subscription_source',

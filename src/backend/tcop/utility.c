@@ -1953,6 +1953,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_DropSubscriptionStmt:
+				LockDBBranchUtilityWriteGate();
 				DropSubscription((DropSubscriptionStmt *) parsetree, isTopLevel);
 				/* no commands stashed for DROP */
 				commandCollected = true;
