@@ -1775,6 +1775,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateConversionStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateConversionCommand((CreateConversionStmt *) parsetree);
 				break;
 

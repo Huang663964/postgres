@@ -1019,6 +1019,51 @@ is($matview_row_count, '2', 'branch succeeds after source refresh materialized v
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_refresh_matview_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_refresh_matview_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_conversion_drain_source;]);
+$node->safe_psql('dbbranch_conversion_drain_source', q[CHECKPOINT;]);
+
+my $conversion_locker = $node->background_psql('dbbranch_conversion_drain_source', on_error_stop => 1);
+$conversion_locker->query_safe(q[BEGIN; LOCK TABLE pg_conversion IN ACCESS EXCLUSIVE MODE;]);
+my $conversion_writer = $node->background_psql('dbbranch_conversion_drain_source', on_error_stop => 1);
+$conversion_writer->query_until(
+	qr/start_conversion_drain_conversion/,
+	q(\echo start_conversion_drain_conversion
+CREATE CONVERSION dbbranch_conv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;
+\echo finish_conversion_drain_conversion
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_conversion_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE CONVERSION dbbranch_conv%';
+]), 'active source create conversion waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_conversion_drain_target FROM DATABASE dbbranch_conversion_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create conversion');
+like($stderr, qr/source database "dbbranch_conversion_drain_source" has active write transactions/,
+	'active source create conversion holds db branch writer gate');
+
+$conversion_locker->query_safe(q[COMMIT;]);
+$conversion_locker->quit;
+$conversion_writer->query_until(qr/finish_conversion_drain_conversion/, '');
+$conversion_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_conversion_drain_target FROM DATABASE dbbranch_conversion_drain_source]);
+my $conversion_count = $node->safe_psql(
+	'dbbranch_conversion_drain_target',
+	q[SELECT count(*) FROM pg_conversion WHERE conname = 'dbbranch_conv';]);
+is($conversion_count, '1', 'branch succeeds after source create conversion drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_conversion_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_conversion_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
 $node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
 
