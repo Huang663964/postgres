@@ -1370,6 +1370,67 @@ is($extension_schema, 'ext_schema', 'branch succeeds after source alter extensio
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_extension_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_extension_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_extension_contents_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_extension_contents_drain_source',
+	q[
+CREATE EXTENSION amcheck;
+CREATE TABLE ext_member (id int);
+CHECKPOINT;
+]);
+
+my $alter_extension_contents_locker = $node->background_psql('dbbranch_alter_extension_contents_drain_source', on_error_stop => 1);
+$alter_extension_contents_locker->query_safe(q[BEGIN; LOCK TABLE pg_extension IN ACCESS EXCLUSIVE MODE;]);
+my $alter_extension_contents_writer = $node->background_psql('dbbranch_alter_extension_contents_drain_source', on_error_stop => 1);
+$alter_extension_contents_writer->query_until(
+	qr/start_alter_extension_contents_drain_extension/,
+	q(\echo start_alter_extension_contents_drain_extension
+ALTER EXTENSION amcheck ADD TABLE ext_member;
+\echo finish_alter_extension_contents_drain_extension
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_extension_contents_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER EXTENSION amcheck ADD TABLE ext_member%';
+]), 'active source alter extension contents waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_extension_contents_drain_target FROM DATABASE dbbranch_alter_extension_contents_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter extension contents');
+like($stderr, qr/source database "dbbranch_alter_extension_contents_drain_source" has active write transactions/,
+	'active source alter extension contents holds db branch writer gate');
+
+$alter_extension_contents_locker->query_safe(q[COMMIT;]);
+$alter_extension_contents_locker->quit;
+$alter_extension_contents_writer->query_until(qr/finish_alter_extension_contents_drain_extension/, '');
+$alter_extension_contents_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_extension_contents_drain_target FROM DATABASE dbbranch_alter_extension_contents_drain_source]);
+my $extension_member_count = $node->safe_psql(
+	'dbbranch_alter_extension_contents_drain_target',
+	q[
+SELECT count(*)
+FROM pg_depend d
+JOIN pg_extension e ON e.oid = d.refobjid
+JOIN pg_class c ON c.oid = d.objid
+WHERE d.refclassid = 'pg_extension'::regclass
+  AND d.classid = 'pg_class'::regclass
+  AND d.deptype = 'e'
+  AND e.extname = 'amcheck'
+  AND c.relname = 'ext_member';
+]);
+is($extension_member_count, '1', 'branch succeeds after source alter extension contents drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_extension_contents_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_extension_contents_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_depends_drain_source;]);
 $node->safe_psql(
 	'dbbranch_depends_drain_source',

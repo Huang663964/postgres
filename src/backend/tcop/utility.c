@@ -1619,6 +1619,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterExtensionContentsStmt:
+				LockDBBranchUtilityWriteGate();
 				address = ExecAlterExtensionContentsStmt((AlterExtensionContentsStmt *) parsetree,
 														 &secondaryObject);
 				break;
