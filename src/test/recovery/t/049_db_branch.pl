@@ -4946,6 +4946,45 @@ ALTER DATABASE dbbranch_database_rename_drain_source_renamed
 DROP DATABASE dbbranch_database_rename_drain_source;
 ]);
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_database_owner_drain_role;');
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_database_owner_drain_source;]);
+$node->safe_psql('dbbranch_database_owner_drain_source', q[CHECKPOINT;]);
+
+my $database_owner_writer =
+  $node->background_psql('postgres', on_error_stop => 1);
+$database_owner_writer->query_safe(
+	q[BEGIN; ALTER DATABASE dbbranch_database_owner_drain_source OWNER TO dbbranch_database_owner_drain_role;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_database_owner_drain_target FROM DATABASE dbbranch_database_owner_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source database owner change');
+like($stderr, qr/source database "dbbranch_database_owner_drain_source" has active write transactions/,
+	'active source database owner change holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source database owner change writes separate metadata file');
+
+$database_owner_writer->query_safe(q[COMMIT;]);
+$database_owner_writer->quit;
+
+my $database_owner_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'dbbranch_database_owner_drain_source';]);
+is($database_owner_applied, 'dbbranch_database_owner_drain_role',
+	'source database owner change finishes after db branch rejects');
+
+$node->safe_psql(
+	'postgres',
+	q[
+DROP DATABASE dbbranch_database_owner_drain_source;
+DROP ROLE dbbranch_database_owner_drain_role;
+]);
+
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_database_grant_drain_role LOGIN;');
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_database_grant_drain_source;]);
 $node->safe_psql('dbbranch_database_grant_drain_source', q[CHECKPOINT;]);
