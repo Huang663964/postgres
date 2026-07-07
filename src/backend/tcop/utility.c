@@ -1429,6 +1429,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				{
 					DefineStmt *stmt = (DefineStmt *) parsetree;
 
+					LockDBBranchUtilityWriteGate();
 					switch (stmt->kind)
 					{
 						case OBJECT_AGGREGATE:

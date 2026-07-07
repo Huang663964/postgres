@@ -575,6 +575,51 @@ is($domain_exists, '1', 'branch succeeds after source create domain drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_domain_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_domain_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_define_drain_source;]);
+$node->safe_psql('dbbranch_define_drain_source', q[CHECKPOINT;]);
+
+my $define_locker = $node->background_psql('dbbranch_define_drain_source', on_error_stop => 1);
+$define_locker->query_safe(q[BEGIN; LOCK TABLE pg_collation IN ACCESS EXCLUSIVE MODE;]);
+my $define_writer = $node->background_psql('dbbranch_define_drain_source', on_error_stop => 1);
+$define_writer->query_until(
+	qr/start_define_drain_collation/,
+	q(\echo start_define_drain_collation
+CREATE COLLATION dbbranch_collation FROM "C";
+\echo finish_define_drain_collation
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_define_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE COLLATION dbbranch_collation%';
+]), 'active source create collation waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_define_drain_target FROM DATABASE dbbranch_define_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create collation');
+like($stderr, qr/source database "dbbranch_define_drain_source" has active write transactions/,
+	'active source create collation holds db branch writer gate');
+
+$define_locker->query_safe(q[COMMIT;]);
+$define_locker->quit;
+$define_writer->query_until(qr/finish_define_drain_collation/, '');
+$define_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_define_drain_target FROM DATABASE dbbranch_define_drain_source]);
+my $collation_exists = $node->safe_psql(
+	'dbbranch_define_drain_target',
+	q[SELECT count(*) FROM pg_collation WHERE collname = 'dbbranch_collation';]);
+is($collation_exists, '1', 'branch succeeds after source create collation drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_define_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_define_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',
