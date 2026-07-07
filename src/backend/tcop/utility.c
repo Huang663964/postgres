@@ -1154,6 +1154,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				 * relation and attribute manipulation
 				 */
 			case T_CreateSchemaStmt:
+				LockDBBranchUtilityWriteGate();
 				CreateSchemaCommand((CreateSchemaStmt *) parsetree,
 									queryString,
 									pstmt->stmt_location,

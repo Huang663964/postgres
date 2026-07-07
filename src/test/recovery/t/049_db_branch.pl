@@ -1901,6 +1901,51 @@ my $renamed_table_exists = $node->safe_psql(
 is($renamed_table_exists, 't', 'source rename finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_schema_drain_source;]);
+$node->safe_psql('dbbranch_create_schema_drain_source', q[CHECKPOINT;]);
+
+my $create_schema_locker = $node->background_psql('dbbranch_create_schema_drain_source', on_error_stop => 1);
+$create_schema_locker->query_safe(q[BEGIN; LOCK TABLE pg_namespace IN ACCESS EXCLUSIVE MODE;]);
+my $create_schema_writer = $node->background_psql('dbbranch_create_schema_drain_source', on_error_stop => 1);
+$create_schema_writer->query_until(
+	qr/start_create_schema_drain_schema/,
+	q(\echo start_create_schema_drain_schema
+CREATE SCHEMA dbbranch_created_schema;
+\echo finish_create_schema_drain_schema
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_create_schema_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE SCHEMA dbbranch_created_schema%';
+]), 'active source create schema waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_create_schema_drain_target FROM DATABASE dbbranch_create_schema_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create schema');
+like($stderr, qr/source database "dbbranch_create_schema_drain_source" has active write transactions/,
+	'active source create schema holds db branch writer gate');
+
+$create_schema_locker->query_safe(q[COMMIT;]);
+$create_schema_locker->quit;
+$create_schema_writer->query_until(qr/finish_create_schema_drain_schema/, '');
+$create_schema_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_create_schema_drain_target FROM DATABASE dbbranch_create_schema_drain_source]);
+my $created_schema_exists = $node->safe_psql(
+	'dbbranch_create_schema_drain_target',
+	q[SELECT count(*) FROM pg_namespace WHERE nspname = 'dbbranch_created_schema';]);
+is($created_schema_exists, '1', 'branch succeeds after source create schema drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_schema_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_schema_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_schema_drain_source;]);
 $node->safe_psql(
 	'dbbranch_schema_drain_source',
