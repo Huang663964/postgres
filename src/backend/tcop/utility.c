@@ -1842,6 +1842,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_RenameStmt:
+				LockDBBranchUtilityWriteGate();
 				address = ExecRenameStmt((RenameStmt *) parsetree);
 				break;
 
