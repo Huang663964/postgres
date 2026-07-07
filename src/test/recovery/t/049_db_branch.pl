@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 121
+	skip 'Injection points not supported by this build', 125
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -477,6 +477,57 @@ WHERE datname = 'dbbranch_cluster_drain_source'
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_reindex_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_reindex_drain_source',
+		q[
+CREATE TABLE reindex_rows (id int PRIMARY KEY, note text);
+INSERT INTO reindex_rows SELECT g, repeat('x', 100) FROM generate_series(1, 25) g;
+CHECKPOINT;
+]);
+
+	my $reindex_locker = $node->background_psql('dbbranch_reindex_drain_source', on_error_stop => 1);
+	$reindex_locker->query_safe(q[BEGIN; LOCK TABLE reindex_rows IN ACCESS EXCLUSIVE MODE;]);
+	my $reindex_writer = $node->background_psql('dbbranch_reindex_drain_source', on_error_stop => 1);
+	$reindex_writer->query_until(
+		qr/start_reindex_drain_reindex/,
+		q(\echo start_reindex_drain_reindex
+REINDEX TABLE reindex_rows;
+\echo finish_reindex_drain_reindex
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_reindex_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'REINDEX%';
+]), 'active source reindex waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_reindex_drain_target FROM DATABASE dbbranch_reindex_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source reindex');
+	like($stderr, qr/source database "dbbranch_reindex_drain_source" has active write transactions/,
+		'active source reindex holds db branch writer gate');
+
+	$reindex_locker->query_safe(q[COMMIT;]);
+	$reindex_locker->quit;
+	$reindex_writer->query_until(qr/finish_reindex_drain_reindex/, '');
+	$reindex_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_reindex_drain_target FROM DATABASE dbbranch_reindex_drain_source]);
+	my $reindex_rows = $node->safe_psql(
+		'dbbranch_reindex_drain_target',
+		q[SELECT count(*) FROM reindex_rows;]);
+	is($reindex_rows, '25', 'branch succeeds after source reindex drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_fail_source;]);
 	$node->safe_psql(

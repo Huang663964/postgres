@@ -37,11 +37,11 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
 
   <para>
    The source database is locked while PostgreSQL waits briefly for existing
-   write transactions and maintenance writes such as <command>VACUUM</command>
-   and <command>CLUSTER</command> to drain, pins WAL, and clones the source
-   storage.  Existing idle or read-only sessions can stay connected.  WAL
-   replay then runs against the branch storage after that source lock is
-   released.
+   write transactions and maintenance writes such as <command>VACUUM</command>,
+   <command>CLUSTER</command>, and <command>REINDEX</command> to drain, pins
+   WAL, and clones the source storage.  Existing idle or read-only sessions can
+   stay connected.  WAL replay then runs against the branch storage after that
+   source lock is released.
   </para>
  </refsect1>
 

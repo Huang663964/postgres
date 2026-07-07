@@ -32,6 +32,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
@@ -114,8 +115,19 @@ static void ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids,
 static bool ReindexRelationConcurrently(const ReindexStmt *stmt,
 										Oid relationOid,
 										const ReindexParams *params);
+static void LockDBBranchReindexWriteGate(void);
 static void update_relispartition(Oid relationId, bool newval);
 static inline void set_indexsafe_procflags(void);
+
+static void
+LockDBBranchReindexWriteGate(void)
+{
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: REINDEX can wait on relation locks before assigning an XID. */
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+}
 
 /*
  * callback argument type for RangeVarCallbackForReindexIndex()
@@ -2857,6 +2869,7 @@ ExecReindex(ParseState *pstate, const ReindexStmt *stmt, bool isTopLevel)
 	params.options =
 		(verbose ? REINDEXOPT_VERBOSE : 0) |
 		(concurrently ? REINDEXOPT_CONCURRENTLY : 0);
+	LockDBBranchReindexWriteGate();
 
 	/*
 	 * Assign the tablespace OID to move indexes to, with InvalidOid to do
@@ -3455,6 +3468,7 @@ ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids, const Reind
 		char		relpersistence;
 
 		StartTransactionCommand();
+		LockDBBranchReindexWriteGate();
 
 		/* functions in indexes may want a snapshot set */
 		PushActiveSnapshot(GetTransactionSnapshot());
