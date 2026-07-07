@@ -4553,17 +4553,26 @@ CREATE BRANCH dbbranch_drop_during_target FROM DATABASE dbbranch_drop_during_sou
 
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
 
+	my $replay_fail_tablespace_dir = $node->basedir . '/dbbranch_replay_fail_ts';
+	mkdir($replay_fail_tablespace_dir)
+	  or die "could not create $replay_fail_tablespace_dir: $!";
+	$node->safe_psql('postgres',
+		"CREATE TABLESPACE dbbranch_replay_fail_ts LOCATION '$replay_fail_tablespace_dir';");
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_fail_source;]);
 	$node->safe_psql(
 		'dbbranch_replay_fail_source',
 		q[
 CREATE TABLE replay_fail_rows (id int PRIMARY KEY);
+CREATE TABLE replay_fail_ts_rows (id int PRIMARY KEY) TABLESPACE dbbranch_replay_fail_ts;
 INSERT INTO replay_fail_rows VALUES (1);
+INSERT INTO replay_fail_ts_rows VALUES (1);
 CHECKPOINT;
 UPDATE replay_fail_rows SET id = 1 WHERE id = 1;
 ]);
 
-	my %replay_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my %replay_storage_before = map { $_ => 1 } (
+		glob($node->data_dir . '/base/*'),
+		glob($node->data_dir . '/pg_tblspc/*/*/*'));
 	my @replay_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_attach('db-branch-before-replay', 'error');]);
@@ -4587,8 +4596,11 @@ UPDATE replay_fail_rows SET id = 1 WHERE id = 1;
 		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
 	is($replay_fail_slot_count, '0', 'replay failure releases DB Branch WAL pin');
 
-	my @replay_clone_left = grep { !$replay_base_before{$_} } glob $node->data_dir . '/base/*';
-	is(scalar @replay_clone_left, 0, 'replay failure removes cloned branch storage path');
+	my @replay_clone_left = grep { !$replay_storage_before{$_} } (
+		glob($node->data_dir . '/base/*'),
+		glob($node->data_dir . '/pg_tblspc/*/*/*'));
+	is(scalar @replay_clone_left, 0,
+		'replay failure removes cloned branch storage paths from all tablespaces');
 
 	my $replay_source_rows = $node->safe_psql(
 		'dbbranch_replay_fail_source',
@@ -4638,6 +4650,7 @@ SELECT count(*) FROM replay_fail_rows;
 
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_fail_source;]);
+	$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_replay_fail_ts;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_redo_fail_source;]);
 	$node->safe_psql(
