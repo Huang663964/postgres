@@ -1614,6 +1614,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterExtensionStmt:
+				LockDBBranchUtilityWriteGate();
 				address = ExecAlterExtensionStmt(pstate, (AlterExtensionStmt *) parsetree);
 				break;
 
