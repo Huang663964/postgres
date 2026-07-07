@@ -609,6 +609,49 @@ my $depends_recorded = $node->safe_psql(
 is($depends_recorded, '1', 'source depends on extension finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_depends_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE ROLE dbbranch_default_reader;]);
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_default_drain_source;]);
+$node->safe_psql('dbbranch_default_drain_source', q[CHECKPOINT;]);
+
+my $default_locker = $node->background_psql('dbbranch_default_drain_source', on_error_stop => 1);
+$default_locker->query_safe(q[BEGIN; LOCK TABLE pg_default_acl IN ACCESS EXCLUSIVE MODE;]);
+my $default_writer = $node->background_psql('dbbranch_default_drain_source', on_error_stop => 1);
+$default_writer->query_until(
+	qr/start_default_drain_default/,
+	q(\echo start_default_drain_default
+ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO dbbranch_default_reader;
+\echo finish_default_drain_default
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_default_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER DEFAULT PRIVILEGES%';
+]), 'active source alter default privileges waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_default_drain_target FROM DATABASE dbbranch_default_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter default privileges');
+like($stderr, qr/source database "dbbranch_default_drain_source" has active write transactions/,
+	'active source alter default privileges holds db branch writer gate');
+
+$default_locker->query_safe(q[COMMIT;]);
+$default_locker->quit;
+$default_writer->query_until(qr/finish_default_drain_default/, '');
+$default_writer->quit;
+
+$node->safe_psql('dbbranch_default_drain_source', q[CREATE TABLE default_priv_rows (id int);]);
+my $default_priv_applied = $node->safe_psql(
+	'dbbranch_default_drain_source',
+	q[SELECT has_table_privilege('dbbranch_default_reader', 'default_priv_rows', 'select');]);
+is($default_priv_applied, 't', 'source alter default privileges finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_default_drain_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_default_reader;]);
+
 $node->safe_psql('postgres', q[CREATE ROLE dbbranch_grant_reader;]);
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_grant_drain_source;]);
 $node->safe_psql(

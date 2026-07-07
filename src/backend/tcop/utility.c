@@ -1857,6 +1857,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterDefaultPrivilegesStmt:
+				LockDBBranchUtilityWriteGate();
 				ExecAlterDefaultPrivilegesStmt(pstate, (AlterDefaultPrivilegesStmt *) parsetree);
 				EventTriggerCollectAlterDefPrivs((AlterDefaultPrivilegesStmt *) parsetree);
 				commandCollected = true;
