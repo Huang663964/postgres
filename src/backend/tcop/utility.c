@@ -989,6 +989,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				GrantStmt  *stmt = (GrantStmt *) parsetree;
 
+				LockDBBranchUtilityWriteGate();
 				if (EventTriggerSupportsObjectType(stmt->objtype))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,

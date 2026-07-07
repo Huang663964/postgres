@@ -517,6 +517,54 @@ my $renamed_table_exists = $node->safe_psql(
 is($renamed_table_exists, 't', 'source rename finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE ROLE dbbranch_grant_reader;]);
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_grant_drain_source;]);
+$node->safe_psql(
+	'dbbranch_grant_drain_source',
+	q[
+CREATE TABLE grant_rows (id int PRIMARY KEY);
+INSERT INTO grant_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $grant_locker = $node->background_psql('dbbranch_grant_drain_source', on_error_stop => 1);
+$grant_locker->query_safe(q[BEGIN; LOCK TABLE grant_rows IN ACCESS EXCLUSIVE MODE;]);
+my $grant_writer = $node->background_psql('dbbranch_grant_drain_source', on_error_stop => 1);
+$grant_writer->query_until(
+	qr/start_grant_drain_grant/,
+	q(\echo start_grant_drain_grant
+GRANT SELECT ON grant_rows TO dbbranch_grant_reader;
+\echo finish_grant_drain_grant
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_grant_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'GRANT SELECT ON grant_rows%';
+]), 'active source grant waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_grant_drain_target FROM DATABASE dbbranch_grant_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source grant');
+like($stderr, qr/source database "dbbranch_grant_drain_source" has active write transactions/,
+	'active source grant holds db branch writer gate');
+
+$grant_locker->query_safe(q[COMMIT;]);
+$grant_locker->quit;
+$grant_writer->query_until(qr/finish_grant_drain_grant/, '');
+$grant_writer->quit;
+
+my $grant_applied = $node->safe_psql(
+	'dbbranch_grant_drain_source',
+	q[SELECT has_table_privilege('dbbranch_grant_reader', 'grant_rows', 'select');]);
+is($grant_applied, 't', 'source grant finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_grant_drain_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_grant_reader;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136
