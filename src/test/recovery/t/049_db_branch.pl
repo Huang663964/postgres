@@ -3306,6 +3306,51 @@ WHERE datname = 'dbbranch_alter_stats_drain_source'
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_stats_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_stats_drain_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_publication_drain_source;]);
+	$node->safe_psql('dbbranch_create_publication_drain_source', q[CHECKPOINT;]);
+
+	my $create_publication_writer = $node->background_psql('dbbranch_create_publication_drain_source', on_error_stop => 1);
+	my $create_publication_locker = $node->background_psql('dbbranch_create_publication_drain_source', on_error_stop => 1);
+	$create_publication_locker->query_safe(q[BEGIN; LOCK TABLE pg_publication IN ACCESS EXCLUSIVE MODE;]);
+	$create_publication_writer->query_until(
+		qr/start_create_publication_drain_publication/,
+		q(\echo start_create_publication_drain_publication
+CREATE PUBLICATION dbbranch_create_pub;
+\echo finish_create_publication_drain_publication
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_create_publication_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE PUBLICATION dbbranch_create_pub%';
+]), 'active source create publication waits on source catalog lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_create_publication_drain_target FROM DATABASE dbbranch_create_publication_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source create publication');
+	like($stderr, qr/source database "dbbranch_create_publication_drain_source" has active write transactions/,
+		'active source create publication holds db branch writer gate');
+
+	$create_publication_locker->query_safe(q[COMMIT;]);
+	$create_publication_locker->quit;
+	$create_publication_writer->query_until(qr/finish_create_publication_drain_publication/, '');
+	$create_publication_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_create_publication_drain_target FROM DATABASE dbbranch_create_publication_drain_source]);
+	my $create_publication_exists = $node->safe_psql(
+		'dbbranch_create_publication_drain_target',
+		q[SELECT count(*) FROM pg_publication WHERE pubname = 'dbbranch_create_pub';]);
+	is($create_publication_exists, '1', 'branch succeeds after source create publication drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_publication_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_publication_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_publication_drain_source;]);
 	$node->safe_psql(
 		'dbbranch_publication_drain_source',

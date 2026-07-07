@@ -1922,6 +1922,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreatePublicationStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreatePublication(pstate, (CreatePublicationStmt *) parsetree);
 				break;
 
