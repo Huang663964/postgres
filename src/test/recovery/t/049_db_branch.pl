@@ -765,6 +765,57 @@ is($server_exists, '1', 'branch succeeds after source create foreign server drai
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_server_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_server_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_server_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_server_drain_source',
+	q[
+CREATE FOREIGN DATA WRAPPER dbbranch_fdw;
+CREATE SERVER dbbranch_server FOREIGN DATA WRAPPER dbbranch_fdw;
+CHECKPOINT;
+]);
+
+my $alter_server_locker = $node->background_psql('dbbranch_alter_server_drain_source', on_error_stop => 1);
+$alter_server_locker->query_safe(q[BEGIN; LOCK TABLE pg_foreign_server IN ACCESS EXCLUSIVE MODE;]);
+my $alter_server_writer = $node->background_psql('dbbranch_alter_server_drain_source', on_error_stop => 1);
+$alter_server_writer->query_until(
+	qr/start_alter_server_drain_server/,
+	q(\echo start_alter_server_drain_server
+ALTER SERVER dbbranch_server OPTIONS (ADD host 'localhost');
+\echo finish_alter_server_drain_server
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_server_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER SERVER dbbranch_server%';
+]), 'active source alter foreign server waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_server_drain_target FROM DATABASE dbbranch_alter_server_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter foreign server');
+like($stderr, qr/source database "dbbranch_alter_server_drain_source" has active write transactions/,
+	'active source alter foreign server holds db branch writer gate');
+
+$alter_server_locker->query_safe(q[COMMIT;]);
+$alter_server_locker->quit;
+$alter_server_writer->query_until(qr/finish_alter_server_drain_server/, '');
+$alter_server_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_server_drain_target FROM DATABASE dbbranch_alter_server_drain_source]);
+my $server_options = $node->safe_psql(
+	'dbbranch_alter_server_drain_target',
+	q[SELECT srvoptions @> ARRAY['host=localhost'] FROM pg_foreign_server WHERE srvname = 'dbbranch_server';]);
+is($server_options, 't', 'branch succeeds after source alter foreign server drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_server_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_server_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',
