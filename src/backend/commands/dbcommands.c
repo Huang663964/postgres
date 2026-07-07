@@ -4063,6 +4063,17 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		branch_lsn = GetXLogInsertEndRecPtr();
 		XLogFlush(branch_lsn);
 		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, wal_scan);
+		INJECTION_POINT("db-branch-after-wal-scan", &wal_scan->mixed_records);
+
+		if (wal_scan->mixed_records > 0)
+		{
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+			source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("DB Branch rmgr replay does not support mixed WAL records yet")));
+		}
 
 		if (source_has_unlogged || source_has_sequence)
 		{

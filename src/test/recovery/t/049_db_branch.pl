@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 105
+	skip 'Injection points not supported by this build', 117
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -514,6 +514,82 @@ SELECT count(*) FROM clone_fail_rows;
 
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-clone');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_clone_fail_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_mixed_wal_source;]);
+	$node->safe_psql(
+		'dbbranch_mixed_wal_source',
+		q[
+CREATE TABLE mixed_wal_rows (id int PRIMARY KEY);
+INSERT INTO mixed_wal_rows VALUES (1);
+CHECKPOINT;
+UPDATE mixed_wal_rows SET id = 1 WHERE id = 1;
+]);
+
+	my %mixed_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @mixed_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-after-wal-scan', 'increment-uint64');]);
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_mixed_wal_target FROM DATABASE dbbranch_mixed_wal_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch rejects mixed WAL before clone');
+	like($stderr, qr/DB Branch rmgr replay does not support mixed WAL records yet/,
+		'db branch surfaces mixed WAL rejection');
+
+	my $mixed_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_mixed_wal_target';]);
+	is($mixed_branch_count, '0', 'mixed WAL rejection creates no branch database');
+
+	my $mixed_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($mixed_slot_count, '0', 'mixed WAL rejection releases DB Branch WAL pin');
+
+	my @mixed_paths_left = grep { !$mixed_base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @mixed_paths_left, 0, 'mixed WAL rejection creates no branch storage path');
+
+	my $mixed_source_rows = $node->safe_psql(
+		'dbbranch_mixed_wal_source',
+		q[
+INSERT INTO mixed_wal_rows VALUES (2);
+SELECT count(*) FROM mixed_wal_rows;
+]);
+	is($mixed_source_rows, '2', 'source accepts writes after mixed WAL rejection');
+
+	my @mixed_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @mixed_metadata_files, scalar(@mixed_metadata_before) + 1,
+		'mixed WAL rejection writes separate metadata file');
+
+	my $mixed_metadata = '';
+	for my $path (@mixed_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_mixed_wal_target$/m)
+		{
+			$mixed_metadata = $contents;
+			last;
+		}
+	}
+
+	like($mixed_metadata, qr/^clone_result=not_started$/m,
+		'mixed WAL rejection metadata records clone not started');
+	like($mixed_metadata, qr/^cleanup=not_started$/m,
+		'mixed WAL rejection metadata records cleanup not started');
+	like($mixed_metadata, qr/^replay_method=not_started$/m,
+		'mixed WAL rejection metadata records replay not started');
+	like($mixed_metadata, qr/^wal_mixed_records=[1-9][0-9]*$/m,
+		'mixed WAL rejection metadata records mixed WAL');
+	like($mixed_metadata, qr/^failure=DB Branch rmgr replay does not support mixed WAL records yet$/m,
+		'mixed WAL rejection metadata records failure reason');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-after-wal-scan');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_mixed_wal_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_mid_fail_source;]);
 	$node->safe_psql(

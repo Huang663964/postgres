@@ -99,6 +99,9 @@ extern PGDLLEXPORT void injection_error(const char *name,
 extern PGDLLEXPORT void injection_notice(const char *name,
 										 const void *private_data,
 										 void *arg);
+extern PGDLLEXPORT void injection_increment_uint64(const char *name,
+												   const void *private_data,
+												   void *arg);
 extern PGDLLEXPORT void injection_wait(const char *name,
 									   const void *private_data,
 									   void *arg);
@@ -277,6 +280,23 @@ injection_notice(const char *name, const void *private_data, void *arg)
 		elog(NOTICE, "notice triggered for injection point %s", name);
 }
 
+void
+injection_increment_uint64(const char *name, const void *private_data, void *arg)
+{
+	InjectionPointCondition *condition = (InjectionPointCondition *) private_data;
+	uint64	   *value = (uint64 *) arg;
+
+	if (!injection_point_allowed(condition))
+		return;
+
+	pgstat_report_inj(name);
+
+	if (value == NULL)
+		elog(ERROR, "injection point %s requires uint64 argument", name);
+
+	(*value)++;
+}
+
 /* Wait on a condition variable, awaken by injection_points_wakeup() */
 void
 injection_wait(const char *name, const void *private_data, void *arg)
@@ -359,6 +379,8 @@ injection_points_attach(PG_FUNCTION_ARGS)
 		function = "injection_error";
 	else if (strcmp(action, "notice") == 0)
 		function = "injection_notice";
+	else if (strcmp(action, "increment-uint64") == 0)
+		function = "injection_increment_uint64";
 	else if (strcmp(action, "wait") == 0)
 		function = "injection_wait";
 	else
