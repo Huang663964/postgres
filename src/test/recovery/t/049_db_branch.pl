@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 18
+	skip 'Injection points not supported by this build', 20
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -456,6 +456,14 @@ CREATE BRANCH dbbranch_install_fail_target FROM DATABASE dbbranch_install_fail_s
 		q[SELECT count(*) FROM pg_dbbranch WHERE branch_db_oid NOT IN (SELECT oid FROM pg_database);]);
 	is($install_catalog_rows, '0', 'install failure leaves no orphan pg_dbbranch rows');
 
+	my $install_source_rows = $node->safe_psql(
+		'dbbranch_install_fail_source',
+		q[
+INSERT INTO install_fail_rows VALUES (3);
+SELECT count(*) FROM install_fail_rows;
+]);
+	is($install_source_rows, '3', 'source accepts writes after install failure');
+
 	my @install_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 	is(scalar @install_metadata_files, scalar(@install_metadata_before) + 1,
 		'install failure writes separate metadata file');
@@ -477,6 +485,8 @@ CREATE BRANCH dbbranch_install_fail_target FROM DATABASE dbbranch_install_fail_s
 		'install failure metadata records released WAL pin');
 	like($install_metadata, qr/^cleanup=done$/m,
 		'install failure metadata records clone cleanup');
+	like($install_metadata, qr/^status_history=CREATING,COPYING,REPLAYING,FAILED$/m,
+		'install failure metadata records failed transition');
 	like($install_metadata, qr/^status=FAILED$/m,
 		'install failure metadata final state is FAILED');
 	like($install_metadata, qr/^failure=.+$/m,
