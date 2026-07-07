@@ -1064,6 +1064,63 @@ is($conversion_count, '1', 'branch succeeds after source create conversion drain
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_conversion_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_conversion_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_cast_drain_source;]);
+$node->safe_psql(
+	'dbbranch_cast_drain_source',
+	q[
+CREATE TYPE dbbranch_cast_type AS (id int);
+CREATE FUNCTION dbbranch_cast_to_text(dbbranch_cast_type) RETURNS text
+LANGUAGE SQL IMMUTABLE AS $$ SELECT ($1).id::text $$;
+CHECKPOINT;
+]);
+
+my $cast_locker = $node->background_psql('dbbranch_cast_drain_source', on_error_stop => 1);
+$cast_locker->query_safe(q[BEGIN; LOCK TABLE pg_cast IN ACCESS EXCLUSIVE MODE;]);
+my $cast_writer = $node->background_psql('dbbranch_cast_drain_source', on_error_stop => 1);
+$cast_writer->query_until(
+	qr/start_cast_drain_cast/,
+	q(\echo start_cast_drain_cast
+CREATE CAST (dbbranch_cast_type AS text) WITH FUNCTION dbbranch_cast_to_text(dbbranch_cast_type);
+\echo finish_cast_drain_cast
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_cast_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE CAST (dbbranch_cast_type AS text)%';
+]), 'active source create cast waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_cast_drain_target FROM DATABASE dbbranch_cast_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create cast');
+like($stderr, qr/source database "dbbranch_cast_drain_source" has active write transactions/,
+	'active source create cast holds db branch writer gate');
+
+$cast_locker->query_safe(q[COMMIT;]);
+$cast_locker->quit;
+$cast_writer->query_until(qr/finish_cast_drain_cast/, '');
+$cast_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_cast_drain_target FROM DATABASE dbbranch_cast_drain_source]);
+my $cast_count = $node->safe_psql(
+	'dbbranch_cast_drain_target',
+	q[
+SELECT count(*)
+FROM pg_cast
+WHERE castsource = 'dbbranch_cast_type'::regtype
+  AND casttarget = 'text'::regtype;
+]);
+is($cast_count, '1', 'branch succeeds after source create cast drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
 $node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
 

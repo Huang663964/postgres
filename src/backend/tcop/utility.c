@@ -1780,6 +1780,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateCastStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateCast((CreateCastStmt *) parsetree);
 				break;
 
