@@ -3793,7 +3793,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	char		source_locprovider;
 	char	   *source_collversion;
 	Oid		branch_dboid;
-	const char *clone_result = "done";
+	const char *volatile clone_result = "done";
 	List	   *tablespace_oids = NIL;
 	ListCell   *cell;
 	bool		source_has_unlogged;
@@ -3801,9 +3801,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	volatile bool clone_paths_created = false;
 	int		notherbackends;
 	int		npreparedxacts;
-	XLogRecPtr redo_ptr = InvalidXLogRecPtr;
-	XLogRecPtr branch_lsn = InvalidXLogRecPtr;
-	DBBranchWalScan wal_scan;
+	volatile XLogRecPtr redo_ptr = InvalidXLogRecPtr;
+	volatile XLogRecPtr branch_lsn = InvalidXLogRecPtr;
+	DBBranchWalScan *wal_scan;
 	uint32		branch_hash;
 	char	   *srcpath;
 	char	   *clone_path;
@@ -3814,15 +3814,17 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	instr_time	clone_start;
 	instr_time	replay_start;
 	instr_time	elapsed;
-	double		source_blocking_ms = 0.0;
-	double		clone_elapsed_ms = 0.0;
-	double		replay_elapsed_ms = 0.0;
+	volatile double source_blocking_ms = 0.0;
+	volatile double clone_elapsed_ms = 0.0;
+	volatile double replay_elapsed_ms = 0.0;
 	TimestampTz created_at = GetCurrentTimestamp();
 	TimestampTz ready_at;
 	volatile bool source_lock_held = false;
 	volatile bool replay_finished = false;
 	volatile bool failure_metadata_written = false;
 
+
+	wal_scan = palloc0(sizeof(DBBranchWalScan));
 
 	if (wal_level < WAL_LEVEL_REPLICA)
 		ereport(ERROR,
@@ -4002,7 +4004,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	{
 		branch_lsn = GetXLogInsertEndRecPtr();
 		XLogFlush(branch_lsn);
-		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, &wal_scan);
+		ScanDBBranchWalRange(source_dboid, redo_ptr, branch_lsn, wal_scan);
 
 		if (source_has_unlogged || source_has_sequence)
 		{
@@ -4089,7 +4091,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 		INSTR_TIME_SET_CURRENT(replay_start);
 		if (!ReplayDBBranchWal(source_dboid, branch_dboid,
-							  redo_ptr, branch_lsn, &wal_scan,
+							  redo_ptr, branch_lsn, wal_scan,
 							  failure, sizeof(failure)))
 		{
 			bool		cleanup_ok;
@@ -4117,7 +4119,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  "released",
 						  clone_result, cleanup_ok ? "done" : "failed",
 						  "rmgr_redo",
-						  &wal_scan,
+						  wal_scan,
 						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 						  "CREATING,COPYING,REPLAYING,FAILED", "FAILED", failure);
 			ereport(ERROR,
@@ -4146,7 +4148,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			LogDBBranchCreateFileCopy(source_dboid, branch_dboid, lfirst_oid(cell));
 		ready_at = GetCurrentTimestamp();
 		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
-						  &wal_scan,
+						  wal_scan,
 						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 						  created_at, ready_at, clone_result,
 						  "rmgr_redo", "READY", "");
@@ -4157,22 +4159,27 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
 						  clone_result, "not_needed", "rmgr_redo",
-						  &wal_scan,
+						  wal_scan,
 						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 						  "CREATING,COPYING,REPLAYING,READY", "READY", "");
 	}
 	PG_CATCH();
 	{
-		ErrorData  *edata = NULL;
+		ErrorData  *edata;
 		bool		cleanup_ok = true;
+		const char *cleanup;
+		const char *replay_method;
+		const char *status_history;
 
-		if (replay_finished && !failure_metadata_written)
+		if (!failure_metadata_written)
 		{
 			MemoryContextSwitchTo(TopMemoryContext);
 			edata = CopyErrorData();
 			snprintf(failure, sizeof(failure), "%s",
-					 edata->message ? edata->message : "DB Branch install failed");
+					 edata->message ? edata->message : "DB Branch creation failed");
 		}
+		else
+			edata = NULL;
 		if (source_lock_held)
 		{
 			UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
@@ -4194,14 +4201,23 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		ReleaseDBBranchWalPin();
 		if (edata != NULL)
 		{
+			if (clone_paths_created)
+				cleanup = cleanup_ok ? "done" : "failed";
+			else
+				cleanup = "not_started";
+			replay_method = replay_finished ? "rmgr_redo" : "not_started";
+			status_history = clone_paths_created ?
+				"CREATING,COPYING,REPLAYING,FAILED" :
+				"CREATING,FAILED";
+
 			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
-						  clone_result, cleanup_ok ? "done" : "failed",
-						  "rmgr_redo",
-						  &wal_scan,
+						  clone_result, cleanup,
+						  replay_method,
+						  wal_scan,
 						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
-						  "CREATING,COPYING,REPLAYING,FAILED", "FAILED", failure);
+						  status_history, "FAILED", failure);
 			FreeErrorData(edata);
 		}
 		PG_RE_THROW();

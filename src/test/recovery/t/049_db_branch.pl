@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 20
+	skip 'Injection points not supported by this build', 37
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -404,6 +404,92 @@ CREATE BRANCH dbbranch_replay_gate_target FROM DATABASE dbbranch_replay_gate_sou
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_fail_source;]);
+	$node->safe_psql(
+		'dbbranch_replay_fail_source',
+		q[
+CREATE TABLE replay_fail_rows (id int PRIMARY KEY);
+INSERT INTO replay_fail_rows VALUES (1);
+CHECKPOINT;
+UPDATE replay_fail_rows SET id = 1 WHERE id = 1;
+]);
+
+	my %replay_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @replay_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-before-replay', 'error');]);
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_replay_fail_target FROM DATABASE dbbranch_replay_fail_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports injected replay failure');
+	like($stderr, qr/db-branch-before-replay/,
+		'db branch surfaces replay injection failure');
+
+	my $replay_fail_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_replay_fail_target';]);
+	is($replay_fail_branch_count, '0', 'replay failure creates no branch database');
+
+	my $replay_fail_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($replay_fail_slot_count, '0', 'replay failure releases DB Branch WAL pin');
+
+	my @replay_clone_left = grep { !$replay_base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @replay_clone_left, 0, 'replay failure removes cloned branch storage path');
+
+	my $replay_source_rows = $node->safe_psql(
+		'dbbranch_replay_fail_source',
+		q[
+INSERT INTO replay_fail_rows VALUES (2);
+SELECT count(*) FROM replay_fail_rows;
+]);
+	is($replay_source_rows, '2', 'source accepts writes after replay failure');
+
+	my @replay_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @replay_metadata_files, scalar(@replay_metadata_before) + 1,
+		'replay failure writes separate metadata file');
+
+	my $replay_metadata = '';
+	for my $path (@replay_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_replay_fail_target$/m)
+		{
+			$replay_metadata = $contents;
+			last;
+		}
+	}
+
+	like($replay_metadata, qr/^wal_pin=released$/m,
+		'replay failure metadata records released WAL pin');
+	like($replay_metadata, qr/^redo_ptr=[0-9A-F]+\/[0-9A-F]+$/m,
+		'replay failure metadata records redo pointer');
+	unlike($replay_metadata, qr/^redo_ptr=0\/0$/m,
+		'replay failure redo pointer is valid');
+	like($replay_metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m,
+		'replay failure metadata records branch LSN');
+	unlike($replay_metadata, qr/^branch_lsn=0\/0$/m,
+		'replay failure branch LSN is valid');
+	like($replay_metadata, qr/^clone_result=(done|copy_fallback)$/m,
+		'replay failure metadata records clone result');
+	like($replay_metadata, qr/^cleanup=done$/m,
+		'replay failure metadata records clone cleanup');
+	like($replay_metadata, qr/^status_history=CREATING,COPYING,REPLAYING,FAILED$/m,
+		'replay failure metadata records failed transition');
+	like($replay_metadata, qr/^status=FAILED$/m,
+		'replay failure metadata final state is FAILED');
+	like($replay_metadata, qr/^failure=.+db-branch-before-replay.*$/m,
+		'replay failure metadata records failure reason');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_fail_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_install_fail_source;]);
 	$node->safe_psql(
