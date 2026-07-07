@@ -715,6 +715,56 @@ is($fdw_exists, '1', 'branch succeeds after source create foreign data wrapper d
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_fdw_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_fdw_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_server_drain_source;]);
+$node->safe_psql(
+	'dbbranch_server_drain_source',
+	q[
+CREATE FOREIGN DATA WRAPPER dbbranch_fdw;
+CHECKPOINT;
+]);
+
+my $server_locker = $node->background_psql('dbbranch_server_drain_source', on_error_stop => 1);
+$server_locker->query_safe(q[BEGIN; LOCK TABLE pg_foreign_server IN ACCESS EXCLUSIVE MODE;]);
+my $server_writer = $node->background_psql('dbbranch_server_drain_source', on_error_stop => 1);
+$server_writer->query_until(
+	qr/start_server_drain_server/,
+	q(\echo start_server_drain_server
+CREATE SERVER dbbranch_server FOREIGN DATA WRAPPER dbbranch_fdw;
+\echo finish_server_drain_server
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_server_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE SERVER dbbranch_server%';
+]), 'active source create foreign server waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_server_drain_target FROM DATABASE dbbranch_server_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create foreign server');
+like($stderr, qr/source database "dbbranch_server_drain_source" has active write transactions/,
+	'active source create foreign server holds db branch writer gate');
+
+$server_locker->query_safe(q[COMMIT;]);
+$server_locker->quit;
+$server_writer->query_until(qr/finish_server_drain_server/, '');
+$server_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_server_drain_target FROM DATABASE dbbranch_server_drain_source]);
+my $server_exists = $node->safe_psql(
+	'dbbranch_server_drain_target',
+	q[SELECT count(*) FROM pg_foreign_server WHERE srvname = 'dbbranch_server';]);
+is($server_exists, '1', 'branch succeeds after source create foreign server drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_server_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_server_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',

@@ -1631,6 +1631,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateForeignServerStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateForeignServer((CreateForeignServerStmt *) parsetree);
 				break;
 
