@@ -1771,6 +1771,7 @@ void
 dropdb(const char *dbname, bool missing_ok, bool force)
 {
 	Oid			db_id;
+	Oid			locked_db_id;
 	bool		db_istemplate;
 	Relation	pgdbrel;
 	HeapTuple	tup;
@@ -1790,9 +1791,21 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	 * using it as a CREATE DATABASE template or trying to delete it for
 	 * themselves.
 	 */
+	db_id = get_database_oid(dbname, missing_ok);
+	if (!OidIsValid(db_id))
+	{
+		ereport(NOTICE,
+				(errmsg("database \"%s\" does not exist, skipping",
+						dbname)));
+		return;
+	}
+
+	LockDBBranchTargetWriteGate(db_id);
+	INJECTION_POINT("db-branch-drop-database-target-gate", NULL);
+
 	pgdbrel = table_open(DatabaseRelationId, RowExclusiveLock);
 
-	if (!get_db_info(dbname, AccessExclusiveLock, &db_id, NULL, NULL,
+	if (!get_db_info(dbname, AccessExclusiveLock, &locked_db_id, NULL, NULL,
 					 &db_istemplate, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
 	{
 		if (!missing_ok)
@@ -1811,6 +1824,11 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 			return;
 		}
 	}
+	if (locked_db_id != db_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_DATABASE),
+				 errmsg("database \"%s\" changed while dropping",
+						dbname)));
 
 	/*
 	 * Permission checks
