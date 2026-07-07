@@ -377,6 +377,51 @@ is($language_exists, '1', 'branch succeeds after source create language drains')
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_language_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_language_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_am_drain_source;]);
+$node->safe_psql('dbbranch_am_drain_source', q[CHECKPOINT;]);
+
+my $am_writer = $node->background_psql('dbbranch_am_drain_source', on_error_stop => 1);
+my $am_locker = $node->background_psql('dbbranch_am_drain_source', on_error_stop => 1);
+$am_locker->query_safe(q[BEGIN; LOCK TABLE pg_am IN ACCESS EXCLUSIVE MODE;]);
+$am_writer->query_until(
+	qr/start_am_drain_am/,
+	q(\echo start_am_drain_am
+CREATE ACCESS METHOD dbbranch_am TYPE INDEX HANDLER bthandler;
+\echo finish_am_drain_am
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_am_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE ACCESS METHOD dbbranch_am%';
+]), 'active source create access method waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_am_drain_target FROM DATABASE dbbranch_am_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create access method');
+like($stderr, qr/source database "dbbranch_am_drain_source" has active write transactions/,
+	'active source create access method holds db branch writer gate');
+
+$am_locker->query_safe(q[COMMIT;]);
+$am_locker->quit;
+$am_writer->query_until(qr/finish_am_drain_am/, '');
+$am_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_am_drain_target FROM DATABASE dbbranch_am_drain_source]);
+my $access_method_exists = $node->safe_psql(
+	'dbbranch_am_drain_target',
+	q[SELECT count(*) FROM pg_am WHERE amname = 'dbbranch_am';]);
+is($access_method_exists, '1', 'branch succeeds after source create access method drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_am_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_am_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_rule_drain_source;]);
 $node->safe_psql(
 	'dbbranch_rule_drain_source',

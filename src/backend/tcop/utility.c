@@ -1917,6 +1917,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateAmStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateAccessMethod((CreateAmStmt *) parsetree);
 				break;
 
