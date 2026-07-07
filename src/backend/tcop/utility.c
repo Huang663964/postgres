@@ -1678,6 +1678,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_ViewStmt:	/* CREATE VIEW */
+				LockDBBranchUtilityWriteGate();
 				EventTriggerAlterTableStart(parsetree);
 				address = DefineView((ViewStmt *) parsetree, queryString,
 									 pstmt->stmt_location, pstmt->stmt_len);

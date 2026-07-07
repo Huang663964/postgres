@@ -378,6 +378,57 @@ my $rule_exists = $node->safe_psql(
 is($rule_exists, '1', 'source create rule finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rule_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_view_drain_source;]);
+$node->safe_psql(
+	'dbbranch_view_drain_source',
+	q[
+CREATE TABLE view_rows (id int PRIMARY KEY);
+INSERT INTO view_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $view_locker = $node->background_psql('dbbranch_view_drain_source', on_error_stop => 1);
+$view_locker->query_safe(q[BEGIN; LOCK TABLE view_rows IN ACCESS EXCLUSIVE MODE;]);
+my $view_writer = $node->background_psql('dbbranch_view_drain_source', on_error_stop => 1);
+$view_writer->query_until(
+	qr/start_view_drain_view/,
+	q(\echo start_view_drain_view
+CREATE VIEW view_rows_v AS SELECT id FROM view_rows;
+\echo finish_view_drain_view
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_view_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE VIEW view_rows_v%';
+]), 'active source create view waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_view_drain_target FROM DATABASE dbbranch_view_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create view');
+like($stderr, qr/source database "dbbranch_view_drain_source" has active write transactions/,
+	'active source create view holds db branch writer gate');
+
+$view_locker->query_safe(q[COMMIT;]);
+$view_locker->quit;
+$view_writer->query_until(qr/finish_view_drain_view/, '');
+$view_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_view_drain_target FROM DATABASE dbbranch_view_drain_source]);
+my $view_rows = $node->safe_psql(
+	'dbbranch_view_drain_target',
+	q[SELECT count(*) FROM view_rows_v;]);
+is($view_rows, '1', 'branch succeeds after source create view drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_view_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_view_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',
