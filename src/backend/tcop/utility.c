@@ -1993,6 +1993,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterCollationStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterCollation((AlterCollationStmt *) parsetree);
 				break;
 
