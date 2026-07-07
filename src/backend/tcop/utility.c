@@ -1936,6 +1936,7 @@ ProcessUtilitySlow(ParseState *pstate,
 					 * XXX RangeVarCallbackOwnsRelation not needed here, to
 					 * keep the same behavior as before.
 					 */
+					LockDBBranchUtilityWriteGate();
 					relid = RangeVarGetRelid(rel, ShareUpdateExclusiveLock, false);
 
 					/* Run parse analysis ... */
