@@ -4637,6 +4637,60 @@ my ($prepared_clone_path) = $prepared_metadata =~ /^clone_path=(.*)$/m;
 ok($prepared_clone_path eq '' || !-e $node->data_dir . '/' . $prepared_clone_path,
 	'prepared rejection does not create clone staging path');
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_create_subscription_drain_source;');
+$node->safe_psql('dbbranch_create_subscription_drain_source', q[CHECKPOINT;]);
+
+my $create_subscription_locker =
+  $node->background_psql('dbbranch_create_subscription_drain_source', on_error_stop => 1);
+my $create_subscription_writer =
+  $node->background_psql('dbbranch_create_subscription_drain_source', on_error_stop => 1);
+$create_subscription_locker->query_safe(q[BEGIN; LOCK TABLE pg_subscription IN ACCESS EXCLUSIVE MODE;]);
+$create_subscription_writer->query_until(
+	qr/start_create_subscription_drain_subscription/,
+	q(\echo start_create_subscription_drain_subscription
+CREATE SUBSCRIPTION dbbranch_create_subscription_sub
+CONNECTION 'dbname=dbbranch_subscription_missing'
+PUBLICATION dbbranch_subscription_pub
+WITH (slot_name = NONE, connect = false);
+\echo finish_create_subscription_drain_subscription
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_create_subscription_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE SUBSCRIPTION dbbranch_create_subscription_sub%';
+]), 'active source create subscription waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_create_subscription_drain_target FROM DATABASE dbbranch_create_subscription_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create subscription');
+like($stderr, qr/source database "dbbranch_create_subscription_drain_source" has active write transactions/,
+	'active source create subscription holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source create subscription writes separate metadata file');
+
+$create_subscription_locker->query_safe(q[COMMIT;]);
+$create_subscription_locker->quit;
+$create_subscription_writer->query_until(qr/finish_create_subscription_drain_subscription/, '');
+$create_subscription_writer->quit;
+
+my $create_subscription_exists = $node->safe_psql(
+	'dbbranch_create_subscription_drain_source',
+	q[SELECT count(*) FROM pg_subscription WHERE subname = 'dbbranch_create_subscription_sub';]);
+is($create_subscription_exists, '1', 'source create subscription completes after drain test');
+
+$node->safe_psql(
+	'dbbranch_create_subscription_drain_source',
+	q[DROP SUBSCRIPTION dbbranch_create_subscription_sub;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_subscription_drain_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_subscription_source;');
 $node->safe_psql(
 	'dbbranch_subscription_source',

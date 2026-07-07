@@ -3985,31 +3985,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				(errcode(ERRCODE_DUPLICATE_DATABASE),
 				 errmsg("database \"%s\" already exists", branch_name)));
 
-	if ((nsubscriptions = CountDBSubscriptions(source_dboid)) > 0)
-	{
-		const char *subscription_failure =
-			"source database has logical replication subscriptions";
-
-		INSTR_TIME_SET_CURRENT(elapsed);
-		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
-		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
-
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
-						  "not_started",
-						  "not_started", "not_started", "not_started",
-						  NULL,
-						  source_blocking_ms, 0.0, 0.0,
-						  "CREATING,FAILED", "FAILED", subscription_failure);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("source database \"%s\" is being used by logical replication subscription",
-						source_name),
-				 errdetail_plural("There is %d subscription.",
-								  "There are %d subscriptions.",
-								  nsubscriptions, nsubscriptions)));
-	}
-
 	if (!LockDBBranchSourceWriteGate(source_dboid, &npreparedxacts))
 	{
 		const char *busy_failure =
@@ -4041,6 +4016,31 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 							source_name)));
 	}
 	source_write_gate_held = true;
+
+	if ((nsubscriptions = CountDBSubscriptions(source_dboid)) > 0)
+	{
+		const char *subscription_failure =
+			"source database has logical replication subscriptions";
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
+						  "not_started",
+						  "not_started", "not_started", "not_started",
+						  NULL,
+						  source_blocking_ms, 0.0, 0.0,
+						  "CREATING,FAILED", "FAILED", subscription_failure);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("source database \"%s\" is being used by logical replication subscription",
+						source_name),
+				 errdetail_plural("There is %d subscription.",
+								  "There are %d subscriptions.",
+								  nsubscriptions, nsubscriptions)));
+	}
 
 	INJECTION_POINT("db-branch-before-drain", NULL);
 

@@ -1939,6 +1939,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateSubscriptionStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateSubscription(pstate,
 											 (CreateSubscriptionStmt *) parsetree,
 											 isTopLevel);
