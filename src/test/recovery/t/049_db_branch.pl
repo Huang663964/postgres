@@ -620,6 +620,51 @@ is($collation_exists, '1', 'branch succeeds after source create collation drains
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_define_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_define_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_sequence_drain_source;]);
+$node->safe_psql('dbbranch_create_sequence_drain_source', q[CHECKPOINT;]);
+
+my $create_sequence_locker = $node->background_psql('dbbranch_create_sequence_drain_source', on_error_stop => 1);
+$create_sequence_locker->query_safe(q[BEGIN; LOCK TABLE pg_sequence IN ACCESS EXCLUSIVE MODE;]);
+my $create_sequence_writer = $node->background_psql('dbbranch_create_sequence_drain_source', on_error_stop => 1);
+$create_sequence_writer->query_until(
+	qr/start_create_sequence_drain_sequence/,
+	q(\echo start_create_sequence_drain_sequence
+CREATE SEQUENCE dbbranch_created_sequence CACHE 1;
+\echo finish_create_sequence_drain_sequence
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_create_sequence_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE SEQUENCE dbbranch_created_sequence%';
+]), 'active source create sequence waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_create_sequence_drain_target FROM DATABASE dbbranch_create_sequence_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create sequence');
+like($stderr, qr/source database "dbbranch_create_sequence_drain_source" has active write transactions/,
+	'active source create sequence holds db branch writer gate');
+
+$create_sequence_locker->query_safe(q[COMMIT;]);
+$create_sequence_locker->quit;
+$create_sequence_writer->query_until(qr/finish_create_sequence_drain_sequence/, '');
+$create_sequence_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_create_sequence_drain_target FROM DATABASE dbbranch_create_sequence_drain_source]);
+my $created_sequence_exists = $node->safe_psql(
+	'dbbranch_create_sequence_drain_target',
+	q[SELECT count(*) FROM pg_class WHERE relkind = 'S' AND relname = 'dbbranch_created_sequence';]);
+is($created_sequence_exists, '1', 'branch succeeds after source create sequence drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_sequence_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_sequence_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_sequence_drain_source;]);
 $node->safe_psql(
 	'dbbranch_sequence_drain_source',
