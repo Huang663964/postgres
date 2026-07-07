@@ -1683,6 +1683,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateRangeStmt: /* CREATE TYPE AS RANGE */
+				LockDBBranchUtilityWriteGate();
 				address = DefineRange(pstate, (CreateRangeStmt *) parsetree);
 				break;
 

@@ -670,6 +670,56 @@ is($composite_type_exists, '1', 'branch succeeds after source create composite t
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_composite_type_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_composite_type_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_range_type_drain_source;]);
+$node->safe_psql('dbbranch_range_type_drain_source', q[CHECKPOINT;]);
+
+my $range_type_locker = $node->background_psql('dbbranch_range_type_drain_source', on_error_stop => 1);
+$range_type_locker->query_safe(q[BEGIN; LOCK TABLE pg_type IN ACCESS EXCLUSIVE MODE;]);
+my $range_type_writer = $node->background_psql('dbbranch_range_type_drain_source', on_error_stop => 1);
+$range_type_writer->query_until(
+	qr/start_range_type_drain_type/,
+	q(\echo start_range_type_drain_type
+CREATE TYPE dbbranch_int4_range AS RANGE (subtype = int4);
+\echo finish_range_type_drain_type
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_range_type_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE TYPE dbbranch_int4_range%';
+]), 'active source create range type waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_range_type_drain_target FROM DATABASE dbbranch_range_type_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create range type');
+like($stderr, qr/source database "dbbranch_range_type_drain_source" has active write transactions/,
+	'active source create range type holds db branch writer gate');
+
+$range_type_locker->query_safe(q[COMMIT;]);
+$range_type_locker->quit;
+$range_type_writer->query_until(qr/finish_range_type_drain_type/, '');
+$range_type_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_range_type_drain_target FROM DATABASE dbbranch_range_type_drain_source]);
+my $range_type_exists = $node->safe_psql(
+	'dbbranch_range_type_drain_target',
+	q[
+SELECT count(*)
+FROM pg_range r
+JOIN pg_type t ON t.oid = r.rngtypid
+WHERE t.typname = 'dbbranch_int4_range';
+]);
+is($range_type_exists, '1', 'branch succeeds after source create range type drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_range_type_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_range_type_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_define_drain_source;]);
 $node->safe_psql('dbbranch_define_drain_source', q[CHECKPOINT;]);
 
