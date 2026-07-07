@@ -213,6 +213,7 @@ static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
+static void LockDBBranchTargetWriteGate(Oid dboid);
 static bool LockDBBranchSourceWriteGate(Oid source_dboid, int *npreparedxacts);
 static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
 									  Oid tablespace_oid);
@@ -2159,6 +2160,8 @@ movedb(const char *dbname, const char *tblspcname)
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cannot change the tablespace of the currently open database")));
 
+	LockDBBranchTargetWriteGate(db_id);
+
 	/*
 	 * Get tablespace's oid
 	 */
@@ -2590,6 +2593,8 @@ AlterDatabase(ParseState *pstate, AlterDatabaseStmt *stmt, bool isTopLevel)
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   stmt->dbname);
 
+	LockDBBranchTargetWriteGate(dboid);
+
 	/*
 	 * In order to avoid getting locked out and having to go through
 	 * standalone mode, we refuse to disallow connections to the database
@@ -2673,6 +2678,8 @@ AlterDatabaseRefreshColl(AlterDatabaseRefreshCollStmt *stmt)
 	if (!object_ownercheck(DatabaseRelationId, db_id, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   stmt->dbname);
+
+	LockDBBranchTargetWriteGate(db_id);
 	LockTuple(rel, &tuple->t_self, InplaceUpdateTupleLock);
 
 	datum = heap_getattr(tuple, Anum_pg_database_datcollversion, RelationGetDescr(rel), &isnull);
@@ -2750,6 +2757,8 @@ AlterDatabaseSet(AlterDatabaseSetStmt *stmt)
 	if (!object_ownercheck(DatabaseRelationId, datid, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 					   stmt->dbname);
+
+	LockDBBranchTargetWriteGate(datid);
 
 	AlterSetting(datid, InvalidOid, stmt->setstmt);
 
@@ -2830,6 +2839,8 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to change owner of database")));
+
+		LockDBBranchTargetWriteGate(db_id);
 
 		LockTuple(rel, &tuple->t_self, InplaceUpdateTupleLock);
 
@@ -3636,6 +3647,16 @@ ReleaseDBBranchWalPin(void)
 {
 	if (MyReplicationSlot != NULL)
 		ReplicationSlotDropAcquired();
+}
+
+static void
+LockDBBranchTargetWriteGate(Oid dboid)
+{
+	if (!OidIsValid(dboid) || IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: database commands often run from postgres, not the target DB. */
+	LockSharedObject(DbBranchRelationId, dboid, 0, RowExclusiveLock);
 }
 
 static bool

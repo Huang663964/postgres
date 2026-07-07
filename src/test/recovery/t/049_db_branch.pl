@@ -4844,7 +4844,7 @@ $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_database_drain_sou
 $node->safe_psql('dbbranch_alter_database_drain_source', q[CHECKPOINT;]);
 
 my $alter_database_set_writer =
-  $node->background_psql('dbbranch_alter_database_drain_source', on_error_stop => 1);
+  $node->background_psql('postgres', on_error_stop => 1);
 $alter_database_set_writer->query_safe(
 	q[BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source SET work_mem = '65MB';]);
 
@@ -4872,7 +4872,7 @@ is($alter_database_work_mem, '65MB',
 	'source alter database set finishes after db branch rejects');
 
 my $alter_database_writer =
-  $node->background_psql('dbbranch_alter_database_drain_source', on_error_stop => 1);
+  $node->background_psql('postgres', on_error_stop => 1);
 $alter_database_writer->query_safe(
 	q[BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source CONNECTION LIMIT 8;]);
 

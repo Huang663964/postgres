@@ -811,19 +811,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_AlterDatabaseStmt:
 			/* no event triggers for global objects */
-			LockDBBranchUtilityWriteGate();
 			AlterDatabase(pstate, (AlterDatabaseStmt *) parsetree, isTopLevel);
 			break;
 
 		case T_AlterDatabaseRefreshCollStmt:
 			/* no event triggers for global objects */
-			LockDBBranchUtilityWriteGate();
 			AlterDatabaseRefreshColl((AlterDatabaseRefreshCollStmt *) parsetree);
 			break;
 
 		case T_AlterDatabaseSetStmt:
 			/* no event triggers for global objects */
-			LockDBBranchUtilityWriteGate();
 			AlterDatabaseSet((AlterDatabaseSetStmt *) parsetree);
 			break;
 
