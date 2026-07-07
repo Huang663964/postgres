@@ -1710,6 +1710,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterSeqStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterSequence(pstate, (AlterSeqStmt *) parsetree);
 				break;
 
