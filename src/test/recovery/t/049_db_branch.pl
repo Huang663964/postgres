@@ -580,6 +580,57 @@ WHERE datname = 'dbbranch_truncate_drain_source'
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_truncate_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_truncate_drain_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_alter_drain_source',
+		q[
+CREATE TABLE alter_rows (id int PRIMARY KEY, note text);
+INSERT INTO alter_rows SELECT g, repeat('x', 100) FROM generate_series(1, 25) g;
+CHECKPOINT;
+]);
+
+	my $alter_locker = $node->background_psql('dbbranch_alter_drain_source', on_error_stop => 1);
+	$alter_locker->query_safe(q[BEGIN; LOCK TABLE alter_rows IN ACCESS SHARE MODE;]);
+	my $alter_writer = $node->background_psql('dbbranch_alter_drain_source', on_error_stop => 1);
+	$alter_writer->query_until(
+		qr/start_alter_drain_alter/,
+		q(\echo start_alter_drain_alter
+ALTER TABLE alter_rows ADD COLUMN added text;
+\echo finish_alter_drain_alter
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER TABLE%';
+]), 'active source alter table waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_alter_drain_target FROM DATABASE dbbranch_alter_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source alter table');
+	like($stderr, qr/source database "dbbranch_alter_drain_source" has active write transactions/,
+		'active source alter table holds db branch writer gate');
+
+	$alter_locker->query_safe(q[COMMIT;]);
+	$alter_locker->quit;
+	$alter_writer->query_until(qr/finish_alter_drain_alter/, '');
+	$alter_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_alter_drain_target FROM DATABASE dbbranch_alter_drain_source]);
+	my $alter_column_count = $node->safe_psql(
+		'dbbranch_alter_drain_target',
+		q[SELECT count(*) FROM information_schema.columns WHERE table_name = 'alter_rows' AND column_name = 'added';]);
+	is($alter_column_count, '1', 'branch succeeds after source alter table drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_fail_source;]);
 	$node->safe_psql(
 		'dbbranch_clone_fail_source',

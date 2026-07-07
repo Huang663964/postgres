@@ -369,7 +369,7 @@ typedef enum addFkConstraintSides
 static void truncate_check_rel(Oid relid, Form_pg_class reltuple);
 static void truncate_check_perms(Oid relid, Form_pg_class reltuple);
 static void truncate_check_activity(Relation rel);
-static void LockDBBranchTruncateWriteGate(void);
+static void LockDBBranchTableWriteGate(void);
 static void RangeVarCallbackForTruncate(const RangeVar *relation,
 										Oid relId, Oid oldRelId, void *arg);
 static List *MergeAttributes(List *columns, const List *supers, char relpersistence,
@@ -1860,12 +1860,12 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
  * are truncated and reindexed.
  */
 static void
-LockDBBranchTruncateWriteGate(void)
+LockDBBranchTableWriteGate(void)
 {
 	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
 		return;
 
-	/* ponytail: TRUNCATE creates new storage before assigning an XID. */
+	/* ponytail: table DDL can wait on relation locks before assigning an XID. */
 	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
 }
 
@@ -1877,7 +1877,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 	List	   *relids_logged = NIL;
 	ListCell   *cell;
 
-	LockDBBranchTruncateWriteGate();
+	LockDBBranchTableWriteGate();
 
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations
@@ -4488,6 +4488,8 @@ CheckAlterTableIsSafe(Relation rel)
 Oid
 AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode)
 {
+	LockDBBranchTableWriteGate();
+
 	return RangeVarGetRelidExtended(stmt->relation, lockmode,
 									stmt->missing_ok ? RVR_MISSING_OK : 0,
 									RangeVarCallbackForAlterRelation,
@@ -4578,6 +4580,8 @@ AlterTableInternal(Oid relid, List *cmds, bool recurse)
 {
 	Relation	rel;
 	LOCKMODE	lockmode = AlterTableGetLockLevel(cmds);
+
+	LockDBBranchTableWriteGate();
 
 	rel = relation_open(relid, lockmode);
 
@@ -17009,6 +17013,8 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 	Oid			orig_tablespaceoid;
 	Oid			new_tablespaceoid;
 	List	   *role_oids = roleSpecsToIds(stmt->roles);
+
+	LockDBBranchTableWriteGate();
 
 	/* Ensure we were not asked to move something we can't */
 	if (stmt->objtype != OBJECT_TABLE && stmt->objtype != OBJECT_INDEX &&
