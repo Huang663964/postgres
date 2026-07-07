@@ -1671,6 +1671,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				{
 					CompositeTypeStmt *stmt = (CompositeTypeStmt *) parsetree;
 
+					LockDBBranchUtilityWriteGate();
 					address = DefineCompositeType(stmt->typevar,
 												  stmt->coldeflist);
 				}

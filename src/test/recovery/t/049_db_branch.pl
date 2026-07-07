@@ -625,6 +625,51 @@ is($enum_label_count, '2', 'branch succeeds after source create enum drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_enum_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_enum_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_composite_type_drain_source;]);
+$node->safe_psql('dbbranch_composite_type_drain_source', q[CHECKPOINT;]);
+
+my $composite_type_locker = $node->background_psql('dbbranch_composite_type_drain_source', on_error_stop => 1);
+$composite_type_locker->query_safe(q[BEGIN; LOCK TABLE pg_type IN ACCESS EXCLUSIVE MODE;]);
+my $composite_type_writer = $node->background_psql('dbbranch_composite_type_drain_source', on_error_stop => 1);
+$composite_type_writer->query_until(
+	qr/start_composite_type_drain_type/,
+	q(\echo start_composite_type_drain_type
+CREATE TYPE dbbranch_composite_type AS (id int, label text);
+\echo finish_composite_type_drain_type
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_composite_type_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE TYPE dbbranch_composite_type%';
+]), 'active source create composite type waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_composite_type_drain_target FROM DATABASE dbbranch_composite_type_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create composite type');
+like($stderr, qr/source database "dbbranch_composite_type_drain_source" has active write transactions/,
+	'active source create composite type holds db branch writer gate');
+
+$composite_type_locker->query_safe(q[COMMIT;]);
+$composite_type_locker->quit;
+$composite_type_writer->query_until(qr/finish_composite_type_drain_type/, '');
+$composite_type_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_composite_type_drain_target FROM DATABASE dbbranch_composite_type_drain_source]);
+my $composite_type_exists = $node->safe_psql(
+	'dbbranch_composite_type_drain_target',
+	q[SELECT count(*) FROM pg_type WHERE typname = 'dbbranch_composite_type';]);
+is($composite_type_exists, '1', 'branch succeeds after source create composite type drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_composite_type_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_composite_type_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_define_drain_source;]);
 $node->safe_psql('dbbranch_define_drain_source', q[CHECKPOINT;]);
 
