@@ -23,6 +23,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_opclass.h"
 #include "commands/cluster.h"
 #include "commands/matview.h"
@@ -66,8 +67,19 @@ static void refresh_by_match_merge(Oid matviewOid, Oid tempOid, Oid relowner,
 								   int save_sec_context);
 static void refresh_by_heap_swap(Oid matviewOid, Oid OIDNewHeap, char relpersistence);
 static bool is_usable_unique_index(Relation indexRel);
+static void LockDBBranchMatViewWriteGate(void);
 static void OpenMatViewIncrementalMaintenance(void);
 static void CloseMatViewIncrementalMaintenance(void);
+
+static void
+LockDBBranchMatViewWriteGate(void)
+{
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: REFRESH can wait on relation locks before assigning an XID. */
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+}
 
 /*
  * SetMatViewPopulatedState
@@ -126,6 +138,7 @@ ExecRefreshMatView(RefreshMatViewStmt *stmt, const char *queryString,
 
 	/* Determine strength of lock needed. */
 	lockmode = stmt->concurrent ? ExclusiveLock : AccessExclusiveLock;
+	LockDBBranchMatViewWriteGate();
 
 	/*
 	 * Get a lock until end of transaction.

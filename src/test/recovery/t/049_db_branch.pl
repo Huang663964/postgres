@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 132
+	skip 'Injection points not supported by this build', 136
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -377,6 +377,60 @@ WHERE datname = 'dbbranch_create_drain_source'
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-clone');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_refresh_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_refresh_drain_source',
+		q[
+CREATE TABLE refresh_rows (id int PRIMARY KEY, note text);
+INSERT INTO refresh_rows VALUES (1, 'old');
+CREATE MATERIALIZED VIEW refresh_mv AS SELECT * FROM refresh_rows;
+INSERT INTO refresh_rows VALUES (2, 'new');
+CHECKPOINT;
+]);
+
+	my $refresh_locker = $node->background_psql('dbbranch_refresh_drain_source', on_error_stop => 1);
+	$refresh_locker->query_safe(q[BEGIN; SELECT count(*) FROM refresh_mv;]);
+	my $refresh_writer = $node->background_psql('dbbranch_refresh_drain_source', on_error_stop => 1);
+	$refresh_writer->query_until(
+		qr/start_refresh_drain_refresh/,
+		q(\echo start_refresh_drain_refresh
+REFRESH MATERIALIZED VIEW refresh_mv;
+\echo finish_refresh_drain_refresh
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_refresh_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'REFRESH MATERIALIZED VIEW%';
+]), 'active source refresh materialized view waits on source matview lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_refresh_drain_target FROM DATABASE dbbranch_refresh_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source refresh materialized view');
+	like($stderr, qr/source database "dbbranch_refresh_drain_source" has active write transactions/,
+		'active source refresh materialized view holds db branch writer gate');
+
+	$refresh_locker->query_safe(q[COMMIT;]);
+	$refresh_locker->quit;
+	$refresh_writer->query_until(qr/finish_refresh_drain_refresh/, '');
+	$refresh_writer->quit;
+	$node->safe_psql('dbbranch_refresh_drain_source', q[CHECKPOINT;]);
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_refresh_drain_target FROM DATABASE dbbranch_refresh_drain_source]);
+	my $refresh_rows = $node->safe_psql(
+		'dbbranch_refresh_drain_target',
+		q[SELECT count(*) FROM refresh_mv;]);
+	is($refresh_rows, '2', 'branch succeeds after source refresh materialized view drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_refresh_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_refresh_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drain_source;]);
 	$node->safe_psql(

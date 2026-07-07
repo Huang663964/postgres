@@ -40,7 +40,7 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
    table DDL such as <command>CREATE TABLE</command>,
    <command>ALTER TABLE</command>, <command>CREATE INDEX</command>,
    <command>DROP TABLE</command>, and <command>TRUNCATE</command>, and
-   maintenance writes such as
+   maintenance writes such as <command>REFRESH MATERIALIZED VIEW</command>,
    <command>VACUUM</command>, <command>CLUSTER</command>, and
    <command>REINDEX</command> to drain, pins WAL, and clones the source
    storage.  Existing idle or read-only sessions can stay connected.  WAL
