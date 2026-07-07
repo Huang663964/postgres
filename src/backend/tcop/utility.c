@@ -22,6 +22,7 @@
 #include "access/xlog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
 #include "commands/alter.h"
@@ -61,6 +62,7 @@
 #include "postmaster/bgwriter.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
+#include "storage/lmgr.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
@@ -80,6 +82,17 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+static void LockDBBranchUtilityWriteGate(void);
+
+static void
+LockDBBranchUtilityWriteGate(void)
+{
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: utility DDL can wait on relation locks before assigning an XID. */
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+}
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -1486,6 +1499,7 @@ ProcessUtilitySlow(ParseState *pstate,
 					 */
 					lockmode = stmt->concurrent ? ShareUpdateExclusiveLock
 						: ShareLock;
+					LockDBBranchUtilityWriteGate();
 					relid =
 						RangeVarGetRelidExtended(stmt->relation, lockmode,
 												 0,
@@ -2018,6 +2032,7 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 		case OBJECT_VIEW:
 		case OBJECT_MATVIEW:
 		case OBJECT_FOREIGN_TABLE:
+			LockDBBranchUtilityWriteGate();
 			RemoveRelations(stmt);
 			break;
 		default:

@@ -37,7 +37,8 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
 
   <para>
    The source database is locked while PostgreSQL waits briefly for existing
-   table DDL such as <command>ALTER TABLE</command> and
+   table DDL such as <command>ALTER TABLE</command>,
+   <command>CREATE INDEX</command>, <command>DROP TABLE</command>, and
    <command>TRUNCATE</command>, and maintenance writes such as
    <command>VACUUM</command>, <command>CLUSTER</command>, and
    <command>REINDEX</command> to drain, pins WAL, and clones the source

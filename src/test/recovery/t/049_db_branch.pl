@@ -631,6 +631,108 @@ WHERE datname = 'dbbranch_alter_drain_source'
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_drain_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_index_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_index_drain_source',
+		q[
+CREATE TABLE index_rows (id int PRIMARY KEY, note text);
+INSERT INTO index_rows SELECT g, repeat('x', 100) FROM generate_series(1, 25) g;
+CHECKPOINT;
+]);
+
+	my $index_locker = $node->background_psql('dbbranch_index_drain_source', on_error_stop => 1);
+	$index_locker->query_safe(q[BEGIN; LOCK TABLE index_rows IN ROW EXCLUSIVE MODE;]);
+	my $index_writer = $node->background_psql('dbbranch_index_drain_source', on_error_stop => 1);
+	$index_writer->query_until(
+		qr/start_index_drain_index/,
+		q(\echo start_index_drain_index
+CREATE INDEX index_rows_note_idx ON index_rows (note);
+\echo finish_index_drain_index
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_index_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE INDEX%';
+]), 'active source create index waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_index_drain_target FROM DATABASE dbbranch_index_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source create index');
+	like($stderr, qr/source database "dbbranch_index_drain_source" has active write transactions/,
+		'active source create index holds db branch writer gate');
+
+	$index_locker->query_safe(q[COMMIT;]);
+	$index_locker->quit;
+	$index_writer->query_until(qr/finish_index_drain_index/, '');
+	$index_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_index_drain_target FROM DATABASE dbbranch_index_drain_source]);
+	my $index_exists = $node->safe_psql(
+		'dbbranch_index_drain_target',
+		q[SELECT to_regclass('public.index_rows_note_idx') IS NOT NULL;]);
+	is($index_exists, 't', 'branch succeeds after source create index drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_index_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_index_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drop_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_drop_drain_source',
+		q[
+CREATE TABLE drop_rows (id int PRIMARY KEY, note text);
+INSERT INTO drop_rows SELECT g, repeat('x', 100) FROM generate_series(1, 25) g;
+CHECKPOINT;
+]);
+
+	my $drop_locker = $node->background_psql('dbbranch_drop_drain_source', on_error_stop => 1);
+	$drop_locker->query_safe(q[BEGIN; LOCK TABLE drop_rows IN ACCESS SHARE MODE;]);
+	my $drop_writer = $node->background_psql('dbbranch_drop_drain_source', on_error_stop => 1);
+	$drop_writer->query_until(
+		qr/start_drop_drain_drop/,
+		q(\echo start_drop_drain_drop
+DROP TABLE drop_rows;
+\echo finish_drop_drain_drop
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_drop_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'DROP TABLE%';
+]), 'active source drop table waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_drop_drain_target FROM DATABASE dbbranch_drop_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source drop table');
+	like($stderr, qr/source database "dbbranch_drop_drain_source" has active write transactions/,
+		'active source drop table holds db branch writer gate');
+
+	$drop_locker->query_safe(q[COMMIT;]);
+	$drop_locker->quit;
+	$drop_writer->query_until(qr/finish_drop_drain_drop/, '');
+	$drop_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_drop_drain_target FROM DATABASE dbbranch_drop_drain_source]);
+	my $drop_table_missing = $node->safe_psql(
+		'dbbranch_drop_drain_target',
+		q[SELECT to_regclass('public.drop_rows') IS NULL;]);
+	is($drop_table_missing, 't', 'branch succeeds after source drop table drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_fail_source;]);
 	$node->safe_psql(
 		'dbbranch_clone_fail_source',
