@@ -1810,6 +1810,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterOpFamilyStmt:
+				LockDBBranchUtilityWriteGate();
 				AlterOpFamily((AlterOpFamilyStmt *) parsetree);
 				/* commands are stashed in AlterOpFamily */
 				commandCollected = true;

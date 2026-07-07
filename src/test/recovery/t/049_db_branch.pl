@@ -1384,6 +1384,61 @@ is($opfamily_count, '1', 'branch succeeds after source create operator family dr
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_opfamily_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_opfamily_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_opfamily_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_opfamily_drain_source',
+	q[
+CREATE OPERATOR FAMILY dbbranch_alter_opfamily USING btree;
+CHECKPOINT;
+]);
+
+my $alter_opfamily_writer = $node->background_psql('dbbranch_alter_opfamily_drain_source', on_error_stop => 1);
+my $alter_opfamily_locker = $node->background_psql('dbbranch_alter_opfamily_drain_source', on_error_stop => 1);
+$alter_opfamily_locker->query_safe(q[BEGIN; LOCK TABLE pg_amop IN ACCESS EXCLUSIVE MODE;]);
+$alter_opfamily_writer->query_until(
+	qr/start_alter_opfamily_drain_opfamily/,
+	q(\echo start_alter_opfamily_drain_opfamily
+ALTER OPERATOR FAMILY dbbranch_alter_opfamily USING btree ADD OPERATOR 1 < (int4, int4);
+\echo finish_alter_opfamily_drain_opfamily
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_opfamily_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER OPERATOR FAMILY dbbranch_alter_opfamily%';
+]), 'active source alter operator family waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_opfamily_drain_target FROM DATABASE dbbranch_alter_opfamily_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter operator family');
+like($stderr, qr/source database "dbbranch_alter_opfamily_drain_source" has active write transactions/,
+	'active source alter operator family holds db branch writer gate');
+
+$alter_opfamily_locker->query_safe(q[COMMIT;]);
+$alter_opfamily_locker->quit;
+$alter_opfamily_writer->query_until(qr/finish_alter_opfamily_drain_opfamily/, '');
+$alter_opfamily_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_opfamily_drain_target FROM DATABASE dbbranch_alter_opfamily_drain_source]);
+my $opfamily_operator_count = $node->safe_psql(
+	'dbbranch_alter_opfamily_drain_target',
+	q[
+SELECT count(*)
+FROM pg_amop ao
+JOIN pg_opfamily ofam ON ofam.oid = ao.amopfamily
+WHERE ofam.opfname = 'dbbranch_alter_opfamily';
+]);
+is($opfamily_operator_count, '1', 'branch succeeds after source alter operator family drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_opfamily_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_opfamily_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_tsdict_drain_source;]);
 $node->safe_psql(
 	'dbbranch_tsdict_drain_source',
