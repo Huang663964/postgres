@@ -2133,6 +2133,7 @@ static void
 movedb(const char *dbname, const char *tblspcname)
 {
 	Oid			db_id;
+	Oid			locked_db_id;
 	Relation	pgdbrel;
 	int			notherbackends;
 	int			npreparedxacts;
@@ -2155,13 +2156,22 @@ movedb(const char *dbname, const char *tblspcname)
 	 * we are moving it, and that no one is using it as a CREATE DATABASE
 	 * template or trying to delete it.
 	 */
+	db_id = get_database_oid(dbname, false);
+	LockDBBranchTargetWriteGate(db_id);
+	INJECTION_POINT("db-branch-move-database-target-gate", NULL);
+
 	pgdbrel = table_open(DatabaseRelationId, RowExclusiveLock);
 
-	if (!get_db_info(dbname, AccessExclusiveLock, &db_id, NULL, NULL, NULL,
+	if (!get_db_info(dbname, AccessExclusiveLock, &locked_db_id, NULL, NULL, NULL,
 					 NULL, NULL, NULL, NULL, NULL, &src_tblspcoid, NULL, NULL, NULL, NULL, NULL, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("database \"%s\" does not exist", dbname)));
+	if (locked_db_id != db_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_DATABASE),
+				 errmsg("database \"%s\" changed while moving",
+						dbname)));
 
 	/*
 	 * We actually need a session lock, so that the lock will persist across
@@ -2186,8 +2196,6 @@ movedb(const char *dbname, const char *tblspcname)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("cannot change the tablespace of the currently open database")));
-
-	LockDBBranchTargetWriteGate(db_id);
 
 	/*
 	 * Get tablespace's oid

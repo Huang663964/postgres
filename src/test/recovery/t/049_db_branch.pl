@@ -3046,7 +3046,7 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_copy_drain_source;]);
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 155
+	skip 'Injection points not supported by this build', 159
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -3166,6 +3166,52 @@ DROP DATABASE dbbranch_dropdb_source_drain_source;
 		'source database drop finishes after db branch rejects');
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_detach('db-branch-drop-database-target-gate');]);
+
+	my $movedb_dir = $node->basedir . '/dbbranch_movedb_ts';
+	mkdir($movedb_dir) or die "could not create $movedb_dir: $!";
+	$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_movedb_ts LOCATION '$movedb_dir';");
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_movedb_drain_source;]);
+	$node->safe_psql('dbbranch_movedb_drain_source', q[CHECKPOINT;]);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-move-database-target-gate', 'wait');]);
+	my $movedb_writer =
+	  $node->background_psql('postgres', on_error_stop => 1);
+	$movedb_writer->query_until(
+		qr/start_movedb_drain_movedb/,
+		q(\echo start_movedb_drain_movedb
+ALTER DATABASE dbbranch_movedb_drain_source SET TABLESPACE dbbranch_movedb_ts;
+\echo finish_movedb_drain_movedb
+));
+	$node->wait_for_event('client backend', 'db-branch-move-database-target-gate');
+
+	my @movedb_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_movedb_drain_target FROM DATABASE dbbranch_movedb_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source database tablespace move');
+	like($stderr, qr/source database "dbbranch_movedb_drain_source" has active write transactions/,
+		'active source database tablespace move holds db branch writer gate');
+
+	my @movedb_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @movedb_metadata_files, scalar(@movedb_metadata_before) + 1,
+		'active source database tablespace move writes separate metadata file');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('db-branch-move-database-target-gate');]);
+	$movedb_writer->query_until(qr/finish_movedb_drain_movedb/, '');
+	$movedb_writer->quit;
+	my $movedb_tablespace = $node->safe_psql(
+		'postgres',
+		q[SELECT spcname FROM pg_database d JOIN pg_tablespace t ON t.oid = d.dattablespace WHERE datname = 'dbbranch_movedb_drain_source';]);
+	is($movedb_tablespace, 'dbbranch_movedb_ts',
+		'source database tablespace move finishes after db branch rejects');
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_detach('db-branch-move-database-target-gate');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_movedb_drain_source;]);
+	$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_movedb_ts;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_tspc_drain_source;]);
 	$node->safe_psql('dbbranch_create_tspc_drain_source', q[CHECKPOINT;]);
