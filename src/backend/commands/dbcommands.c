@@ -2005,6 +2005,7 @@ ObjectAddress
 RenameDatabase(const char *oldname, const char *newname)
 {
 	Oid			db_id;
+	Oid			locked_db_id;
 	HeapTuple	newtup;
 	ItemPointerData otid;
 	Relation	rel;
@@ -2016,13 +2017,21 @@ RenameDatabase(const char *oldname, const char *newname)
 	 * Look up the target database's OID, and get exclusive lock on it. We
 	 * need this for the same reasons as DROP DATABASE.
 	 */
+	db_id = get_database_oid(oldname, false);
+	LockDBBranchTargetWriteGate(db_id);
+
 	rel = table_open(DatabaseRelationId, RowExclusiveLock);
 
-	if (!get_db_info(oldname, AccessExclusiveLock, &db_id, NULL, NULL, NULL,
+	if (!get_db_info(oldname, AccessExclusiveLock, &locked_db_id, NULL, NULL, NULL,
 					 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("database \"%s\" does not exist", oldname)));
+	if (locked_db_id != db_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_DATABASE),
+				 errmsg("database \"%s\" changed while renaming",
+						oldname)));
 
 	/* must be owner */
 	if (!object_ownercheck(DatabaseRelationId, db_id, GetUserId()))

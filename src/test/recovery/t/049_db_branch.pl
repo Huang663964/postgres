@@ -4907,6 +4907,45 @@ ALTER DATABASE dbbranch_alter_database_drain_source CONNECTION LIMIT -1;
 DROP DATABASE dbbranch_alter_database_drain_source;
 ]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_database_rename_drain_source;]);
+$node->safe_psql('dbbranch_database_rename_drain_source', q[CHECKPOINT;]);
+
+my $database_rename_writer =
+  $node->background_psql('postgres', on_error_stop => 1);
+$database_rename_writer->query_safe(
+	q[BEGIN; ALTER DATABASE dbbranch_database_rename_drain_source RENAME TO dbbranch_database_rename_drain_source_renamed;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_database_rename_drain_target FROM DATABASE dbbranch_database_rename_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source database rename');
+like($stderr, qr/source database "dbbranch_database_rename_drain_source" has active write transactions/,
+	'active source database rename holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source database rename writes separate metadata file');
+
+$database_rename_writer->query_safe(q[COMMIT;]);
+$database_rename_writer->quit;
+
+my $database_rename_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_database_rename_drain_source_renamed';]);
+is($database_rename_applied, '1',
+	'source database rename finishes after db branch rejects');
+
+$node->safe_psql(
+	'postgres',
+	q[
+ALTER DATABASE dbbranch_database_rename_drain_source_renamed
+	RENAME TO dbbranch_database_rename_drain_source;
+DROP DATABASE dbbranch_database_rename_drain_source;
+]);
+
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_database_grant_drain_role LOGIN;');
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_database_grant_drain_source;]);
 $node->safe_psql('dbbranch_database_grant_drain_source', q[CHECKPOINT;]);
