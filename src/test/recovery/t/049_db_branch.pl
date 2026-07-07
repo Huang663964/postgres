@@ -332,6 +332,52 @@ my $trigger_exists = $node->safe_psql(
 is($trigger_exists, '1', 'source create trigger finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_trigger_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_rule_drain_source;]);
+$node->safe_psql(
+	'dbbranch_rule_drain_source',
+	q[
+CREATE TABLE rule_rows (id int PRIMARY KEY);
+INSERT INTO rule_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $rule_locker = $node->background_psql('dbbranch_rule_drain_source', on_error_stop => 1);
+$rule_locker->query_safe(q[BEGIN; LOCK TABLE rule_rows IN ACCESS SHARE MODE;]);
+my $rule_writer = $node->background_psql('dbbranch_rule_drain_source', on_error_stop => 1);
+$rule_writer->query_until(
+	qr/start_rule_drain_rule/,
+	q(\echo start_rule_drain_rule
+CREATE RULE rule_rows_insert_ignore AS ON INSERT TO rule_rows DO INSTEAD NOTHING;
+\echo finish_rule_drain_rule
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_rule_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE RULE rule_rows_insert_ignore%';
+]), 'active source create rule waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_rule_drain_target FROM DATABASE dbbranch_rule_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create rule');
+like($stderr, qr/source database "dbbranch_rule_drain_source" has active write transactions/,
+	'active source create rule holds db branch writer gate');
+
+$rule_locker->query_safe(q[COMMIT;]);
+$rule_locker->quit;
+$rule_writer->query_until(qr/finish_rule_drain_rule/, '');
+$rule_writer->quit;
+
+my $rule_exists = $node->safe_psql(
+	'dbbranch_rule_drain_source',
+	q[SELECT count(*) FROM pg_rewrite WHERE rulename = 'rule_rows_insert_ignore';]);
+is($rule_exists, '1', 'source create rule finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rule_drain_source;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136

@@ -1688,6 +1688,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_RuleStmt:	/* CREATE RULE */
+				LockDBBranchUtilityWriteGate();
 				address = DefineRule((RuleStmt *) parsetree, queryString);
 				break;
 
