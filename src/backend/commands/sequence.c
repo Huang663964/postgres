@@ -29,6 +29,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_sequence.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage_xlog.h"
@@ -101,6 +102,7 @@ static void fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber fo
 static Relation lock_and_open_sequence(SeqTable seq);
 static void create_seq_hashtable(void);
 static void init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel);
+static void LockDBBranchSequenceWriteGate(Relation seqrel);
 static Form_pg_sequence_data read_seq_tuple(Relation rel,
 											Buffer *buf, HeapTuple seqdatatuple);
 static void init_params(ParseState *pstate, List *options, bool for_identity,
@@ -111,6 +113,17 @@ static void init_params(ParseState *pstate, List *options, bool for_identity,
 						List **owned_by);
 static void do_setval(Oid relid, int64 next, bool iscalled);
 static void process_owned_by(Relation seqrel, List *owned_by, bool for_identity);
+
+static void
+LockDBBranchSequenceWriteGate(Relation seqrel)
+{
+	if (seqrel->rd_islocaltemp || !OidIsValid(MyDatabaseId) ||
+		IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: nextval can dirty sequence pages without assigning an XID. */
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+}
 
 
 /*
@@ -674,6 +687,8 @@ nextval_internal(Oid relid, bool check_permissions)
 		last_used_seq = elm;
 		return elm->last;
 	}
+
+	LockDBBranchSequenceWriteGate(seqrel);
 
 	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(pgstuple))

@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 97
+	skip 'Injection points not supported by this build', 99
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -271,12 +271,14 @@ SKIP:
 		'dbbranch_idle_drain_source',
 		q[
 CREATE TABLE idle_rows (id int PRIMARY KEY);
+CREATE SEQUENCE idle_seq CACHE 1;
 INSERT INTO idle_rows VALUES (1);
 CHECKPOINT;
 ]);
 
-	my $idle_reader = $node->background_psql('dbbranch_idle_drain_source', on_error_stop => 1);
+	my $idle_reader = $node->background_psql('dbbranch_idle_drain_source', on_error_stop => 0);
 	$idle_reader->query_safe(q[SELECT 1;]);
+	$idle_reader->query_safe(q[SELECT nextval('idle_seq');]);
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_attach('db-branch-before-drain', 'wait');]);
 
@@ -288,6 +290,14 @@ CREATE BRANCH dbbranch_idle_drain_target FROM DATABASE dbbranch_idle_drain_sourc
 \echo finish_idle_drain_branch
 ));
 	$node->wait_for_event('client backend', 'db-branch-before-drain');
+	my (undef, $idle_seq_ret) = $idle_reader->query(q[
+SET statement_timeout = '500ms';
+SELECT nextval('idle_seq');
+]);
+	is($idle_seq_ret, 1, 'db branch writer gate blocks existing source sequence writes');
+	like($idle_reader->{stderr}, qr/canceling statement due to statement timeout/,
+		'existing source sequence write waits on db branch writer gate');
+
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-drain');]);
 	$idle_branch->query_until(qr/finish_idle_drain_branch/, '');
 	$idle_branch->quit;
