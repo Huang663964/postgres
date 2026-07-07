@@ -2732,6 +2732,58 @@ is($drop_owned_removed, 't', 'source drop owned finishes after db branch rejects
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_owned_drain_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_drop_owned_owner;]);
 
+$node->safe_psql('postgres', q[CREATE ROLE dbbranch_reassign_owned_owner;]);
+$node->safe_psql('postgres', q[CREATE ROLE dbbranch_reassign_owned_new_owner;]);
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_reassign_owned_drain_source;]);
+$node->safe_psql(
+	'dbbranch_reassign_owned_drain_source',
+	q[
+CREATE TABLE reassign_owned_rows (id int PRIMARY KEY);
+ALTER TABLE reassign_owned_rows OWNER TO dbbranch_reassign_owned_owner;
+CHECKPOINT;
+]);
+
+my $reassign_owned_locker =
+  $node->background_psql('dbbranch_reassign_owned_drain_source', on_error_stop => 1);
+$reassign_owned_locker->query_safe(q[BEGIN; LOCK TABLE reassign_owned_rows IN ACCESS SHARE MODE;]);
+my $reassign_owned_writer =
+  $node->background_psql('dbbranch_reassign_owned_drain_source', on_error_stop => 1);
+$reassign_owned_writer->query_until(
+	qr/start_reassign_owned_drain_reassign/,
+	q(\echo start_reassign_owned_drain_reassign
+REASSIGN OWNED BY dbbranch_reassign_owned_owner TO dbbranch_reassign_owned_new_owner;
+\echo finish_reassign_owned_drain_reassign
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_reassign_owned_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'REASSIGN OWNED BY dbbranch_reassign_owned_owner%';
+]), 'active source reassign owned waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_reassign_owned_drain_target FROM DATABASE dbbranch_reassign_owned_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source reassign owned');
+like($stderr, qr/source database "dbbranch_reassign_owned_drain_source" has active write transactions/,
+	'active source reassign owned holds db branch writer gate');
+
+$reassign_owned_locker->query_safe(q[COMMIT;]);
+$reassign_owned_locker->quit;
+$reassign_owned_writer->query_until(qr/finish_reassign_owned_drain_reassign/, '');
+$reassign_owned_writer->quit;
+
+my $reassign_owned_changed = $node->safe_psql(
+	'dbbranch_reassign_owned_drain_source',
+	q[SELECT relowner = 'dbbranch_reassign_owned_new_owner'::regrole FROM pg_class WHERE relname = 'reassign_owned_rows';]);
+is($reassign_owned_changed, 't', 'source reassign owned finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reassign_owned_drain_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_reassign_owned_owner;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_reassign_owned_new_owner;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_comment_drain_source;]);
 $node->safe_psql(
 	'dbbranch_comment_drain_source',

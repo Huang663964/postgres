@@ -952,6 +952,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_ReassignOwnedStmt:
 			/* no event triggers for global objects */
+			LockDBBranchUtilityWriteGate();
 			ReassignOwnedObjects((ReassignOwnedStmt *) parsetree);
 			break;
 
