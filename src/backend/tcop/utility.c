@@ -1817,6 +1817,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterTSConfigurationStmt:
+				LockDBBranchUtilityWriteGate();
 				AlterTSConfiguration((AlterTSConfigurationStmt *) parsetree);
 
 				/*

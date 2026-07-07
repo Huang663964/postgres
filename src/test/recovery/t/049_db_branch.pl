@@ -1216,6 +1216,63 @@ is($tsdict_option, q[accept = 'false'], 'branch succeeds after source alter text
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_tsdict_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_tsdict_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_tsconfig_drain_source;]);
+$node->safe_psql(
+	'dbbranch_tsconfig_drain_source',
+	q[
+CREATE TEXT SEARCH CONFIGURATION dbbranch_tsconfig (parser = default);
+CHECKPOINT;
+]);
+
+my $tsconfig_locker = $node->background_psql('dbbranch_tsconfig_drain_source', on_error_stop => 1);
+$tsconfig_locker->query_safe(q[BEGIN; LOCK TABLE pg_ts_config_map IN ACCESS EXCLUSIVE MODE;]);
+my $tsconfig_writer = $node->background_psql('dbbranch_tsconfig_drain_source', on_error_stop => 1);
+$tsconfig_writer->query_until(
+	qr/start_tsconfig_drain_tsconfig/,
+	q(\echo start_tsconfig_drain_tsconfig
+ALTER TEXT SEARCH CONFIGURATION dbbranch_tsconfig ALTER MAPPING FOR asciiword WITH simple;
+\echo finish_tsconfig_drain_tsconfig
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_tsconfig_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER TEXT SEARCH CONFIGURATION dbbranch_tsconfig%';
+]), 'active source alter text search configuration waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_tsconfig_drain_target FROM DATABASE dbbranch_tsconfig_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter text search configuration');
+like($stderr, qr/source database "dbbranch_tsconfig_drain_source" has active write transactions/,
+	'active source alter text search configuration holds db branch writer gate');
+
+$tsconfig_locker->query_safe(q[COMMIT;]);
+$tsconfig_locker->quit;
+$tsconfig_writer->query_until(qr/finish_tsconfig_drain_tsconfig/, '');
+$tsconfig_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_tsconfig_drain_target FROM DATABASE dbbranch_tsconfig_drain_source]);
+my $tsconfig_mapping_count = $node->safe_psql(
+	'dbbranch_tsconfig_drain_target',
+	q[
+SELECT count(*)
+FROM pg_ts_config_map m
+JOIN pg_ts_config c ON c.oid = m.mapcfg
+JOIN pg_ts_dict d ON d.oid = m.mapdict
+WHERE c.cfgname = 'dbbranch_tsconfig'
+  AND d.dictname = 'simple';
+]);
+is($tsconfig_mapping_count, '1', 'branch succeeds after source alter text search configuration drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_tsconfig_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_tsconfig_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
 $node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
 
