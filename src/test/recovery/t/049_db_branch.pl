@@ -1905,6 +1905,43 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_debug_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cmdtag_source;]);
 
+my $checksum_node = PostgreSQL::Test::Cluster->new('checksum');
+$checksum_node->init(allows_streaming => 1, extra => ['--data-checksums']);
+$checksum_node->start;
+is($checksum_node->safe_psql('postgres', q[SHOW data_checksums;]),
+	'on', 'checksum test node has data checksums enabled');
+$checksum_node->safe_psql('postgres', q[CREATE DATABASE dbbranch_checksum_source;]);
+$checksum_node->safe_psql(
+	'dbbranch_checksum_source',
+	q[
+CREATE TABLE checksum_rows (id int PRIMARY KEY, payload text NOT NULL);
+INSERT INTO checksum_rows VALUES (1, repeat('a', 9000));
+CHECKPOINT;
+UPDATE checksum_rows SET payload = repeat('b', 9000) WHERE id = 1;
+INSERT INTO checksum_rows VALUES (2, repeat('c', 9000));
+]);
+
+$stderr = '';
+$result = $checksum_node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_checksum_target FROM DATABASE dbbranch_checksum_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch works with data checksums enabled');
+
+my $checksum_rows = $checksum_node->safe_psql(
+	'dbbranch_checksum_target',
+	q[
+SET enable_seqscan = off;
+SELECT string_agg(id || ':' || substr(payload, 1, 1) || ':' || length(payload), ',' ORDER BY id)
+FROM checksum_rows;
+]);
+is($checksum_rows, '1:b:9000,2:c:9000',
+	'checksum branch reads cloned and replayed indexed rows');
+
+$checksum_node->safe_psql('postgres', q[DROP DATABASE dbbranch_checksum_target;]);
+$checksum_node->safe_psql('postgres', q[DROP DATABASE dbbranch_checksum_source;]);
+$checksum_node->stop;
+
 my $minimal_node = PostgreSQL::Test::Cluster->new('minimal');
 $minimal_node->init;
 $minimal_node->append_conf('postgresql.conf', qq[
