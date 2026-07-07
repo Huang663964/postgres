@@ -1690,6 +1690,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateFunctionStmt:	/* CREATE FUNCTION */
+				LockDBBranchUtilityWriteGate();
 				address = CreateFunction(pstate, (CreateFunctionStmt *) parsetree);
 				break;
 

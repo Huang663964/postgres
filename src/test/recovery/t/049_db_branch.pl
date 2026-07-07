@@ -429,6 +429,57 @@ is($view_rows, '1', 'branch succeeds after source create view drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_view_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_view_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_function_drain_source;]);
+$node->safe_psql(
+	'dbbranch_function_drain_source',
+	q[
+CREATE TABLE function_rows (id int PRIMARY KEY);
+INSERT INTO function_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $function_locker = $node->background_psql('dbbranch_function_drain_source', on_error_stop => 1);
+$function_locker->query_safe(q[BEGIN; LOCK TABLE function_rows IN ACCESS EXCLUSIVE MODE;]);
+my $function_writer = $node->background_psql('dbbranch_function_drain_source', on_error_stop => 1);
+$function_writer->query_until(
+	qr/start_function_drain_function/,
+	q(\echo start_function_drain_function
+CREATE FUNCTION function_rows_count() RETURNS int LANGUAGE SQL RETURN (SELECT count(*)::int FROM function_rows);
+\echo finish_function_drain_function
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_function_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE FUNCTION function_rows_count%';
+]), 'active source create function waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_function_drain_target FROM DATABASE dbbranch_function_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create function');
+like($stderr, qr/source database "dbbranch_function_drain_source" has active write transactions/,
+	'active source create function holds db branch writer gate');
+
+$function_locker->query_safe(q[COMMIT;]);
+$function_locker->quit;
+$function_writer->query_until(qr/finish_function_drain_function/, '');
+$function_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_function_drain_target FROM DATABASE dbbranch_function_drain_source]);
+my $function_rows = $node->safe_psql(
+	'dbbranch_function_drain_target',
+	q[SELECT function_rows_count();]);
+is($function_rows, '1', 'branch succeeds after source create function drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',
