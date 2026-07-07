@@ -1651,6 +1651,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_DropUserMappingStmt:
+				LockDBBranchUtilityWriteGate();
 				RemoveUserMapping((DropUserMappingStmt *) parsetree);
 				/* no commands stashed for DROP */
 				commandCollected = true;

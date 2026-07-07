@@ -929,6 +929,63 @@ is($alter_mapping_options, 't', 'branch succeeds after source alter user mapping
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_mapping_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_mapping_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drop_mapping_drain_source;]);
+$node->safe_psql(
+	'dbbranch_drop_mapping_drain_source',
+	q[
+CREATE FOREIGN DATA WRAPPER dbbranch_fdw;
+CREATE SERVER dbbranch_server FOREIGN DATA WRAPPER dbbranch_fdw;
+CREATE USER MAPPING FOR CURRENT_USER SERVER dbbranch_server OPTIONS (user 'branch_user');
+CHECKPOINT;
+]);
+
+my $drop_mapping_locker = $node->background_psql('dbbranch_drop_mapping_drain_source', on_error_stop => 1);
+$drop_mapping_locker->query_safe(q[BEGIN; LOCK TABLE pg_user_mapping IN ACCESS EXCLUSIVE MODE;]);
+my $drop_mapping_writer = $node->background_psql('dbbranch_drop_mapping_drain_source', on_error_stop => 1);
+$drop_mapping_writer->query_until(
+	qr/start_drop_mapping_drain_mapping/,
+	q(\echo start_drop_mapping_drain_mapping
+DROP USER MAPPING FOR CURRENT_USER SERVER dbbranch_server;
+\echo finish_drop_mapping_drain_mapping
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_drop_mapping_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'DROP USER MAPPING%';
+]), 'active source drop user mapping waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_mapping_drain_target FROM DATABASE dbbranch_drop_mapping_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source drop user mapping');
+like($stderr, qr/source database "dbbranch_drop_mapping_drain_source" has active write transactions/,
+	'active source drop user mapping holds db branch writer gate');
+
+$drop_mapping_locker->query_safe(q[COMMIT;]);
+$drop_mapping_locker->quit;
+$drop_mapping_writer->query_until(qr/finish_drop_mapping_drain_mapping/, '');
+$drop_mapping_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_mapping_drain_target FROM DATABASE dbbranch_drop_mapping_drain_source]);
+my $drop_mapping_exists = $node->safe_psql(
+	'dbbranch_drop_mapping_drain_target',
+	q[
+SELECT count(*)
+FROM pg_user_mapping m
+JOIN pg_foreign_server s ON s.oid = m.umserver
+WHERE s.srvname = 'dbbranch_server';
+]);
+is($drop_mapping_exists, '0', 'branch succeeds after source drop user mapping drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_mapping_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_mapping_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',
