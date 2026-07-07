@@ -38,6 +38,7 @@
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_inherits.h"
@@ -368,6 +369,7 @@ typedef enum addFkConstraintSides
 static void truncate_check_rel(Oid relid, Form_pg_class reltuple);
 static void truncate_check_perms(Oid relid, Form_pg_class reltuple);
 static void truncate_check_activity(Relation rel);
+static void LockDBBranchTruncateWriteGate(void);
 static void RangeVarCallbackForTruncate(const RangeVar *relation,
 										Oid relId, Oid oldRelId, void *arg);
 static List *MergeAttributes(List *columns, const List *supers, char relpersistence,
@@ -1857,6 +1859,16 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
  * internal to the group that's being truncated.  Finally all the relations
  * are truncated and reindexed.
  */
+static void
+LockDBBranchTruncateWriteGate(void)
+{
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: TRUNCATE creates new storage before assigning an XID. */
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+}
+
 void
 ExecuteTruncate(TruncateStmt *stmt)
 {
@@ -1864,6 +1876,8 @@ ExecuteTruncate(TruncateStmt *stmt)
 	List	   *relids = NIL;
 	List	   *relids_logged = NIL;
 	ListCell   *cell;
+
+	LockDBBranchTruncateWriteGate();
 
 	/*
 	 * Open, exclusive-lock, and check all the explicitly-specified relations

@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 125
+	skip 'Injection points not supported by this build', 129
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -528,6 +528,57 @@ WHERE datname = 'dbbranch_reindex_drain_source'
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_truncate_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_truncate_drain_source',
+		q[
+CREATE TABLE truncate_rows (id int PRIMARY KEY, note text);
+INSERT INTO truncate_rows SELECT g, repeat('x', 100) FROM generate_series(1, 25) g;
+CHECKPOINT;
+]);
+
+	my $truncate_locker = $node->background_psql('dbbranch_truncate_drain_source', on_error_stop => 1);
+	$truncate_locker->query_safe(q[BEGIN; LOCK TABLE truncate_rows IN ACCESS EXCLUSIVE MODE;]);
+	my $truncate_writer = $node->background_psql('dbbranch_truncate_drain_source', on_error_stop => 1);
+	$truncate_writer->query_until(
+		qr/start_truncate_drain_truncate/,
+		q(\echo start_truncate_drain_truncate
+TRUNCATE truncate_rows;
+\echo finish_truncate_drain_truncate
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_truncate_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'TRUNCATE%';
+]), 'active source truncate waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_truncate_drain_target FROM DATABASE dbbranch_truncate_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source truncate');
+	like($stderr, qr/source database "dbbranch_truncate_drain_source" has active write transactions/,
+		'active source truncate holds db branch writer gate');
+
+	$truncate_locker->query_safe(q[COMMIT;]);
+	$truncate_locker->quit;
+	$truncate_writer->query_until(qr/finish_truncate_drain_truncate/, '');
+	$truncate_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_truncate_drain_target FROM DATABASE dbbranch_truncate_drain_source]);
+	my $truncate_rows = $node->safe_psql(
+		'dbbranch_truncate_drain_target',
+		q[SELECT count(*) FROM truncate_rows;]);
+	is($truncate_rows, '0', 'branch succeeds after source truncate drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_truncate_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_truncate_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_fail_source;]);
 	$node->safe_psql(
