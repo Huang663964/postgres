@@ -4947,6 +4947,73 @@ DROP DATABASE dbbranch_database_grant_drain_source;
 DROP ROLE dbbranch_database_grant_drain_role;
 ]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_database_comment_drain_source;]);
+$node->safe_psql('dbbranch_database_comment_drain_source', q[CHECKPOINT;]);
+
+my $database_comment_writer =
+  $node->background_psql('postgres', on_error_stop => 1);
+$database_comment_writer->query_safe(
+	q[BEGIN; COMMENT ON DATABASE dbbranch_database_comment_drain_source IS 'branch database comment';]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_database_comment_drain_target FROM DATABASE dbbranch_database_comment_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source database comment');
+like($stderr, qr/source database "dbbranch_database_comment_drain_source" has active write transactions/,
+	'active source database comment holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source database comment writes separate metadata file');
+
+$database_comment_writer->query_safe(q[COMMIT;]);
+$database_comment_writer->quit;
+
+my $database_comment_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = 'dbbranch_database_comment_drain_source';]);
+is($database_comment_applied, 'branch database comment',
+	'source database comment finishes after db branch rejects');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_database_comment_drain_source;]);
+
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_database_seclabel_drain_source;]);
+$node->safe_psql('dbbranch_database_seclabel_drain_source', q[CHECKPOINT;]);
+
+my $database_seclabel_writer =
+  $node->background_psql('postgres', on_error_stop => 1);
+$database_seclabel_writer->query_safe(q[LOAD 'dummy_seclabel';]);
+$database_seclabel_writer->query_safe(
+	q[BEGIN; SECURITY LABEL FOR 'dummy' ON DATABASE dbbranch_database_seclabel_drain_source IS 'classified';]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_database_seclabel_drain_target FROM DATABASE dbbranch_database_seclabel_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source database security label');
+like($stderr, qr/source database "dbbranch_database_seclabel_drain_source" has active write transactions/,
+	'active source database security label holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source database security label writes separate metadata file');
+
+$database_seclabel_writer->query_safe(q[COMMIT;]);
+$database_seclabel_writer->quit;
+
+my $database_seclabel_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT label FROM pg_shseclabel WHERE classoid = 'pg_database'::regclass AND objoid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_database_seclabel_drain_source') AND provider = 'dummy';]);
+is($database_seclabel_applied, 'classified',
+	'source database security label finishes after db branch rejects');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_database_seclabel_drain_source;]);
+
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_role_setting_drain_role LOGIN;');
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_role_setting_drain_source;]);
 $node->safe_psql('dbbranch_role_setting_drain_source', q[CHECKPOINT;]);

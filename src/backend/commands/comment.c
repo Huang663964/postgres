@@ -20,11 +20,13 @@
 #include "access/table.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaddress.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_description.h"
 #include "catalog/pg_shdescription.h"
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
@@ -75,6 +77,10 @@ CommentObject(CommentStmt *stmt)
 	/* Require ownership of the target object. */
 	check_object_ownership(GetUserId(), stmt->objtype, address,
 						   stmt->object, relation);
+
+	if (stmt->objtype == OBJECT_DATABASE && !IsBootstrapProcessingMode())
+		LockSharedObject(DbBranchRelationId, address.objectId, 0,
+						 RowExclusiveLock);
 
 	/* Perform other integrity checks as needed. */
 	switch (stmt->objtype)

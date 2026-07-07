@@ -3872,6 +3872,7 @@ Oid
 CreateDatabaseBranch(const char *source_name, const char *branch_name)
 {
 	Oid		source_dboid;
+	Oid		locked_source_dboid;
 	int		source_encoding;
 	bool		source_istemplate;
 	bool		source_allowconn;
@@ -3936,18 +3937,17 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 	INSTR_TIME_SET_CURRENT(source_block_start);
 
-	if (!get_db_info(source_name, ShareLock,
-					 &source_dboid, NULL, &source_encoding,
-					 &source_istemplate, &source_allowconn, &source_connlimit,
-					 &source_hasloginevt,
-					 &source_frozenxid, &source_minmxid,
-					 &source_deftablespace, &source_collate, &source_ctype,
-					 &source_locale, &source_icurules, &source_locprovider,
-					 &source_collversion))
+	if (!get_db_info(source_name, NoLock,
+					 &source_dboid, NULL, NULL,
+					 &source_istemplate, NULL, NULL,
+					 NULL,
+					 NULL, NULL,
+					 NULL, NULL, NULL,
+					 NULL, NULL, NULL,
+					 NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("source database \"%s\" does not exist", source_name)));
-	source_lock_held = true;
 
 	if (database_is_invalid_oid(source_dboid))
 		ereport(ERROR,
@@ -3959,6 +3959,74 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create database")));
+	if (!source_istemplate &&
+		!object_ownercheck(DatabaseRelationId, source_dboid, GetUserId()))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to copy database \"%s\"",
+						source_name)));
+
+	if (OidIsValid(get_database_oid(branch_name, true)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_DATABASE),
+				 errmsg("database \"%s\" already exists", branch_name)));
+
+	if (!LockDBBranchSourceWriteGate(source_dboid, &npreparedxacts))
+	{
+		const char *busy_failure =
+			(npreparedxacts > 0) ?
+			"source database has prepared transactions" :
+			"source database has active write transactions";
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
+						  "not_started",
+						  "not_started", "not_started", "not_started",
+						  NULL,
+						  source_blocking_ms, 0.0, 0.0,
+						  "CREATING,FAILED", "FAILED", busy_failure);
+		if (npreparedxacts > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("source database \"%s\" has prepared transactions",
+							source_name),
+					 errdetail_busy_db(0, npreparedxacts)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("source database \"%s\" has active write transactions",
+							source_name)));
+	}
+	source_write_gate_held = true;
+
+	if (!get_db_info(source_name, ShareLock,
+					 &locked_source_dboid, NULL, &source_encoding,
+					 &source_istemplate, &source_allowconn, &source_connlimit,
+					 &source_hasloginevt,
+					 &source_frozenxid, &source_minmxid,
+					 &source_deftablespace, &source_collate, &source_ctype,
+					 &source_locale, &source_icurules, &source_locprovider,
+					 &source_collversion))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_DATABASE),
+				 errmsg("source database \"%s\" does not exist", source_name)));
+	source_lock_held = true;
+	if (locked_source_dboid != source_dboid)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_DATABASE),
+				 errmsg("source database \"%s\" changed while creating branch",
+						source_name)));
+
+	if (database_is_invalid_oid(source_dboid))
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("cannot use invalid database \"%s\" as source", source_name),
+				errhint("Use DROP DATABASE to drop invalid databases."));
+
 	if (!source_istemplate &&
 		!object_ownercheck(DatabaseRelationId, source_dboid, GetUserId()))
 		ereport(ERROR,
@@ -4000,43 +4068,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 							 "or build PostgreSQL with the right library version.",
 							 quote_identifier(source_name))));
 	}
-
-	if (OidIsValid(get_database_oid(branch_name, true)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_DATABASE),
-				 errmsg("database \"%s\" already exists", branch_name)));
-
-	if (!LockDBBranchSourceWriteGate(source_dboid, &npreparedxacts))
-	{
-		const char *busy_failure =
-			(npreparedxacts > 0) ?
-			"source database has prepared transactions" :
-			"source database has active write transactions";
-
-		INSTR_TIME_SET_CURRENT(elapsed);
-		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
-		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
-
-		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
-						  "not_started",
-						  "not_started", "not_started", "not_started",
-						  NULL,
-						  source_blocking_ms, 0.0, 0.0,
-						  "CREATING,FAILED", "FAILED", busy_failure);
-		if (npreparedxacts > 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_IN_USE),
-					 errmsg("source database \"%s\" has prepared transactions",
-							source_name),
-					 errdetail_busy_db(0, npreparedxacts)));
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_IN_USE),
-					 errmsg("source database \"%s\" has active write transactions",
-							source_name)));
-	}
-	source_write_gate_held = true;
 
 	if ((nsubscriptions = CountDBSubscriptions(source_dboid)) > 0)
 	{

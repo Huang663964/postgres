@@ -16,10 +16,12 @@
 #include "access/table.h"
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_seclabel.h"
 #include "catalog/pg_shseclabel.h"
 #include "commands/seclabel.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/memutils.h"
@@ -171,6 +173,10 @@ ExecSecLabelStmt(SecLabelStmt *stmt)
 	/* Require ownership of the target object. */
 	check_object_ownership(GetUserId(), stmt->objtype, address,
 						   stmt->object, relation);
+
+	if (stmt->objtype == OBJECT_DATABASE && !IsBootstrapProcessingMode())
+		LockSharedObject(DbBranchRelationId, address.objectId, 0,
+						 RowExclusiveLock);
 
 	/* Perform other integrity checks as needed. */
 	switch (stmt->objtype)
