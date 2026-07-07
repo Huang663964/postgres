@@ -1646,6 +1646,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterUserMappingStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterUserMapping((AlterUserMappingStmt *) parsetree);
 				break;
 
