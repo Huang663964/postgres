@@ -206,6 +206,8 @@ static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
 								   char *failure, Size failure_len);
 static bool CloneDBBranchFile(const char *fromfile, const char *tofile,
 							  char *failure, Size failure_len);
+static bool ShouldSkipDBBranchCloneEntry(const char *name);
+static void RemoveDBBranchTempCloneFiles(const char *dbpath);
 static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
@@ -3531,6 +3533,8 @@ CloneDBBranchDirectory(const char *fromdir, const char *todir,
 		if (strcmp(xlde->d_name, ".") == 0 ||
 			strcmp(xlde->d_name, "..") == 0)
 			continue;
+		if (ShouldSkipDBBranchCloneEntry(xlde->d_name))
+			continue;
 
 		snprintf(fromfile, sizeof(fromfile), "%s/%s", fromdir, xlde->d_name);
 		snprintf(tofile, sizeof(tofile), "%s/%s", todir, xlde->d_name);
@@ -3561,6 +3565,45 @@ CloneDBBranchDirectory(const char *fromdir, const char *todir,
 	return true;
 }
 
+static bool
+ShouldSkipDBBranchCloneEntry(const char *name)
+{
+	return strncmp(name, PG_TEMP_FILE_PREFIX,
+				   strlen(PG_TEMP_FILE_PREFIX)) == 0 ||
+		looks_like_temp_rel_name(name);
+}
+
+static void
+RemoveDBBranchTempCloneFiles(const char *dbpath)
+{
+	DIR		   *xldir;
+	struct dirent *xlde;
+	char		path[MAXPGPATH * 2];
+
+	xldir = AllocateDir(dbpath);
+
+	while ((xlde = ReadDir(xldir, dbpath)) != NULL)
+	{
+		PGFileType	xlde_type;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (!ShouldSkipDBBranchCloneEntry(xlde->d_name))
+			continue;
+
+		snprintf(path, sizeof(path), "%s/%s", dbpath, xlde->d_name);
+		xlde_type = get_dirent_type(path, xlde, false, ERROR);
+		if (xlde_type == PGFILETYPE_REG && unlink(path) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove temporary clone file \"%s\": %m",
+							path)));
+	}
+	FreeDir(xldir);
+
+	if (enableFsync)
+		fsync_fname(dbpath, true);
+}
 
 static void
 MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
@@ -4101,6 +4144,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				{
 					/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
 					copydir(frompath, topath, false);
+					RemoveDBBranchTempCloneFiles(topath);
 					clone_result = "copy_fallback";
 				}
 				else

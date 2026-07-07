@@ -113,6 +113,11 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   </para>
 
   <para>
+   Temporary relation files that belong to live source sessions are not copied
+   into the branch storage.
+  </para>
+
+  <para>
    WAL replay currently supports records whose block references are local to
    the source database.  If a required WAL record also references another
    database or shared state, branch creation fails and records the failure in

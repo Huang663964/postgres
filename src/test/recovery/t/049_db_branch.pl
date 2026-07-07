@@ -30,6 +30,15 @@ my $source_rows = $node->safe_psql(
 	'SELECT count(*) FROM users;');
 is($source_rows, '3', 'source database baseline is ready for DB Branch');
 
+my $source_temp = $node->background_psql('dbbranch_source', on_error_stop => 1);
+$source_temp->query_safe(q[CREATE TEMP TABLE temp_branch_private (id int);]);
+$source_temp->query_safe(q[INSERT INTO temp_branch_private VALUES (1);]);
+my $source_temp_relpath =
+  $source_temp->query_safe(q[SELECT pg_relation_filepath('temp_branch_private');]);
+my ($source_temp_file) = $source_temp_relpath =~ m{([^/]+)$};
+ok(-e $node->data_dir . '/' . $source_temp_relpath,
+	'live source temp relation file exists before DB Branch clone');
+
 my $wal_start = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
 my $stderr = '';
 my $result = $node->psql(
@@ -114,6 +123,8 @@ if ($result == 0)
 		'postgres',
 		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_target';]);
 	is($clone_path, 'base/' . $branch_oid, 'branch storage path uses branch database OID');
+	ok(!-e $node->data_dir . '/' . $clone_path . '/' . $source_temp_file,
+		'db branch clone skips live source temp relation files');
 	my $source_locator = $node->safe_psql(
 		'postgres',
 		q[SELECT dattablespace || '/' || oid FROM pg_database WHERE datname = 'dbbranch_source';]);
@@ -253,6 +264,8 @@ else
 		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target';]);
 	is($branch_count, '0', 'failed branch is not connectable');
 }
+
+$source_temp->quit;
 
 my $slot_count = $node->safe_psql(
 	'postgres',
