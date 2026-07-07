@@ -1166,6 +1166,56 @@ is($opfamily_count, '1', 'branch succeeds after source create operator family dr
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_opfamily_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_opfamily_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_tsdict_drain_source;]);
+$node->safe_psql(
+	'dbbranch_tsdict_drain_source',
+	q[
+CREATE TEXT SEARCH DICTIONARY dbbranch_tsdict (template=simple);
+CHECKPOINT;
+]);
+
+my $tsdict_locker = $node->background_psql('dbbranch_tsdict_drain_source', on_error_stop => 1);
+$tsdict_locker->query_safe(q[BEGIN; LOCK TABLE pg_ts_dict IN ACCESS EXCLUSIVE MODE;]);
+my $tsdict_writer = $node->background_psql('dbbranch_tsdict_drain_source', on_error_stop => 1);
+$tsdict_writer->query_until(
+	qr/start_tsdict_drain_tsdict/,
+	q(\echo start_tsdict_drain_tsdict
+ALTER TEXT SEARCH DICTIONARY dbbranch_tsdict (Accept = false);
+\echo finish_tsdict_drain_tsdict
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_tsdict_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER TEXT SEARCH DICTIONARY dbbranch_tsdict%';
+]), 'active source alter text search dictionary waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_tsdict_drain_target FROM DATABASE dbbranch_tsdict_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter text search dictionary');
+like($stderr, qr/source database "dbbranch_tsdict_drain_source" has active write transactions/,
+	'active source alter text search dictionary holds db branch writer gate');
+
+$tsdict_locker->query_safe(q[COMMIT;]);
+$tsdict_locker->quit;
+$tsdict_writer->query_until(qr/finish_tsdict_drain_tsdict/, '');
+$tsdict_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_tsdict_drain_target FROM DATABASE dbbranch_tsdict_drain_source]);
+my $tsdict_option = $node->safe_psql(
+	'dbbranch_tsdict_drain_target',
+	q[SELECT dictinitoption FROM pg_ts_dict WHERE dictname = 'dbbranch_tsdict';]);
+is($tsdict_option, q[accept = 'false'], 'branch succeeds after source alter text search dictionary drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_tsdict_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_tsdict_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
 $node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
 

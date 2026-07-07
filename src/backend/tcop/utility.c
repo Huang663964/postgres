@@ -1812,6 +1812,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterTSDictionaryStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterTSDictionary((AlterTSDictionaryStmt *) parsetree);
 				break;
 
