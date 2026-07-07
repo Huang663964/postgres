@@ -480,6 +480,56 @@ is($function_rows, '1', 'branch succeeds after source create function drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_function_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_function_drain_source',
+	q[
+CREATE FUNCTION alter_function_rows_count() RETURNS int LANGUAGE SQL RETURN 1;
+CHECKPOINT;
+]);
+
+my $alter_function_locker = $node->background_psql('dbbranch_alter_function_drain_source', on_error_stop => 1);
+$alter_function_locker->query_safe(q[BEGIN; LOCK TABLE pg_proc IN ACCESS EXCLUSIVE MODE;]);
+my $alter_function_writer = $node->background_psql('dbbranch_alter_function_drain_source', on_error_stop => 1);
+$alter_function_writer->query_until(
+	qr/start_alter_function_drain_function/,
+	q(\echo start_alter_function_drain_function
+ALTER FUNCTION alter_function_rows_count() COST 2;
+\echo finish_alter_function_drain_function
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_function_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER FUNCTION alter_function_rows_count%';
+]), 'active source alter function waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_function_drain_target FROM DATABASE dbbranch_alter_function_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter function');
+like($stderr, qr/source database "dbbranch_alter_function_drain_source" has active write transactions/,
+	'active source alter function holds db branch writer gate');
+
+$alter_function_locker->query_safe(q[COMMIT;]);
+$alter_function_locker->quit;
+$alter_function_writer->query_until(qr/finish_alter_function_drain_function/, '');
+$alter_function_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_function_drain_target FROM DATABASE dbbranch_alter_function_drain_source]);
+my $function_cost = $node->safe_psql(
+	'dbbranch_alter_function_drain_target',
+	q[SELECT procost::int FROM pg_proc WHERE proname = 'alter_function_rows_count';]);
+is($function_cost, '2', 'branch succeeds after source alter function drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',

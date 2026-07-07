@@ -1695,6 +1695,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterFunctionStmt:	/* ALTER FUNCTION */
+				LockDBBranchUtilityWriteGate();
 				address = AlterFunction(pstate, (AlterFunctionStmt *) parsetree);
 				break;
 
