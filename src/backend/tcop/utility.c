@@ -1891,6 +1891,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_DropOwnedStmt:
+				LockDBBranchUtilityWriteGate();
 				DropOwnedObjects((DropOwnedStmt *) parsetree);
 				/* no commands stashed for DROP */
 				commandCollected = true;

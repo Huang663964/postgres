@@ -2682,6 +2682,56 @@ is($grant_applied, 't', 'source grant finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_grant_drain_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_grant_reader;]);
 
+$node->safe_psql('postgres', q[CREATE ROLE dbbranch_drop_owned_owner;]);
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drop_owned_drain_source;]);
+$node->safe_psql(
+	'dbbranch_drop_owned_drain_source',
+	q[
+CREATE TABLE drop_owned_rows (id int PRIMARY KEY);
+ALTER TABLE drop_owned_rows OWNER TO dbbranch_drop_owned_owner;
+CHECKPOINT;
+]);
+
+my $drop_owned_locker =
+  $node->background_psql('dbbranch_drop_owned_drain_source', on_error_stop => 1);
+$drop_owned_locker->query_safe(q[BEGIN; LOCK TABLE drop_owned_rows IN ACCESS SHARE MODE;]);
+my $drop_owned_writer =
+  $node->background_psql('dbbranch_drop_owned_drain_source', on_error_stop => 1);
+$drop_owned_writer->query_until(
+	qr/start_drop_owned_drain_drop_owned/,
+	q(\echo start_drop_owned_drain_drop_owned
+DROP OWNED BY dbbranch_drop_owned_owner;
+\echo finish_drop_owned_drain_drop_owned
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_drop_owned_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'DROP OWNED BY dbbranch_drop_owned_owner%';
+]), 'active source drop owned waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_owned_drain_target FROM DATABASE dbbranch_drop_owned_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source drop owned');
+like($stderr, qr/source database "dbbranch_drop_owned_drain_source" has active write transactions/,
+	'active source drop owned holds db branch writer gate');
+
+$drop_owned_locker->query_safe(q[COMMIT;]);
+$drop_owned_locker->quit;
+$drop_owned_writer->query_until(qr/finish_drop_owned_drain_drop_owned/, '');
+$drop_owned_writer->quit;
+
+my $drop_owned_removed = $node->safe_psql(
+	'dbbranch_drop_owned_drain_source',
+	q[SELECT to_regclass('drop_owned_rows') IS NULL;]);
+is($drop_owned_removed, 't', 'source drop owned finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_owned_drain_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_drop_owned_owner;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_comment_drain_source;]);
 $node->safe_psql(
 	'dbbranch_comment_drain_source',
