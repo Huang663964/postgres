@@ -1854,6 +1854,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreatePolicyStmt:	/* CREATE POLICY */
+				LockDBBranchUtilityWriteGate();
 				address = CreatePolicy((CreatePolicyStmt *) parsetree);
 				break;
 

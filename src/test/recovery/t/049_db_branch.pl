@@ -378,6 +378,52 @@ my $rule_exists = $node->safe_psql(
 is($rule_exists, '1', 'source create rule finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rule_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
+$node->safe_psql(
+	'dbbranch_policy_drain_source',
+	q[
+CREATE TABLE policy_rows (id int PRIMARY KEY);
+INSERT INTO policy_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $policy_locker = $node->background_psql('dbbranch_policy_drain_source', on_error_stop => 1);
+$policy_locker->query_safe(q[BEGIN; LOCK TABLE policy_rows IN ACCESS SHARE MODE;]);
+my $policy_writer = $node->background_psql('dbbranch_policy_drain_source', on_error_stop => 1);
+$policy_writer->query_until(
+	qr/start_policy_drain_policy/,
+	q(\echo start_policy_drain_policy
+CREATE POLICY policy_rows_select ON policy_rows FOR SELECT USING (id > 0);
+\echo finish_policy_drain_policy
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_policy_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE POLICY policy_rows_select%';
+]), 'active source create policy waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_policy_drain_target FROM DATABASE dbbranch_policy_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create policy');
+like($stderr, qr/source database "dbbranch_policy_drain_source" has active write transactions/,
+	'active source create policy holds db branch writer gate');
+
+$policy_locker->query_safe(q[COMMIT;]);
+$policy_locker->quit;
+$policy_writer->query_until(qr/finish_policy_drain_policy/, '');
+$policy_writer->quit;
+
+my $policy_exists = $node->safe_psql(
+	'dbbranch_policy_drain_source',
+	q[SELECT count(*) FROM pg_policy WHERE polname = 'policy_rows_select';]);
+is($policy_exists, '1', 'source create policy finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_policy_drain_source;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136
