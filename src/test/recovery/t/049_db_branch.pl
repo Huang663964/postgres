@@ -715,6 +715,56 @@ is($fdw_exists, '1', 'branch succeeds after source create foreign data wrapper d
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_fdw_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_fdw_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_fdw_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_fdw_drain_source',
+	q[
+CREATE FOREIGN DATA WRAPPER dbbranch_fdw;
+CHECKPOINT;
+]);
+
+my $alter_fdw_locker = $node->background_psql('dbbranch_alter_fdw_drain_source', on_error_stop => 1);
+$alter_fdw_locker->query_safe(q[BEGIN; LOCK TABLE pg_foreign_data_wrapper IN ACCESS EXCLUSIVE MODE;]);
+my $alter_fdw_writer = $node->background_psql('dbbranch_alter_fdw_drain_source', on_error_stop => 1);
+$alter_fdw_writer->query_until(
+	qr/start_alter_fdw_drain_fdw/,
+	q(\echo start_alter_fdw_drain_fdw
+ALTER FOREIGN DATA WRAPPER dbbranch_fdw OPTIONS (ADD host 'localhost');
+\echo finish_alter_fdw_drain_fdw
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_fdw_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER FOREIGN DATA WRAPPER dbbranch_fdw%';
+]), 'active source alter foreign data wrapper waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_fdw_drain_target FROM DATABASE dbbranch_alter_fdw_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter foreign data wrapper');
+like($stderr, qr/source database "dbbranch_alter_fdw_drain_source" has active write transactions/,
+	'active source alter foreign data wrapper holds db branch writer gate');
+
+$alter_fdw_locker->query_safe(q[COMMIT;]);
+$alter_fdw_locker->quit;
+$alter_fdw_writer->query_until(qr/finish_alter_fdw_drain_fdw/, '');
+$alter_fdw_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_fdw_drain_target FROM DATABASE dbbranch_alter_fdw_drain_source]);
+my $fdw_options = $node->safe_psql(
+	'dbbranch_alter_fdw_drain_target',
+	q[SELECT fdwoptions @> ARRAY['host=localhost'] FROM pg_foreign_data_wrapper WHERE fdwname = 'dbbranch_fdw';]);
+is($fdw_options, 't', 'branch succeeds after source alter foreign data wrapper drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_fdw_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_fdw_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_server_drain_source;]);
 $node->safe_psql(
 	'dbbranch_server_drain_source',

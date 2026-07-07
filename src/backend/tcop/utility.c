@@ -1627,6 +1627,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterFdwStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterForeignDataWrapper(pstate, (AlterFdwStmt *) parsetree);
 				break;
 
