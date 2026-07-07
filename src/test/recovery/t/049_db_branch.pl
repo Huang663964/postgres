@@ -3046,11 +3046,91 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_copy_drain_source;]);
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 139
+	skip 'Injection points not supported by this build', 145
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
 	$node->safe_psql('postgres', q[CREATE EXTENSION IF NOT EXISTS injection_points;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_tspc_drain_source;]);
+	$node->safe_psql('dbbranch_create_tspc_drain_source', q[CHECKPOINT;]);
+	my $create_tspc_dir = $node->basedir . '/dbbranch_create_tspc';
+	mkdir($create_tspc_dir) or die "could not create $create_tspc_dir: $!";
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-create-tablespace', 'wait');]);
+	my $create_tspc_writer =
+	  $node->background_psql('dbbranch_create_tspc_drain_source', on_error_stop => 1);
+	$create_tspc_writer->query_until(
+		qr/start_create_tspc_drain_tspc/,
+		qq(\\echo start_create_tspc_drain_tspc
+CREATE TABLESPACE dbbranch_create_tspc LOCATION '$create_tspc_dir';
+\\echo finish_create_tspc_drain_tspc
+));
+	$node->wait_for_event('client backend', 'db-branch-create-tablespace');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_create_tspc_drain_target FROM DATABASE dbbranch_create_tspc_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source create tablespace');
+	like($stderr, qr/source database "dbbranch_create_tspc_drain_source" has active write transactions/,
+		'active source create tablespace holds db branch writer gate');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('db-branch-create-tablespace');]);
+	$create_tspc_writer->query_until(qr/finish_create_tspc_drain_tspc/, '');
+	$create_tspc_writer->quit;
+	my $created_tspc_exists = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_tablespace WHERE spcname = 'dbbranch_create_tspc';]);
+	is($created_tspc_exists, '1',
+		'source create tablespace finishes after db branch rejects');
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_detach('db-branch-create-tablespace');]);
+	$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_create_tspc;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_tspc_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drop_tspc_drain_source;]);
+	my $drop_tspc_dir = $node->basedir . '/dbbranch_drop_tspc';
+	mkdir($drop_tspc_dir) or die "could not create $drop_tspc_dir: $!";
+	$node->safe_psql(
+		'dbbranch_drop_tspc_drain_source',
+		"CREATE TABLESPACE dbbranch_drop_tspc LOCATION '$drop_tspc_dir';");
+	$node->safe_psql('dbbranch_drop_tspc_drain_source', q[CHECKPOINT;]);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-drop-tablespace', 'wait');]);
+	my $drop_tspc_writer =
+	  $node->background_psql('dbbranch_drop_tspc_drain_source', on_error_stop => 1);
+	$drop_tspc_writer->query_until(
+		qr/start_drop_tspc_drain_tspc/,
+		q(\echo start_drop_tspc_drain_tspc
+DROP TABLESPACE dbbranch_drop_tspc;
+\echo finish_drop_tspc_drain_tspc
+));
+	$node->wait_for_event('client backend', 'db-branch-drop-tablespace');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_drop_tspc_drain_target FROM DATABASE dbbranch_drop_tspc_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source drop tablespace');
+	like($stderr, qr/source database "dbbranch_drop_tspc_drain_source" has active write transactions/,
+		'active source drop tablespace holds db branch writer gate');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('db-branch-drop-tablespace');]);
+	$drop_tspc_writer->query_until(qr/finish_drop_tspc_drain_tspc/, '');
+	$drop_tspc_writer->quit;
+	my $dropped_tspc_exists = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_tablespace WHERE spcname = 'dbbranch_drop_tspc';]);
+	is($dropped_tspc_exists, '0',
+		'source drop tablespace finishes after db branch rejects');
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_detach('db-branch-drop-tablespace');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_tspc_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_import_schema_drain_source;]);
 	my $node_port = $node->port;

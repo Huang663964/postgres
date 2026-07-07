@@ -728,12 +728,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_CreateTableSpaceStmt:
 			/* no event triggers for global objects */
 			PreventInTransactionBlock(isTopLevel, "CREATE TABLESPACE");
+			LockDBBranchUtilityWriteGate();
+			INJECTION_POINT("db-branch-create-tablespace", NULL);
 			CreateTableSpace((CreateTableSpaceStmt *) parsetree);
 			break;
 
 		case T_DropTableSpaceStmt:
 			/* no event triggers for global objects */
 			PreventInTransactionBlock(isTopLevel, "DROP TABLESPACE");
+			LockDBBranchUtilityWriteGate();
+			INJECTION_POINT("db-branch-drop-tablespace", NULL);
 			DropTableSpace((DropTableSpaceStmt *) parsetree);
 			break;
 
