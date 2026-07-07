@@ -121,7 +121,7 @@ LockDBBranchSequenceWriteGate(Relation seqrel)
 		IsBootstrapProcessingMode())
 		return;
 
-	/* ponytail: nextval can dirty sequence pages without assigning an XID. */
+	/* ponytail: sequence ops can dirty pages without assigning an XID. */
 	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
 }
 
@@ -996,6 +996,8 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	 * sequence information.  Currently, we don't support that.
 	 */
 	PreventCommandIfParallelMode("setval()");
+
+	LockDBBranchSequenceWriteGate(seqrel);
 
 	/* lock page buffer and read tuple */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);

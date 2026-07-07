@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 99
+	skip 'Injection points not supported by this build', 101
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -272,6 +272,7 @@ SKIP:
 		q[
 CREATE TABLE idle_rows (id int PRIMARY KEY);
 CREATE SEQUENCE idle_seq CACHE 1;
+CREATE UNLOGGED SEQUENCE idle_unlogged_seq CACHE 1;
 INSERT INTO idle_rows VALUES (1);
 CHECKPOINT;
 ]);
@@ -297,6 +298,12 @@ SELECT nextval('idle_seq');
 	is($idle_seq_ret, 1, 'db branch writer gate blocks existing source sequence writes');
 	like($idle_reader->{stderr}, qr/canceling statement due to statement timeout/,
 		'existing source sequence write waits on db branch writer gate');
+	my (undef, $idle_setval_ret) = $idle_reader->query(q[
+SELECT setval('idle_unlogged_seq', 7);
+]);
+	is($idle_setval_ret, 1, 'db branch writer gate blocks existing source sequence setval');
+	like($idle_reader->{stderr}, qr/canceling statement due to statement timeout/,
+		'existing source sequence setval waits on db branch writer gate');
 
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-drain');]);
 	$idle_branch->query_until(qr/finish_idle_drain_branch/, '');
