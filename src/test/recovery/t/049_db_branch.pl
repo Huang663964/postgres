@@ -5856,11 +5856,13 @@ CHECKPOINT;
 INSERT INTO rel_ts_rows VALUES (2, 'redo');
 ]);
 
+my $rel_tablespace_wal_start = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
 $stderr = '';
 $result = $node->psql(
 	'postgres',
 	q[CREATE BRANCH dbbranch_rel_ts_target FROM DATABASE dbbranch_rel_ts_source],
 	stderr => \$stderr);
+my $rel_tablespace_wal_end = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
 
 is($result, 0, 'db branch supports relations in non-default tablespaces');
 
@@ -5877,6 +5879,36 @@ like($rel_tablespace_path, qr/^pg_tblspc\/[0-9]+\/[^\/]+\/[0-9]+\/[0-9]+$/,
 	'relation tablespace file stays under pg_tblspc');
 ok(-f $node->data_dir . '/' . $rel_tablespace_path,
 	'relation tablespace branch file exists');
+
+my $rel_source_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_rel_ts_source';]);
+my $rel_branch_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_rel_ts_target';]);
+my $rel_default_tablespace = $node->safe_psql(
+	'postgres',
+	q[SELECT dattablespace FROM pg_database WHERE datname = 'dbbranch_rel_ts_source';]);
+my $rel_tablespace_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_tablespace WHERE spcname = 'dbbranch_rel_ts';]);
+my $rel_waldump = '';
+ok(
+	PostgreSQL::Test::Utils::run_log(
+		[
+			'pg_waldump', '-p', $node->data_dir, '-r', 'Database',
+			'-s', $rel_tablespace_wal_start, '-e', $rel_tablespace_wal_end
+		],
+		'>' => \$rel_waldump),
+	'relation tablespace branch WAL can be dumped');
+like(
+	$rel_waldump,
+	qr{CREATE_FILE_COPY.*copy dir \Q$rel_default_tablespace/$rel_source_oid\E to \Q$rel_default_tablespace/$rel_branch_oid\E},
+	'relation tablespace branch logs default tablespace file-copy WAL');
+like(
+	$rel_waldump,
+	qr{CREATE_FILE_COPY.*copy dir \Q$rel_tablespace_oid/$rel_source_oid\E to \Q$rel_tablespace_oid/$rel_branch_oid\E},
+	'relation tablespace branch logs relation tablespace file-copy WAL');
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_source;]);
