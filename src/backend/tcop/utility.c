@@ -1887,6 +1887,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterPublicationStmt:
+				LockDBBranchUtilityWriteGate();
 				AlterPublication(pstate, (AlterPublicationStmt *) parsetree);
 
 				/*

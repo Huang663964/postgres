@@ -1423,6 +1423,58 @@ WHERE datname = 'dbbranch_stats_drain_source'
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_stats_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_stats_drain_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_publication_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_publication_drain_source',
+		q[
+CREATE TABLE publication_rows (id int PRIMARY KEY);
+CREATE PUBLICATION publication_rows_pub;
+INSERT INTO publication_rows VALUES (1);
+CHECKPOINT;
+]);
+
+	my $publication_locker = $node->background_psql('dbbranch_publication_drain_source', on_error_stop => 1);
+	$publication_locker->query_safe(q[BEGIN; LOCK TABLE publication_rows IN SHARE UPDATE EXCLUSIVE MODE;]);
+	my $publication_writer = $node->background_psql('dbbranch_publication_drain_source', on_error_stop => 1);
+	$publication_writer->query_until(
+		qr/start_publication_drain_publication/,
+		q(\echo start_publication_drain_publication
+ALTER PUBLICATION publication_rows_pub ADD TABLE publication_rows;
+\echo finish_publication_drain_publication
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_publication_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER PUBLICATION publication_rows_pub%';
+]), 'active source alter publication waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_publication_drain_target FROM DATABASE dbbranch_publication_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source alter publication');
+	like($stderr, qr/source database "dbbranch_publication_drain_source" has active write transactions/,
+		'active source alter publication holds db branch writer gate');
+
+	$publication_locker->query_safe(q[COMMIT;]);
+	$publication_locker->quit;
+	$publication_writer->query_until(qr/finish_publication_drain_publication/, '');
+	$publication_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_publication_drain_target FROM DATABASE dbbranch_publication_drain_source]);
+	my $publication_rel_exists = $node->safe_psql(
+		'dbbranch_publication_drain_target',
+		q[SELECT count(*) FROM pg_publication_rel pr JOIN pg_publication p ON p.oid = pr.prpubid WHERE p.pubname = 'publication_rows_pub';]);
+	is($publication_rel_exists, '1', 'branch succeeds after source alter publication drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_publication_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_publication_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drop_drain_source;]);
 	$node->safe_psql(
 		'dbbranch_drop_drain_source',
