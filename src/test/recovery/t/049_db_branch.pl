@@ -471,6 +471,52 @@ my $alter_policy_expr = $node->safe_psql(
 like($alter_policy_expr, qr/id > 1/, 'source alter policy finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_policy_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_rename_drain_source;]);
+$node->safe_psql(
+	'dbbranch_rename_drain_source',
+	q[
+CREATE TABLE rename_rows (id int PRIMARY KEY);
+INSERT INTO rename_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $rename_locker = $node->background_psql('dbbranch_rename_drain_source', on_error_stop => 1);
+$rename_locker->query_safe(q[BEGIN; LOCK TABLE rename_rows IN ACCESS SHARE MODE;]);
+my $rename_writer = $node->background_psql('dbbranch_rename_drain_source', on_error_stop => 1);
+$rename_writer->query_until(
+	qr/start_rename_drain_rename/,
+	q(\echo start_rename_drain_rename
+ALTER TABLE rename_rows RENAME TO renamed_rows;
+\echo finish_rename_drain_rename
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_rename_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER TABLE rename_rows RENAME%';
+]), 'active source rename waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_rename_drain_target FROM DATABASE dbbranch_rename_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source rename');
+like($stderr, qr/source database "dbbranch_rename_drain_source" has active write transactions/,
+	'active source rename holds db branch writer gate');
+
+$rename_locker->query_safe(q[COMMIT;]);
+$rename_locker->quit;
+$rename_writer->query_until(qr/finish_rename_drain_rename/, '');
+$rename_writer->quit;
+
+my $renamed_table_exists = $node->safe_psql(
+	'dbbranch_rename_drain_source',
+	q[SELECT to_regclass('public.renamed_rows') IS NOT NULL;]);
+is($renamed_table_exists, 't', 'source rename finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_drain_source;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136

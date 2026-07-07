@@ -1015,6 +1015,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				RenameStmt *stmt = (RenameStmt *) parsetree;
 
+				LockDBBranchUtilityWriteGate();
 				if (EventTriggerSupportsObjectType(stmt->renameType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
