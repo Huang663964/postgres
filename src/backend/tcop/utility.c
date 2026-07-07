@@ -919,11 +919,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_CreateEventTrigStmt:
 			/* no event triggers on event triggers */
+			LockDBBranchUtilityWriteGate();
 			CreateEventTrigger((CreateEventTrigStmt *) parsetree);
 			break;
 
 		case T_AlterEventTrigStmt:
 			/* no event triggers on event triggers */
+			LockDBBranchUtilityWriteGate();
 			AlterEventTrigger((AlterEventTrigStmt *) parsetree);
 			break;
 

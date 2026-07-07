@@ -2546,6 +2546,44 @@ is($extension_member_count, '1', 'branch succeeds after source alter extension c
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_extension_contents_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_extension_contents_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_event_trigger_drain_source;]);
+$node->safe_psql(
+	'dbbranch_event_trigger_drain_source',
+	q[
+CREATE FUNCTION dbbranch_event_trigger_proc() RETURNS event_trigger AS $$
+BEGIN
+  NULL;
+END;
+$$ LANGUAGE plpgsql;
+CHECKPOINT;
+]);
+
+my $event_trigger_writer =
+  $node->background_psql('dbbranch_event_trigger_drain_source', on_error_stop => 1);
+$event_trigger_writer->query_safe(q[
+BEGIN;
+CREATE EVENT TRIGGER dbbranch_event_trigger_waiter
+	ON ddl_command_start EXECUTE PROCEDURE dbbranch_event_trigger_proc();
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_event_trigger_drain_target FROM DATABASE dbbranch_event_trigger_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create event trigger');
+like($stderr, qr/source database "dbbranch_event_trigger_drain_source" has active write transactions/,
+	'active source create event trigger holds db branch writer gate');
+
+$event_trigger_writer->query_safe(q[COMMIT;]);
+$event_trigger_writer->quit;
+
+my $event_trigger_exists = $node->safe_psql(
+	'dbbranch_event_trigger_drain_source',
+	q[SELECT count(*) FROM pg_event_trigger WHERE evtname = 'dbbranch_event_trigger_waiter';]);
+is($event_trigger_exists, '1', 'source create event trigger finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_event_trigger_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_depends_drain_source;]);
 $node->safe_psql(
 	'dbbranch_depends_drain_source',
