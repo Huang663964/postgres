@@ -4138,6 +4138,14 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		replay_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 		replay_finished = true;
 
+		LockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
+		source_lock_held = true;
+		if (!SearchSysCacheExists1(DATABASEOID, ObjectIdGetDatum(source_dboid)))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_DATABASE),
+					 errmsg("source database \"%s\" was dropped while creating branch",
+							source_name)));
+
 		INJECTION_POINT("db-branch-before-install", NULL);
 
 		FlushDatabaseBuffers(branch_dboid);

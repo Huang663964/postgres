@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 82
+	skip 'Injection points not supported by this build', 96
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -572,6 +572,98 @@ CREATE BRANCH dbbranch_replay_gate_target FROM DATABASE dbbranch_replay_gate_sou
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drop_during_source;]);
+	$node->safe_psql(
+		'dbbranch_drop_during_source',
+		q[
+CREATE TABLE drop_during_rows (id int PRIMARY KEY);
+INSERT INTO drop_during_rows VALUES (1);
+CHECKPOINT;
+UPDATE drop_during_rows SET id = 1 WHERE id = 1;
+]);
+
+	my %drop_during_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @drop_during_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-before-replay', 'wait');]);
+
+	my $drop_during_branch = $node->background_psql('postgres', on_error_stop => 0);
+	$drop_during_branch->query_until(
+		qr/start_drop_during_branch/,
+		q(\echo start_drop_during_branch
+CREATE BRANCH dbbranch_drop_during_target FROM DATABASE dbbranch_drop_during_source;
+\echo finish_drop_during_branch
+));
+	$node->wait_for_event('client backend', 'db-branch-before-replay');
+
+	my @drop_during_clone_paths = grep { !$drop_during_base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @drop_during_clone_paths, 1,
+		'source-drop race has cloned branch storage before replay');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_during_source;]);
+	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-replay');]);
+	$drop_during_branch->query_until(qr/finish_drop_during_branch/, '');
+	like(
+		$drop_during_branch->{stderr},
+		qr/source database "dbbranch_drop_during_source" was dropped while creating branch/,
+		'db branch reports source drop during replay window');
+	$drop_during_branch->quit;
+
+	my $drop_during_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_drop_during_target';]);
+	is($drop_during_branch_count, '0', 'source-drop race creates no branch database');
+
+	my $drop_during_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($drop_during_slot_count, '0', 'source-drop race releases DB Branch WAL pin');
+
+	my @drop_during_clone_left = grep { -e $_ } @drop_during_clone_paths;
+	is(scalar @drop_during_clone_left, 0,
+		'source-drop race removes cloned branch storage path');
+
+	my $drop_during_catalog_rows = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_dbbranch WHERE branch_db_oid NOT IN (SELECT oid FROM pg_database) OR source_db_oid NOT IN (SELECT oid FROM pg_database);]);
+	is($drop_during_catalog_rows, '0',
+		'source-drop race leaves no orphan pg_dbbranch rows');
+
+	my @drop_during_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @drop_during_metadata_files, scalar(@drop_during_metadata_before) + 1,
+		'source-drop race writes separate metadata file');
+
+	my $drop_during_metadata = '';
+	for my $path (@drop_during_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_drop_during_target$/m)
+		{
+			$drop_during_metadata = $contents;
+			last;
+		}
+	}
+
+	like($drop_during_metadata, qr/^wal_pin=released$/m,
+		'source-drop race metadata records released WAL pin');
+	like($drop_during_metadata, qr/^clone_result=(done|copy_fallback)$/m,
+		'source-drop race metadata records clone result');
+	like($drop_during_metadata, qr/^cleanup=done$/m,
+		'source-drop race metadata records clone cleanup');
+	like($drop_during_metadata, qr/^replay_method=rmgr_redo$/m,
+		'source-drop race metadata records replay method');
+	like($drop_during_metadata, qr/^status_history=CREATING,COPYING,REPLAYING,FAILED$/m,
+		'source-drop race metadata records failed transition');
+	like($drop_during_metadata, qr/^status=FAILED$/m,
+		'source-drop race metadata final state is FAILED');
+	like($drop_during_metadata,
+		qr/^failure=source database "dbbranch_drop_during_source" was dropped while creating branch$/m,
+		'source-drop race metadata records failure reason');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_fail_source;]);
 	$node->safe_psql(
