@@ -47,21 +47,51 @@ my ($source_temp_file) = $source_temp_relpath =~ m{([^/]+)$};
 ok(-e $node->data_dir . '/' . $source_temp_relpath,
 	'live source temp relation file exists before DB Branch clone');
 
-my $wal_start = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
+my @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+my $metadata_file_count = scalar @metadata_files;
 my $stderr = '';
 my $result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_temp_reject_target FROM DATABASE dbbranch_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch rejects live source temp relation catalog rows');
+like($stderr, qr/source database "dbbranch_source" has temporary relation catalog rows/,
+	'live source temp relation catalog rows are reported');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'live source temp relation rejection writes separate metadata file');
+
+$source_temp->quit;
+$source_temp_file = 't999_888';
+open my $source_temp_fh, '>', $node->data_dir . '/' . $source_dbpath . '/' . $source_temp_file
+  or die "could not create fake temp relation file: $!";
+close $source_temp_fh;
+
+my $wal_start = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn();');
+$stderr = '';
+$result = $node->psql(
 	'postgres',
 	q[CREATE BRANCH dbbranch_target FROM DATABASE dbbranch_source],
 	stderr => \$stderr);
 
-my @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-is(scalar @metadata_files, 1, 'branch creation writes one metadata file');
-my $metadata_file_count = scalar @metadata_files;
-
-open my $metadata_fh, '<', $metadata_files[0]
-  or die "could not open $metadata_files[0]: $!";
-my $metadata = do { local $/; <$metadata_fh> };
-close $metadata_fh;
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count, 'branch creation writes one metadata file');
+my $metadata = '';
+for my $metadata_file (@metadata_files)
+{
+	open my $metadata_fh, '<', $metadata_file
+	  or die "could not open $metadata_file: $!";
+	my $contents = do { local $/; <$metadata_fh> };
+	close $metadata_fh;
+	if ($contents =~ /^branch_name=dbbranch_target$/m)
+	{
+		$metadata = $contents;
+		last;
+	}
+}
 
 like($metadata, qr/^source_db_name=dbbranch_source$/m, 'metadata records source database');
 like($metadata, qr/^branch_name=dbbranch_target$/m, 'metadata records branch database');
@@ -124,9 +154,18 @@ if ($result == 0)
 		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_target';]);
 	is($clone_path, 'base/' . $branch_oid, 'branch storage path uses branch database OID');
 	ok(!-e $node->data_dir . '/' . $clone_path . '/' . $source_temp_file,
-		'db branch clone skips live source temp relation files');
+		'db branch clone skips temp-named source relation files');
 	ok(!-e $node->data_dir . '/' . $clone_path . '/pg_internal.init',
 		'db branch clone skips source relcache init file');
+	my $branch_temp_catalog_count = $node->safe_psql(
+		'dbbranch_target',
+		q[SELECT count(*)
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = 'temp_branch_private'
+			  AND n.nspname LIKE 'pg_temp_%';]);
+	is($branch_temp_catalog_count, '0',
+		'ready branch has no rejected source temp relation catalog rows');
 
 	my $branch_rows = $node->safe_psql(
 		'dbbranch_target',
@@ -272,8 +311,6 @@ else
 		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target';]);
 	is($branch_count, '0', 'failed branch is not connectable');
 }
-
-$source_temp->quit;
 
 my $slot_count = $node->safe_psql(
 	'postgres',

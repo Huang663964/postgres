@@ -160,13 +160,16 @@ static bool check_db_file_conflict(Oid db_id);
 static int	errdetail_busy_db(int notherbackends, int npreparedxacts);
 static void CreateDatabaseUsingWalLog(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 									  Oid dst_tsid);
-static List *ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath);
+static List *ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath,
+									   bool *has_temp_relation);
 static List *ScanSourceDatabasePgClassPage(Page page, Buffer buf, Oid tbid,
 										   Oid dbid, char *srcpath,
-										   List *rlocatorlist, Snapshot snapshot);
+										   List *rlocatorlist, Snapshot snapshot,
+										   bool *has_temp_relation);
 static CreateDBRelInfo *ScanSourceDatabasePgClassTuple(HeapTupleData *tuple,
 													   Oid tbid, Oid dbid,
-													   char *srcpath);
+													   char *srcpath,
+													   bool *has_temp_relation);
 static void CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid,
 									bool isRedo);
 static void CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid,
@@ -232,7 +235,8 @@ static bool ScanDBBranchSourceRelations(Oid source_dboid,
 										Oid source_deftablespace,
 										char *srcpath,
 										List **tablespace_oids,
-										bool *has_sequence);
+										bool *has_sequence,
+										bool *has_temp_relation);
 
 /*
  * Create a new database using the WAL_LOG strategy.
@@ -264,7 +268,8 @@ CreateDatabaseUsingWalLog(Oid src_dboid, Oid dst_dboid,
 	RelationMapCopy(dst_dboid, dst_tsid, srcpath, dstpath);
 
 	/* Get list of relfilelocators to copy from the source database. */
-	rlocatorlist = ScanSourceDatabasePgClass(src_tsid, src_dboid, srcpath);
+	rlocatorlist = ScanSourceDatabasePgClass(src_tsid, src_dboid, srcpath,
+											 NULL);
 	Assert(rlocatorlist != NIL);
 
 	/*
@@ -342,7 +347,8 @@ CreateDatabaseUsingWalLog(Oid src_dboid, Oid dst_dboid,
  * a database to which we're not even connected.
  */
 static List *
-ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
+ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath,
+						  bool *has_temp_relation)
 {
 	RelFileLocator rlocator;
 	BlockNumber nblocks;
@@ -404,7 +410,8 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 		/* Append relevant pg_class tuples for current page to rlocatorlist. */
 		rlocatorlist = ScanSourceDatabasePgClassPage(page, buf, tbid, dbid,
 													 srcpath, rlocatorlist,
-													 snapshot);
+													 snapshot,
+													 has_temp_relation);
 
 		UnlockReleaseBuffer(buf);
 	}
@@ -423,7 +430,7 @@ ScanSourceDatabasePgClass(Oid tbid, Oid dbid, char *srcpath)
 static List *
 ScanSourceDatabasePgClassPage(Page page, Buffer buf, Oid tbid, Oid dbid,
 							  char *srcpath, List *rlocatorlist,
-							  Snapshot snapshot)
+							  Snapshot snapshot, bool *has_temp_relation)
 {
 	BlockNumber blkno = BufferGetBlockNumber(buf);
 	OffsetNumber offnum;
@@ -466,7 +473,8 @@ ScanSourceDatabasePgClassPage(Page page, Buffer buf, Oid tbid, Oid dbid,
 			 * copy the relation, add it to the list.
 			 */
 			relinfo = ScanSourceDatabasePgClassTuple(&tuple, tbid, dbid,
-													 srcpath);
+													 srcpath,
+													 has_temp_relation);
 			if (relinfo != NULL)
 				rlocatorlist = lappend(rlocatorlist, relinfo);
 		}
@@ -485,7 +493,7 @@ ScanSourceDatabasePgClassPage(Page page, Buffer buf, Oid tbid, Oid dbid,
  */
 CreateDBRelInfo *
 ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
-							   char *srcpath)
+							   char *srcpath, bool *has_temp_relation)
 {
 	CreateDBRelInfo *relinfo;
 	Form_pg_class classForm;
@@ -498,15 +506,19 @@ ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
 	 *
 	 * Shared objects don't need to be copied, because they are shared.
 	 * Objects without storage can't be copied, because there's nothing to
-	 * copy. Temporary relations don't need to be copied either, because they
-	 * are inaccessible outside of the session that created them, which must
-	 * be gone already, and couldn't connect to a different database if it
-	 * still existed. autovacuum will eventually remove the pg_class entries
-	 * as well.
+	 * copy. Temporary relations don't need storage copying, but DB Branch
+	 * must reject their catalog rows so the branch does not inherit dangling
+	 * temp metadata without temp files.
 	 */
+	if (classForm->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		if (has_temp_relation != NULL)
+			*has_temp_relation = true;
+		return NULL;
+	}
+
 	if (classForm->reltablespace == GLOBALTABLESPACE_OID ||
-		!RELKIND_HAS_STORAGE(classForm->relkind) ||
-		classForm->relpersistence == RELPERSISTENCE_TEMP)
+		!RELKIND_HAS_STORAGE(classForm->relkind))
 		return NULL;
 
 	/*
@@ -3875,7 +3887,7 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 static bool
 ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
 								char *srcpath, List **tablespace_oids,
-								bool *has_sequence)
+								bool *has_sequence, bool *has_temp_relation)
 {
 	List	   *rlocatorlist;
 	ListCell   *cell;
@@ -3883,8 +3895,10 @@ ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
 
 	*tablespace_oids = list_make1_oid(source_deftablespace);
 	*has_sequence = false;
+	*has_temp_relation = false;
 	rlocatorlist = ScanSourceDatabasePgClass(source_deftablespace,
-										 source_dboid, srcpath);
+										 source_dboid, srcpath,
+										 has_temp_relation);
 	foreach(cell, rlocatorlist)
 	{
 		CreateDBRelInfo *relinfo = (CreateDBRelInfo *) lfirst(cell);
@@ -3928,6 +3942,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	ListCell   *cell;
 	bool		source_has_unlogged;
 	bool		source_has_sequence;
+	bool		source_has_temp_relation;
 	volatile bool clone_paths_created = false;
 	volatile bool clone_finished = false;
 	int		npreparedxacts;
@@ -4138,7 +4153,30 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 	source_has_unlogged = ScanDBBranchSourceRelations(source_dboid,
 										   source_deftablespace, srcpath,
-										   &tablespace_oids, &source_has_sequence);
+										   &tablespace_oids, &source_has_sequence,
+										   &source_has_temp_relation);
+	if (source_has_temp_relation)
+	{
+		const char *temp_failure =
+			"source database has temporary relation catalog rows";
+
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+						  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
+						  "not_started",
+						  "not_started", "not_started", "not_started",
+						  NULL,
+						  source_blocking_ms, 0.0, 0.0,
+						  "CREATING,FAILED", "FAILED", temp_failure);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("source database \"%s\" has temporary relation catalog rows",
+						source_name),
+				 errdetail("End sessions holding temporary relations in the source database before creating a branch.")));
+	}
 	branch_dboid = AllocateDBBranchDatabaseOid();
 	/* ponytail: final path avoids a DB-branch-only relpath hook. */
 	clone_path = GetDatabasePath(branch_dboid, source_deftablespace);
