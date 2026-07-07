@@ -517,6 +517,53 @@ my $renamed_table_exists = $node->safe_psql(
 is($renamed_table_exists, 't', 'source rename finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_schema_drain_source;]);
+$node->safe_psql(
+	'dbbranch_schema_drain_source',
+	q[
+CREATE SCHEMA branch_dst;
+CREATE TABLE schema_rows (id int PRIMARY KEY);
+INSERT INTO schema_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $schema_locker = $node->background_psql('dbbranch_schema_drain_source', on_error_stop => 1);
+$schema_locker->query_safe(q[BEGIN; LOCK TABLE schema_rows IN ACCESS SHARE MODE;]);
+my $schema_writer = $node->background_psql('dbbranch_schema_drain_source', on_error_stop => 1);
+$schema_writer->query_until(
+	qr/start_schema_drain_schema/,
+	q(\echo start_schema_drain_schema
+ALTER TABLE schema_rows SET SCHEMA branch_dst;
+\echo finish_schema_drain_schema
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_schema_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER TABLE schema_rows SET SCHEMA%';
+]), 'active source set schema waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_schema_drain_target FROM DATABASE dbbranch_schema_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source set schema');
+like($stderr, qr/source database "dbbranch_schema_drain_source" has active write transactions/,
+	'active source set schema holds db branch writer gate');
+
+$schema_locker->query_safe(q[COMMIT;]);
+$schema_locker->quit;
+$schema_writer->query_until(qr/finish_schema_drain_schema/, '');
+$schema_writer->quit;
+
+my $schema_table_moved = $node->safe_psql(
+	'dbbranch_schema_drain_source',
+	q[SELECT to_regclass('branch_dst.schema_rows') IS NOT NULL AND to_regclass('public.schema_rows') IS NULL;]);
+is($schema_table_moved, 't', 'source set schema finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_schema_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE ROLE dbbranch_grant_reader;]);
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_grant_drain_source;]);
 $node->safe_psql(
