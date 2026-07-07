@@ -915,6 +915,57 @@ is($sequence_increment, '2', 'branch succeeds after source alter sequence drains
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_sequence_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_sequence_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_ctas_drain_source;]);
+$node->safe_psql(
+	'dbbranch_ctas_drain_source',
+	q[
+CREATE TABLE ctas_rows (id int);
+INSERT INTO ctas_rows VALUES (1), (2);
+CHECKPOINT;
+]);
+
+my $ctas_locker = $node->background_psql('dbbranch_ctas_drain_source', on_error_stop => 1);
+$ctas_locker->query_safe(q[BEGIN; LOCK TABLE ctas_rows IN ACCESS EXCLUSIVE MODE;]);
+my $ctas_writer = $node->background_psql('dbbranch_ctas_drain_source', on_error_stop => 1);
+$ctas_writer->query_until(
+	qr/start_ctas_drain_table/,
+	q(\echo start_ctas_drain_table
+CREATE TABLE ctas_result AS SELECT * FROM ctas_rows;
+\echo finish_ctas_drain_table
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_ctas_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE TABLE ctas_result%';
+]), 'active source create table as waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_ctas_drain_target FROM DATABASE dbbranch_ctas_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create table as');
+like($stderr, qr/source database "dbbranch_ctas_drain_source" has active write transactions/,
+	'active source create table as holds db branch writer gate');
+
+$ctas_locker->query_safe(q[COMMIT;]);
+$ctas_locker->quit;
+$ctas_writer->query_until(qr/finish_ctas_drain_table/, '');
+$ctas_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_ctas_drain_target FROM DATABASE dbbranch_ctas_drain_source]);
+my $ctas_row_count = $node->safe_psql(
+	'dbbranch_ctas_drain_target',
+	q[SELECT count(*) FROM ctas_result;]);
+is($ctas_row_count, '2', 'branch succeeds after source create table as drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_ctas_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_ctas_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
 $node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
 
