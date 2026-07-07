@@ -2655,6 +2655,40 @@ is($create_role_exists, '1', 'source create role finishes after db branch reject
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_create_role_waiter;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_role_drain_source;]);
 
+$node->safe_psql(
+	'postgres',
+	q[
+CREATE ROLE dbbranch_grant_role_parent;
+CREATE ROLE dbbranch_grant_role_member;
+CREATE DATABASE dbbranch_grant_role_drain_source;
+]);
+$node->safe_psql('dbbranch_grant_role_drain_source', q[CHECKPOINT;]);
+
+my $grant_role_writer =
+  $node->background_psql('dbbranch_grant_role_drain_source', on_error_stop => 1);
+$grant_role_writer->query_safe(
+	q[BEGIN; GRANT dbbranch_grant_role_parent TO dbbranch_grant_role_member;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_grant_role_drain_target FROM DATABASE dbbranch_grant_role_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source grant role');
+like($stderr, qr/source database "dbbranch_grant_role_drain_source" has active write transactions/,
+	'active source grant role holds db branch writer gate');
+
+$grant_role_writer->query_safe(q[COMMIT;]);
+$grant_role_writer->quit;
+
+my $grant_role_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT pg_has_role('dbbranch_grant_role_member', 'dbbranch_grant_role_parent', 'member');]);
+is($grant_role_applied, 't', 'source grant role finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_grant_role_drain_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_grant_role_member;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_grant_role_parent;]);
+
 $node->safe_psql('postgres', q[CREATE ROLE dbbranch_default_reader;]);
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_default_drain_source;]);
 $node->safe_psql('dbbranch_default_drain_source', q[CHECKPOINT;]);

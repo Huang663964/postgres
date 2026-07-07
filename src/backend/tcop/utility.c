@@ -781,6 +781,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_GrantRoleStmt:
 			/* no event triggers for global objects */
+			LockDBBranchUtilityWriteGate();
 			GrantRole(pstate, (GrantRoleStmt *) parsetree);
 			break;
 
