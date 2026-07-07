@@ -1544,6 +1544,8 @@ $node->safe_psql(
 	'dbbranch_wal_source',
 	q[
 CREATE TABLE wal_rows (id int PRIMARY KEY, payload text NOT NULL);
+CREATE TABLE gin_rows (id int PRIMARY KEY, tags text[] NOT NULL);
+CREATE INDEX gin_rows_tags_idx ON gin_rows USING gin (tags);
 CREATE SEQUENCE wal_seq CACHE 1;
 INSERT INTO wal_rows VALUES (1, repeat('a', 9000)), (2, repeat('b', 9000));
 SELECT nextval('wal_seq');
@@ -1551,6 +1553,7 @@ CHECKPOINT;
 UPDATE wal_rows SET payload = repeat('c', 9000) WHERE id = 1;
 DELETE FROM wal_rows WHERE id = 2;
 INSERT INTO wal_rows VALUES (3, repeat('d', 9000));
+INSERT INTO gin_rows VALUES (1, ARRAY['branch', 'gin']), (2, ARRAY['source']);
 SELECT nextval('wal_seq');
 ]);
 
@@ -1585,6 +1588,14 @@ is(
 		'dbbranch_wal_target',
 		q[SELECT bt_index_check('wal_rows_pkey', true);]),
 	'', 'branch btree passes amcheck after WAL replay');
+
+my $gin_index_lookup = $node->safe_psql(
+	'dbbranch_wal_target',
+	q[
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY id) FROM gin_rows WHERE tags @> ARRAY['branch'];
+]);
+is($gin_index_lookup, '1', 'branch GIN index lookup sees replayed row');
 
 my $source_sequence = $node->safe_psql(
 	'dbbranch_wal_source',
