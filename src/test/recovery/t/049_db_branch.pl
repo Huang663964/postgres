@@ -720,6 +720,66 @@ is($range_type_exists, '1', 'branch succeeds after source create range type drai
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_range_type_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_range_type_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_type_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_type_drain_source',
+	q[
+CREATE TYPE dbbranch_varchar_type;
+CREATE FUNCTION dbbranch_varchar_in(cstring, oid, integer) RETURNS dbbranch_varchar_type
+LANGUAGE internal IMMUTABLE PARALLEL SAFE STRICT AS 'varcharin';
+CREATE FUNCTION dbbranch_varchar_out(dbbranch_varchar_type) RETURNS cstring
+LANGUAGE internal IMMUTABLE PARALLEL SAFE STRICT AS 'varcharout';
+CREATE TYPE dbbranch_varchar_type (
+	input = dbbranch_varchar_in,
+	output = dbbranch_varchar_out,
+	alignment = integer,
+	storage = main
+);
+CHECKPOINT;
+]);
+
+my $alter_type_locker = $node->background_psql('dbbranch_alter_type_drain_source', on_error_stop => 1);
+$alter_type_locker->query_safe(q[BEGIN; LOCK TABLE pg_type IN ACCESS EXCLUSIVE MODE;]);
+my $alter_type_writer = $node->background_psql('dbbranch_alter_type_drain_source', on_error_stop => 1);
+$alter_type_writer->query_until(
+	qr/start_alter_type_drain_type/,
+	q(\echo start_alter_type_drain_type
+ALTER TYPE dbbranch_varchar_type SET (storage = extended);
+\echo finish_alter_type_drain_type
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_type_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER TYPE dbbranch_varchar_type%';
+]), 'active source alter type waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_type_drain_target FROM DATABASE dbbranch_alter_type_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter type');
+like($stderr, qr/source database "dbbranch_alter_type_drain_source" has active write transactions/,
+	'active source alter type holds db branch writer gate');
+
+$alter_type_locker->query_safe(q[COMMIT;]);
+$alter_type_locker->quit;
+$alter_type_writer->query_until(qr/finish_alter_type_drain_type/, '');
+$alter_type_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_type_drain_target FROM DATABASE dbbranch_alter_type_drain_source]);
+my $altered_type_storage = $node->safe_psql(
+	'dbbranch_alter_type_drain_target',
+	q[SELECT typstorage FROM pg_type WHERE typname = 'dbbranch_varchar_type';]);
+is($altered_type_storage, 'x', 'branch succeeds after source alter type drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_type_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_type_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_enum_drain_source;]);
 $node->safe_psql(
 	'dbbranch_alter_enum_drain_source',
