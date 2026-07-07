@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 117
+	skip 'Injection points not supported by this build', 121
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -426,6 +426,57 @@ WHERE datname = 'dbbranch_vacuum_drain_source'
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_cluster_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_cluster_drain_source',
+		q[
+CREATE TABLE cluster_rows (id int PRIMARY KEY, note text);
+INSERT INTO cluster_rows SELECT g, repeat('x', 100) FROM generate_series(1, 25) g;
+CHECKPOINT;
+]);
+
+	my $cluster_locker = $node->background_psql('dbbranch_cluster_drain_source', on_error_stop => 1);
+	$cluster_locker->query_safe(q[BEGIN; LOCK TABLE cluster_rows IN ACCESS EXCLUSIVE MODE;]);
+	my $cluster_writer = $node->background_psql('dbbranch_cluster_drain_source', on_error_stop => 1);
+	$cluster_writer->query_until(
+		qr/start_cluster_drain_cluster/,
+		q(\echo start_cluster_drain_cluster
+CLUSTER cluster_rows USING cluster_rows_pkey;
+\echo finish_cluster_drain_cluster
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_cluster_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CLUSTER%';
+]), 'active source cluster waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_cluster_drain_target FROM DATABASE dbbranch_cluster_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source cluster');
+	like($stderr, qr/source database "dbbranch_cluster_drain_source" has active write transactions/,
+		'active source cluster holds db branch writer gate');
+
+	$cluster_locker->query_safe(q[COMMIT;]);
+	$cluster_locker->quit;
+	$cluster_writer->query_until(qr/finish_cluster_drain_cluster/, '');
+	$cluster_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_cluster_drain_target FROM DATABASE dbbranch_cluster_drain_source]);
+	my $cluster_rows = $node->safe_psql(
+		'dbbranch_cluster_drain_target',
+		q[SELECT count(*) FROM cluster_rows;]);
+	is($cluster_rows, '25', 'branch succeeds after source cluster drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_fail_source;]);
 	$node->safe_psql(

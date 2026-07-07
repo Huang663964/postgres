@@ -32,6 +32,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
@@ -76,8 +77,18 @@ static void copy_table_data(Relation NewHeap, Relation OldHeap, Relation OldInde
 static List *get_tables_to_cluster(MemoryContext cluster_context);
 static List *get_tables_to_cluster_partitioned(MemoryContext cluster_context,
 											   Oid indexOid);
+static void LockDBBranchClusterWriteGate(void);
 static bool cluster_is_permitted_for_relation(Oid relid, Oid userid);
 
+static void
+LockDBBranchClusterWriteGate(void)
+{
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: CLUSTER can wait on relation locks before assigning an XID. */
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+}
 
 /*---------------------------------------------------------------------------
  * This cluster code allows for clustering multiple tables at once. Because
@@ -130,6 +141,7 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 	}
 
 	params.options = (verbose ? CLUOPT_VERBOSE : 0);
+	LockDBBranchClusterWriteGate();
 
 	if (stmt->relation != NULL)
 	{
@@ -276,6 +288,7 @@ cluster_multiple_rels(List *rtcs, ClusterParams *params)
 
 		/* Start a new transaction for each relation. */
 		StartTransactionCommand();
+		LockDBBranchClusterWriteGate();
 
 		/* functions in indexes may want a snapshot set */
 		PushActiveSnapshot(GetTransactionSnapshot());
