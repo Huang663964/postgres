@@ -3046,11 +3046,74 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_copy_drain_source;]);
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 136
+	skip 'Injection points not supported by this build', 139
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
 	$node->safe_psql('postgres', q[CREATE EXTENSION IF NOT EXISTS injection_points;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_import_schema_drain_source;]);
+	my $node_port = $node->port;
+	$node->safe_psql(
+		'dbbranch_import_schema_drain_source',
+		qq[
+CREATE EXTENSION postgres_fdw;
+CREATE SCHEMA import_src;
+CREATE TABLE import_src.import_rows (id int PRIMARY KEY);
+CREATE SCHEMA import_dest;
+CREATE SERVER dbbranch_import_server FOREIGN DATA WRAPPER postgres_fdw
+  OPTIONS (dbname 'dbbranch_import_schema_drain_source', port '$node_port');
+CREATE USER MAPPING FOR CURRENT_USER SERVER dbbranch_import_server;
+CHECKPOINT;
+]);
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-import-foreign-schema', 'wait');]);
+	my $import_schema_writer =
+	  $node->background_psql('dbbranch_import_schema_drain_source', on_error_stop => 1);
+	$import_schema_writer->query_until(
+		qr/start_import_schema_drain_import/,
+		q(\echo start_import_schema_drain_import
+IMPORT FOREIGN SCHEMA import_src LIMIT TO (import_rows) FROM SERVER dbbranch_import_server INTO import_dest;
+\echo finish_import_schema_drain_import
+));
+	$node->wait_for_event('client backend', 'db-branch-import-foreign-schema');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_import_schema_drain_target FROM DATABASE dbbranch_import_schema_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source import foreign schema');
+	like($stderr, qr/source database "dbbranch_import_schema_drain_source" has active write transactions/,
+		'active source import foreign schema holds db branch writer gate');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('db-branch-import-foreign-schema');]);
+	$import_schema_writer->query_until(qr/finish_import_schema_drain_import/, '');
+	$import_schema_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_import_schema_drain_target FROM DATABASE dbbranch_import_schema_drain_source]);
+	my $import_schema_table_exists = $node->safe_psql(
+		'dbbranch_import_schema_drain_target',
+		q[
+SELECT count(*)
+FROM pg_foreign_table ft
+JOIN pg_class c ON c.oid = ft.ftrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'import_dest'
+  AND c.relname = 'import_rows';
+]);
+	is($import_schema_table_exists, '1',
+		'branch succeeds after source import foreign schema drains');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_detach('db-branch-import-foreign-schema');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_import_schema_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_import_schema_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_idle_drain_source;]);
 	$node->safe_psql(
 		'dbbranch_idle_drain_source',

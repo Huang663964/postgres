@@ -66,6 +66,7 @@
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 
 /* Hook for plugins to get control in ProcessUtility() */
@@ -1681,6 +1682,8 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_ImportForeignSchemaStmt:
+				LockDBBranchUtilityWriteGate();
+				INJECTION_POINT("db-branch-import-foreign-schema", NULL);
 				ImportForeignSchema((ImportForeignSchemaStmt *) parsetree);
 				/* commands are stashed inside ImportForeignSchema */
 				commandCollected = true;

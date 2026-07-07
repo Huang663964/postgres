@@ -12,6 +12,7 @@
 EXTRA_INSTALL=contrib/amcheck \
 	contrib/pg_prewarm \
 	contrib/pg_stat_statements \
+	contrib/postgres_fdw \
 	contrib/test_decoding \
 	src/test/modules/dummy_seclabel \
 	src/test/modules/injection_points
