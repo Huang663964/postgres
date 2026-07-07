@@ -24,6 +24,7 @@
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_db_role_setting.h"
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
@@ -1053,6 +1054,8 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 	{
 		databaseid = get_database_oid(stmt->database, false);
 		shdepLockAndCheckObject(DatabaseRelationId, databaseid);
+		/* ponytail: ALTER ROLE ... IN DATABASE often runs from postgres. */
+		LockSharedObject(DbBranchRelationId, databaseid, 0, RowExclusiveLock);
 
 		if (!stmt->role)
 		{

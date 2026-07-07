@@ -4907,6 +4907,47 @@ ALTER DATABASE dbbranch_alter_database_drain_source CONNECTION LIMIT -1;
 DROP DATABASE dbbranch_alter_database_drain_source;
 ]);
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_role_setting_drain_role LOGIN;');
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_role_setting_drain_source;]);
+$node->safe_psql('dbbranch_role_setting_drain_source', q[CHECKPOINT;]);
+
+my $role_setting_writer =
+  $node->background_psql('postgres', on_error_stop => 1);
+$role_setting_writer->query_safe(
+	q[BEGIN; ALTER ROLE dbbranch_role_setting_drain_role IN DATABASE dbbranch_role_setting_drain_source SET maintenance_work_mem = '33MB';]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_role_setting_drain_target FROM DATABASE dbbranch_role_setting_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source role-in-database setting');
+like($stderr, qr/source database "dbbranch_role_setting_drain_source" has active write transactions/,
+	'active source role-in-database setting holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source role-in-database setting writes separate metadata file');
+
+$role_setting_writer->query_safe(q[COMMIT;]);
+$role_setting_writer->quit;
+
+my $role_setting_work_mem = $node->safe_psql(
+	'dbbranch_role_setting_drain_source',
+	q[SHOW maintenance_work_mem;],
+	extra_params => [ '--username' => 'dbbranch_role_setting_drain_role' ]);
+is($role_setting_work_mem, '33MB',
+	'source role-in-database setting finishes after db branch rejects');
+
+$node->safe_psql(
+	'postgres',
+	q[
+ALTER ROLE dbbranch_role_setting_drain_role IN DATABASE dbbranch_role_setting_drain_source RESET maintenance_work_mem;
+DROP DATABASE dbbranch_role_setting_drain_source;
+DROP ROLE dbbranch_role_setting_drain_role;
+]);
+
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_setting_role LOGIN;');
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_setting_source;');
 $node->safe_psql(
