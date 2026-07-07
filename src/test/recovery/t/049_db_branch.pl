@@ -1269,6 +1269,51 @@ is($owner_changed, 't', 'source alter schema owner finishes after db branch reje
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_owner_drain_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_schema_owner;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_extension_drain_source;]);
+$node->safe_psql('dbbranch_extension_drain_source', q[CHECKPOINT;]);
+
+my $extension_locker = $node->background_psql('dbbranch_extension_drain_source', on_error_stop => 1);
+$extension_locker->query_safe(q[BEGIN; LOCK TABLE pg_extension IN ACCESS EXCLUSIVE MODE;]);
+my $extension_writer = $node->background_psql('dbbranch_extension_drain_source', on_error_stop => 1);
+$extension_writer->query_until(
+	qr/start_extension_drain_extension/,
+	q(\echo start_extension_drain_extension
+CREATE EXTENSION amcheck;
+\echo finish_extension_drain_extension
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_extension_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE EXTENSION amcheck%';
+]), 'active source create extension waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_extension_drain_target FROM DATABASE dbbranch_extension_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create extension');
+like($stderr, qr/source database "dbbranch_extension_drain_source" has active write transactions/,
+	'active source create extension holds db branch writer gate');
+
+$extension_locker->query_safe(q[COMMIT;]);
+$extension_locker->quit;
+$extension_writer->query_until(qr/finish_extension_drain_extension/, '');
+$extension_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_extension_drain_target FROM DATABASE dbbranch_extension_drain_source]);
+my $extension_exists = $node->safe_psql(
+	'dbbranch_extension_drain_target',
+	q[SELECT count(*) FROM pg_extension WHERE extname = 'amcheck';]);
+is($extension_exists, '1', 'branch succeeds after source create extension drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_extension_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_extension_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_depends_drain_source;]);
 $node->safe_psql(
 	'dbbranch_depends_drain_source',

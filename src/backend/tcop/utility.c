@@ -1609,6 +1609,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateExtensionStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateExtension(pstate, (CreateExtensionStmt *) parsetree);
 				break;
 
