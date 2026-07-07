@@ -3799,6 +3799,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	bool		source_has_unlogged;
 	bool		source_has_sequence;
 	volatile bool clone_paths_created = false;
+	volatile bool clone_finished = false;
 	int		notherbackends;
 	int		npreparedxacts;
 	volatile XLogRecPtr redo_ptr = InvalidXLogRecPtr;
@@ -4022,6 +4023,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			char	   *topath = GetDatabasePath(branch_dboid, tablespace_oid);
 
 			clone_paths_created = true;
+			INJECTION_POINT("db-branch-during-clone", NULL);
 			if (!CloneDBBranchDirectory(frompath, topath, failure, sizeof(failure)))
 			{
 				bool		cleanup_ok = CleanupDBBranchClonePath(topath);
@@ -4074,6 +4076,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			pfree(frompath);
 			pfree(topath);
 		}
+		clone_finished = true;
 
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, clone_start);
@@ -4170,6 +4173,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		ErrorData  *edata;
 		bool		cleanup_ok = true;
 		const char *cleanup;
+		const char *clone_metadata_result;
 		const char *replay_method;
 		const char *status_history;
 
@@ -4207,15 +4211,24 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				cleanup = cleanup_ok ? "done" : "failed";
 			else
 				cleanup = "not_started";
+			if (!clone_paths_created)
+				clone_metadata_result = "not_started";
+			else if (!clone_finished)
+				clone_metadata_result = "failed";
+			else
+				clone_metadata_result = clone_result;
 			replay_method = replay_finished ? "rmgr_redo" : "not_started";
-			status_history = clone_paths_created ?
-				"CREATING,COPYING,REPLAYING,FAILED" :
-				"CREATING,FAILED";
+			if (!clone_paths_created)
+				status_history = "CREATING,FAILED";
+			else if (!clone_finished)
+				status_history = "CREATING,COPYING,FAILED";
+			else
+				status_history = "CREATING,COPYING,REPLAYING,FAILED";
 
 			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
-						  clone_paths_created ? clone_result : "not_started", cleanup,
+						  clone_metadata_result, cleanup,
 						  replay_method,
 						  wal_scan,
 						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
