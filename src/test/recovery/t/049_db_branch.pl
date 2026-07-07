@@ -1579,6 +1579,13 @@ SELECT substr(payload, 1, 1) || ':' || length(payload) FROM wal_rows WHERE id = 
 ]);
 is($wal_index_lookup, 'd:9000', 'branch btree index lookup sees replayed row');
 
+$node->safe_psql('dbbranch_wal_target', q[CREATE EXTENSION amcheck;]);
+is(
+	$node->safe_psql(
+		'dbbranch_wal_target',
+		q[SELECT bt_index_check('wal_rows_pkey', true);]),
+	'', 'branch btree passes amcheck after WAL replay');
+
 my $source_sequence = $node->safe_psql(
 	'dbbranch_wal_source',
 	q[SELECT last_value FROM wal_seq;]);
