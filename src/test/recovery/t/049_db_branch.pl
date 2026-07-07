@@ -670,6 +670,51 @@ is($sequence_increment, '2', 'branch succeeds after source alter sequence drains
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_sequence_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_sequence_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
+$node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
+
+my $fdw_locker = $node->background_psql('dbbranch_fdw_drain_source', on_error_stop => 1);
+$fdw_locker->query_safe(q[BEGIN; LOCK TABLE pg_foreign_data_wrapper IN ACCESS EXCLUSIVE MODE;]);
+my $fdw_writer = $node->background_psql('dbbranch_fdw_drain_source', on_error_stop => 1);
+$fdw_writer->query_until(
+	qr/start_fdw_drain_fdw/,
+	q(\echo start_fdw_drain_fdw
+CREATE FOREIGN DATA WRAPPER dbbranch_fdw;
+\echo finish_fdw_drain_fdw
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_fdw_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE FOREIGN DATA WRAPPER dbbranch_fdw%';
+]), 'active source create foreign data wrapper waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_fdw_drain_target FROM DATABASE dbbranch_fdw_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create foreign data wrapper');
+like($stderr, qr/source database "dbbranch_fdw_drain_source" has active write transactions/,
+	'active source create foreign data wrapper holds db branch writer gate');
+
+$fdw_locker->query_safe(q[COMMIT;]);
+$fdw_locker->quit;
+$fdw_writer->query_until(qr/finish_fdw_drain_fdw/, '');
+$fdw_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_fdw_drain_target FROM DATABASE dbbranch_fdw_drain_source]);
+my $fdw_exists = $node->safe_psql(
+	'dbbranch_fdw_drain_target',
+	q[SELECT count(*) FROM pg_foreign_data_wrapper WHERE fdwname = 'dbbranch_fdw';]);
+is($fdw_exists, '1', 'branch succeeds after source create foreign data wrapper drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_fdw_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_fdw_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',
