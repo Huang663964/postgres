@@ -30,6 +30,14 @@ my $source_rows = $node->safe_psql(
 	'SELECT count(*) FROM users;');
 is($source_rows, '3', 'source database baseline is ready for DB Branch');
 
+my $source_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_source';]);
+my $source_dbpath = 'base/' . $source_oid;
+$node->safe_psql('dbbranch_source', q[SELECT 1;]);
+ok(-e $node->data_dir . '/' . $source_dbpath . '/pg_internal.init',
+	'source relcache init file exists before DB Branch clone');
+
 my $source_temp = $node->background_psql('dbbranch_source', on_error_stop => 1);
 $source_temp->query_safe(q[CREATE TEMP TABLE temp_branch_private (id int);]);
 $source_temp->query_safe(q[INSERT INTO temp_branch_private VALUES (1);]);
@@ -111,20 +119,20 @@ if ($result == 0)
 		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_target' AND datallowconn;]);
 	is($branch_count, '1', 'ready branch is connectable');
 
-	my $branch_rows = $node->safe_psql(
-		'dbbranch_target',
-		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
-	is($branch_rows, '1:alice,2:bob,3:carol', 'ready branch can read cloned source rows');
-
-	my $source_oid = $node->safe_psql(
-		'postgres',
-		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_source';]);
 	my $branch_oid = $node->safe_psql(
 		'postgres',
 		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_target';]);
 	is($clone_path, 'base/' . $branch_oid, 'branch storage path uses branch database OID');
 	ok(!-e $node->data_dir . '/' . $clone_path . '/' . $source_temp_file,
 		'db branch clone skips live source temp relation files');
+	ok(!-e $node->data_dir . '/' . $clone_path . '/pg_internal.init',
+		'db branch clone skips source relcache init file');
+
+	my $branch_rows = $node->safe_psql(
+		'dbbranch_target',
+		q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM users;]);
+	is($branch_rows, '1:alice,2:bob,3:carol', 'ready branch can read cloned source rows');
+
 	my $source_locator = $node->safe_psql(
 		'postgres',
 		q[SELECT dattablespace || '/' || oid FROM pg_database WHERE datname = 'dbbranch_source';]);

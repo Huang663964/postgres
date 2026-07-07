@@ -82,6 +82,7 @@
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/pg_locale.h"
+#include "utils/relcache.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -207,7 +208,7 @@ static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
 static bool CloneDBBranchFile(const char *fromfile, const char *tofile,
 							  char *failure, Size failure_len);
 static bool ShouldSkipDBBranchCloneEntry(const char *name);
-static void RemoveDBBranchTempCloneFiles(const char *dbpath);
+static void RemoveDBBranchSkippedCloneFiles(const char *dbpath);
 static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
@@ -3568,13 +3569,16 @@ CloneDBBranchDirectory(const char *fromdir, const char *todir,
 static bool
 ShouldSkipDBBranchCloneEntry(const char *name)
 {
+	if (strcmp(name, RELCACHE_INIT_FILENAME) == 0)
+		return true;
+
 	return strncmp(name, PG_TEMP_FILE_PREFIX,
 				   strlen(PG_TEMP_FILE_PREFIX)) == 0 ||
 		looks_like_temp_rel_name(name);
 }
 
 static void
-RemoveDBBranchTempCloneFiles(const char *dbpath)
+RemoveDBBranchSkippedCloneFiles(const char *dbpath)
 {
 	DIR		   *xldir;
 	struct dirent *xlde;
@@ -3596,7 +3600,7 @@ RemoveDBBranchTempCloneFiles(const char *dbpath)
 		if (xlde_type == PGFILETYPE_REG && unlink(path) != 0)
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not remove temporary clone file \"%s\": %m",
+					 errmsg("could not remove skipped clone file \"%s\": %m",
 							path)));
 	}
 	FreeDir(xldir);
@@ -4144,7 +4148,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				{
 					/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
 					copydir(frompath, topath, false);
-					RemoveDBBranchTempCloneFiles(topath);
+					RemoveDBBranchSkippedCloneFiles(topath);
 					clone_result = "copy_fallback";
 				}
 				else

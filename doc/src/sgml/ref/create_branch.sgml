@@ -115,6 +115,8 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   <para>
    Temporary relation files that belong to live source sessions are not copied
    into the branch storage.
+   Source relation cache initialization files are also skipped and rebuilt by
+   branch backends.
   </para>
 
   <para>
