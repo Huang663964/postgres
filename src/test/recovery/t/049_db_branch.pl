@@ -1181,6 +1181,51 @@ is($cast_count, '1', 'branch succeeds after source create cast drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_opclass_drain_source;]);
+$node->safe_psql('dbbranch_opclass_drain_source', q[CHECKPOINT;]);
+
+my $opclass_writer = $node->background_psql('dbbranch_opclass_drain_source', on_error_stop => 1);
+my $opclass_locker = $node->background_psql('dbbranch_opclass_drain_source', on_error_stop => 1);
+$opclass_locker->query_safe(q[BEGIN; LOCK TABLE pg_opclass IN ACCESS EXCLUSIVE MODE;]);
+$opclass_writer->query_until(
+	qr/start_opclass_drain_opclass/,
+	q(\echo start_opclass_drain_opclass
+CREATE OPERATOR CLASS dbbranch_opclass FOR TYPE int USING btree AS STORAGE int;
+\echo finish_opclass_drain_opclass
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_opclass_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE OPERATOR CLASS dbbranch_opclass%';
+]), 'active source create operator class waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_opclass_drain_target FROM DATABASE dbbranch_opclass_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create operator class');
+like($stderr, qr/source database "dbbranch_opclass_drain_source" has active write transactions/,
+	'active source create operator class holds db branch writer gate');
+
+$opclass_locker->query_safe(q[COMMIT;]);
+$opclass_locker->quit;
+$opclass_writer->query_until(qr/finish_opclass_drain_opclass/, '');
+$opclass_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_opclass_drain_target FROM DATABASE dbbranch_opclass_drain_source]);
+my $opclass_count = $node->safe_psql(
+	'dbbranch_opclass_drain_target',
+	q[SELECT count(*) FROM pg_opclass WHERE opcname = 'dbbranch_opclass';]);
+is($opclass_count, '1', 'branch succeeds after source create operator class drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_opclass_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_opclass_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_operator_drain_source;]);
 $node->safe_psql(
 	'dbbranch_operator_drain_source',

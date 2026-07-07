@@ -1786,6 +1786,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateOpClassStmt:
+				LockDBBranchUtilityWriteGate();
 				DefineOpClass((CreateOpClassStmt *) parsetree);
 				/* command is stashed in DefineOpClass */
 				commandCollected = true;
