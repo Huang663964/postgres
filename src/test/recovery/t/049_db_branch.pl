@@ -261,11 +261,54 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 11
+	skip 'Injection points not supported by this build', 13
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
 	$node->safe_psql('postgres', q[CREATE EXTENSION IF NOT EXISTS injection_points;]);
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_idle_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_idle_drain_source',
+		q[
+CREATE TABLE idle_rows (id int PRIMARY KEY);
+INSERT INTO idle_rows VALUES (1);
+CHECKPOINT;
+]);
+
+	my $idle_reader = $node->background_psql('dbbranch_idle_drain_source', on_error_stop => 1);
+	$idle_reader->query_safe(q[SELECT 1;]);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-before-drain', 'wait');]);
+
+	my $idle_branch = $node->background_psql('postgres', on_error_stop => 1);
+	$idle_branch->query_until(
+		qr/start_idle_drain_branch/,
+		q(\echo start_idle_drain_branch
+CREATE BRANCH dbbranch_idle_drain_target FROM DATABASE dbbranch_idle_drain_source;
+\echo finish_idle_drain_branch
+));
+	$node->wait_for_event('client backend', 'db-branch-before-drain');
+	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-drain');]);
+	usleep(200_000);
+
+	my $idle_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_idle_drain_target';]);
+	is($idle_branch_count, '0', 'db branch waits for idle source backend to leave');
+
+	$idle_reader->quit;
+	$idle_branch->query_until(qr/finish_idle_drain_branch/, '');
+	$idle_branch->quit;
+
+	my $idle_rows = $node->safe_psql(
+		'dbbranch_idle_drain_target',
+		q[SELECT count(*) FROM idle_rows;]);
+	is($idle_rows, '1', 'idle-drained branch reads source rows');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-drain');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_idle_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_idle_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drain_source;]);
 	$node->safe_psql(
 		'dbbranch_drain_source',
