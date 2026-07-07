@@ -93,6 +93,19 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   </para>
 
   <para>
+   The current implementation waits for all existing backends connected to
+   the source database, including read-only sessions.  It does not yet use a
+   writer-only drain.
+  </para>
+
+  <para>
+   WAL replay currently supports records whose block references are local to
+   the source database.  If a required WAL record also references another
+   database or shared state, branch creation fails and records the failure in
+   the diagnostic state file.
+  </para>
+
+  <para>
    Successful branch creation is recorded in the
    <link linkend="catalog-pg-dbbranch"><structname>pg_dbbranch</structname></link>
    system catalog.
