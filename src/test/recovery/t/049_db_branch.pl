@@ -564,6 +564,51 @@ my $schema_table_moved = $node->safe_psql(
 is($schema_table_moved, 't', 'source set schema finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_schema_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_depends_drain_source;]);
+$node->safe_psql(
+	'dbbranch_depends_drain_source',
+	q[
+CREATE MATERIALIZED VIEW depends_mv AS SELECT 1 AS id;
+CHECKPOINT;
+]);
+
+my $depends_locker = $node->background_psql('dbbranch_depends_drain_source', on_error_stop => 1);
+$depends_locker->query_safe(q[BEGIN; SELECT count(*) FROM depends_mv;]);
+my $depends_writer = $node->background_psql('dbbranch_depends_drain_source', on_error_stop => 1);
+$depends_writer->query_until(
+	qr/start_depends_drain_depends/,
+	q(\echo start_depends_drain_depends
+ALTER MATERIALIZED VIEW depends_mv DEPENDS ON EXTENSION plpgsql;
+\echo finish_depends_drain_depends
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_depends_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER MATERIALIZED VIEW depends_mv DEPENDS%';
+]), 'active source depends on extension waits on source matview lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_depends_drain_target FROM DATABASE dbbranch_depends_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source depends on extension');
+like($stderr, qr/source database "dbbranch_depends_drain_source" has active write transactions/,
+	'active source depends on extension holds db branch writer gate');
+
+$depends_locker->query_safe(q[COMMIT;]);
+$depends_locker->quit;
+$depends_writer->query_until(qr/finish_depends_drain_depends/, '');
+$depends_writer->quit;
+
+my $depends_recorded = $node->safe_psql(
+	'dbbranch_depends_drain_source',
+	q[SELECT count(*) FROM pg_depend WHERE classid = 'pg_class'::regclass AND objid = 'depends_mv'::regclass AND refclassid = 'pg_extension'::regclass AND refobjid = (SELECT oid FROM pg_extension WHERE extname = 'plpgsql') AND deptype = 'x';]);
+is($depends_recorded, '1', 'source depends on extension finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_depends_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE ROLE dbbranch_grant_reader;]);
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_grant_drain_source;]);
 $node->safe_psql(

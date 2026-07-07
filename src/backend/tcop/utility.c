@@ -1034,6 +1034,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				AlterObjectDependsStmt *stmt = (AlterObjectDependsStmt *) parsetree;
 
+				LockDBBranchUtilityWriteGate();
 				if (EventTriggerSupportsObjectType(stmt->objectType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
