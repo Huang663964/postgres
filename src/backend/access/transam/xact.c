@@ -33,6 +33,7 @@
 #include "access/xlogutils.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_enum.h"
 #include "catalog/storage.h"
 #include "commands/async.h"
@@ -678,6 +679,25 @@ AssignTransactionId(TransactionState s)
 			AssignTransactionId(parents[--parentOffset]);
 
 		pfree(parents);
+	}
+
+	if (!isSubXact && OidIsValid(MyDatabaseId) && !IsBootstrapProcessingMode())
+	{
+		currentOwner = CurrentResourceOwner;
+		PG_TRY();
+		{
+			CurrentResourceOwner = s->curTransactionOwner;
+			/* ponytail: DB Branch freeze uses this lock; no shared flag table. */
+			LockSharedObject(DbBranchRelationId, MyDatabaseId, 0,
+							 RowExclusiveLock);
+			CurrentResourceOwner = currentOwner;
+		}
+		PG_CATCH();
+		{
+			CurrentResourceOwner = currentOwner;
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 	}
 
 	/*

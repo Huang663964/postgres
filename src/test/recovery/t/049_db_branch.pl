@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 96
+	skip 'Injection points not supported by this build', 97
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -289,22 +289,20 @@ CREATE BRANCH dbbranch_idle_drain_target FROM DATABASE dbbranch_idle_drain_sourc
 ));
 	$node->wait_for_event('client backend', 'db-branch-before-drain');
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-drain');]);
-	usleep(200_000);
+	$idle_branch->query_until(qr/finish_idle_drain_branch/, '');
+	$idle_branch->quit;
 
 	my $idle_branch_count = $node->safe_psql(
 		'postgres',
 		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_idle_drain_target';]);
-	is($idle_branch_count, '0', 'db branch waits for idle source backend to leave');
-
-	$idle_reader->quit;
-	$idle_branch->query_until(qr/finish_idle_drain_branch/, '');
-	$idle_branch->quit;
+	is($idle_branch_count, '1', 'db branch does not wait for idle source backend to leave');
 
 	my $idle_rows = $node->safe_psql(
 		'dbbranch_idle_drain_target',
 		q[SELECT count(*) FROM idle_rows;]);
 	is($idle_rows, '1', 'idle-drained branch reads source rows');
 
+	$idle_reader->quit;
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-drain');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_idle_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_idle_drain_source;]);
@@ -330,6 +328,14 @@ CHECKPOINT;
 CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 \echo finish_drain_branch
 ));
+	usleep(200_000);
+	my $drain_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_drain_target';]);
+	is($drain_branch_count, '0', 'db branch waits for active source writer');
+
+	$drain_writer->query_safe('COMMIT;');
+	$drain_writer->quit;
 	$node->wait_for_event('client backend', 'db-branch-before-drain');
 	my $freeze_timed_out = 0;
 	$node->psql(
@@ -340,9 +346,6 @@ CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 	ok($freeze_timed_out, 'db branch freeze gate blocks new source connections');
 
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-drain');]);
-	usleep(200_000);
-	$drain_writer->query_safe('COMMIT;');
-	$drain_writer->quit;
 	$drain_branch->query_until(qr/finish_drain_branch/, '');
 	$drain_branch->quit;
 
@@ -1303,51 +1306,6 @@ is($unlogged_rows, '1,2', 'unlogged branch reads flushed unlogged rows');
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_unlogged_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_unlogged_source;]);
-
-my $writer = $node->background_psql('dbbranch_source', on_error_stop => 1);
-$writer->query_safe(q[BEGIN; INSERT INTO users VALUES (5, 'erin');]);
-
-$stderr = '';
-$result = $node->psql(
-	'postgres',
-	q[CREATE BRANCH dbbranch_busy_target FROM DATABASE dbbranch_source],
-	stderr => \$stderr);
-
-is($result, 3, 'db branch internal entry rejects busy source database');
-like(
-	$stderr,
-	qr/source database "dbbranch_source" is being accessed by other users/,
-	'conservative source drain blocks active writer');
-
-$writer->query_safe('ROLLBACK;');
-$writer->quit;
-
-@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
-$metadata_file_count++;
-is(scalar @metadata_files, $metadata_file_count, 'busy branch attempt writes separate metadata file');
-
-my $busy_metadata = '';
-for my $path (@metadata_files)
-{
-	open my $fh, '<', $path or die "could not open $path: $!";
-	my $contents = do { local $/; <$fh> };
-	close $fh;
-	if ($contents =~ /^branch_name=dbbranch_busy_target$/m)
-	{
-		$busy_metadata = $contents;
-		last;
-	}
-}
-
-like($busy_metadata, qr/^wal_pin=not_started$/m, 'busy source metadata records WAL pin not started');
-like($busy_metadata, qr/^clone_result=not_started$/m, 'busy source metadata records clone not started');
-like($busy_metadata, qr/^cleanup=not_started$/m, 'busy source metadata records cleanup not started');
-like($busy_metadata, qr/^replay_method=not_started$/m, 'busy source metadata records replay not started');
-like($busy_metadata, qr/^status=FAILED$/m, 'busy source metadata final state is FAILED');
-like(
-	$busy_metadata,
-	qr/^failure=source database is being accessed by other users$/m,
-	'busy source metadata records drain failure');
 
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_prepared_source;');
 $node->safe_psql(

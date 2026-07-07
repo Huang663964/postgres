@@ -210,6 +210,7 @@ static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
 static void ReleaseDBBranchWalPin(void);
+static bool LockDBBranchSourceWriteGate(Oid source_dboid, int *npreparedxacts);
 static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
 									  Oid tablespace_oid);
 static void CopyDBBranchDatabaseSettings(Oid source_dboid, Oid branch_dboid);
@@ -3590,6 +3591,30 @@ ReleaseDBBranchWalPin(void)
 		ReplicationSlotDropAcquired();
 }
 
+static bool
+LockDBBranchSourceWriteGate(Oid source_dboid, int *npreparedxacts)
+{
+	int			tries;
+
+	for (tries = 0; tries < 50; tries++)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		*npreparedxacts = CountDBPreparedXacts(source_dboid);
+		if (*npreparedxacts > 0)
+			return false;
+
+		if (ConditionalLockSharedObject(DbBranchRelationId, source_dboid, 0,
+										ShareLock))
+			return true;
+
+		pg_usleep(100 * 1000L);
+	}
+
+	*npreparedxacts = CountDBPreparedXacts(source_dboid);
+	return false;
+}
+
 static void
 LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
 						  Oid tablespace_oid)
@@ -3801,7 +3826,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	bool		source_has_sequence;
 	volatile bool clone_paths_created = false;
 	volatile bool clone_finished = false;
-	int		notherbackends;
 	int		npreparedxacts;
 	int		nsubscriptions;
 	volatile XLogRecPtr redo_ptr = InvalidXLogRecPtr;
@@ -3823,6 +3847,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	TimestampTz created_at = GetCurrentTimestamp();
 	TimestampTz ready_at;
 	volatile bool source_lock_held = false;
+	volatile bool source_write_gate_held = false;
 	volatile bool replay_finished = false;
 	volatile bool failure_metadata_written = false;
 
@@ -3938,15 +3963,12 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 								  nsubscriptions, nsubscriptions)));
 	}
 
-	/* ponytail: full backend drain first; relax to writer-only gate later. */
-	INJECTION_POINT("db-branch-before-drain", NULL);
-
-	if (CountOtherDBBackends(source_dboid, &notherbackends, &npreparedxacts))
+	if (!LockDBBranchSourceWriteGate(source_dboid, &npreparedxacts))
 	{
 		const char *busy_failure =
-			(npreparedxacts > 0 && notherbackends == 0) ?
+			(npreparedxacts > 0) ?
 			"source database has prepared transactions" :
-			"source database is being accessed by other users";
+			"source database has active write transactions";
 
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
@@ -3959,19 +3981,22 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 						  NULL,
 						  source_blocking_ms, 0.0, 0.0,
 						  "CREATING,FAILED", "FAILED", busy_failure);
-		if (npreparedxacts > 0 && notherbackends == 0)
+		if (npreparedxacts > 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_IN_USE),
 					 errmsg("source database \"%s\" has prepared transactions",
 							source_name),
-					 errdetail_busy_db(notherbackends, npreparedxacts)));
+					 errdetail_busy_db(0, npreparedxacts)));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_IN_USE),
-					 errmsg("source database \"%s\" is being accessed by other users",
-							source_name),
-					 errdetail_busy_db(notherbackends, npreparedxacts)));
+					 errmsg("source database \"%s\" has active write transactions",
+							source_name)));
 	}
+	source_write_gate_held = true;
+
+	INJECTION_POINT("db-branch-before-drain", NULL);
+
 	branch_hash = hash_bytes((const unsigned char *) branch_name, strlen(branch_name));
 	srcpath = GetDatabasePath(source_dboid, source_deftablespace);
 	MakeDBBranchWalPinName(source_dboid, branch_hash, wal_pin_name,
@@ -4008,6 +4033,11 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			INSTR_TIME_SUBTRACT(elapsed, source_block_start);
 			source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 
+			if (source_write_gate_held)
+			{
+				UnlockSharedObject(DbBranchRelationId, source_dboid, 0, ShareLock);
+				source_write_gate_held = false;
+			}
 			if (source_lock_held)
 			{
 				UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
@@ -4116,6 +4146,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		 * source freeze ends after branch_lsn is fixed and storage is cloned;
 		 * replay must not keep source connections blocked.
 		 */
+		UnlockSharedObject(DbBranchRelationId, source_dboid, 0, ShareLock);
+		source_write_gate_held = false;
 		UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
 		source_lock_held = false;
 
@@ -4221,6 +4253,11 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		}
 		else
 			edata = NULL;
+		if (source_write_gate_held)
+		{
+			UnlockSharedObject(DbBranchRelationId, source_dboid, 0, ShareLock);
+			source_write_gate_held = false;
+		}
 		if (source_lock_held)
 		{
 			UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);

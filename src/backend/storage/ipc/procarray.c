@@ -3622,6 +3622,35 @@ CountDBBackends(Oid databaseid)
 }
 
 /*
+ * CountDBPreparedXacts --- count prepared transactions for a database
+ */
+int
+CountDBPreparedXacts(Oid databaseid)
+{
+	ProcArrayStruct *arrayP = procArray;
+	int			count = 0;
+	int			index;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	for (index = 0; index < arrayP->numProcs; index++)
+	{
+		int			pgprocno = arrayP->pgprocnos[index];
+		PGPROC	   *proc = &allProcs[pgprocno];
+
+		if (proc->pid != 0)
+			continue;
+		if (!OidIsValid(databaseid) ||
+			proc->databaseId == databaseid)
+			count++;
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	return count;
+}
+
+/*
  * CountDBConnections --- counts database backends (only regular backends)
  */
 int

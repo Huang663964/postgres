@@ -99,9 +99,10 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   </para>
 
   <para>
-   The current implementation waits for all existing backends connected to
-   the source database, including read-only sessions.  It does not yet use a
-   writer-only drain.
+   The current implementation gates writers while the source database is
+   cloned.  Existing idle or read-only sessions can stay connected, but new
+   source connections and write transactions wait until the branch setup
+   releases the source lock.
   </para>
 
   <para>
