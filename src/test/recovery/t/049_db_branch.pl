@@ -424,6 +424,53 @@ my $policy_exists = $node->safe_psql(
 is($policy_exists, '1', 'source create policy finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_policy_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_policy_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_policy_drain_source',
+	q[
+CREATE TABLE alter_policy_rows (id int PRIMARY KEY);
+CREATE POLICY alter_policy_rows_select ON alter_policy_rows FOR SELECT USING (id > 0);
+INSERT INTO alter_policy_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $alter_policy_locker = $node->background_psql('dbbranch_alter_policy_drain_source', on_error_stop => 1);
+$alter_policy_locker->query_safe(q[BEGIN; LOCK TABLE alter_policy_rows IN ACCESS SHARE MODE;]);
+my $alter_policy_writer = $node->background_psql('dbbranch_alter_policy_drain_source', on_error_stop => 1);
+$alter_policy_writer->query_until(
+	qr/start_alter_policy_drain_policy/,
+	q(\echo start_alter_policy_drain_policy
+ALTER POLICY alter_policy_rows_select ON alter_policy_rows USING (id > 1);
+\echo finish_alter_policy_drain_policy
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_policy_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER POLICY alter_policy_rows_select%';
+]), 'active source alter policy waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_policy_drain_target FROM DATABASE dbbranch_alter_policy_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter policy');
+like($stderr, qr/source database "dbbranch_alter_policy_drain_source" has active write transactions/,
+	'active source alter policy holds db branch writer gate');
+
+$alter_policy_locker->query_safe(q[COMMIT;]);
+$alter_policy_locker->quit;
+$alter_policy_writer->query_until(qr/finish_alter_policy_drain_policy/, '');
+$alter_policy_writer->quit;
+
+my $alter_policy_expr = $node->safe_psql(
+	'dbbranch_alter_policy_drain_source',
+	q[SELECT pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polname = 'alter_policy_rows_select';]);
+like($alter_policy_expr, qr/id > 1/, 'source alter policy finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_policy_drain_source;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136
