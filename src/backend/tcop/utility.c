@@ -1834,6 +1834,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CommentStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CommentObject((CommentStmt *) parsetree);
 				break;
 

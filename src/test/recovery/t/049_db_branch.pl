@@ -565,6 +565,52 @@ is($grant_applied, 't', 'source grant finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_grant_drain_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_grant_reader;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_comment_drain_source;]);
+$node->safe_psql(
+	'dbbranch_comment_drain_source',
+	q[
+CREATE TABLE comment_rows (id int PRIMARY KEY);
+INSERT INTO comment_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $comment_locker = $node->background_psql('dbbranch_comment_drain_source', on_error_stop => 1);
+$comment_locker->query_safe(q[BEGIN; LOCK TABLE comment_rows IN ACCESS EXCLUSIVE MODE;]);
+my $comment_writer = $node->background_psql('dbbranch_comment_drain_source', on_error_stop => 1);
+$comment_writer->query_until(
+	qr/start_comment_drain_comment/,
+	q(\echo start_comment_drain_comment
+COMMENT ON TABLE comment_rows IS 'branch comment';
+\echo finish_comment_drain_comment
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_comment_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'COMMENT ON TABLE comment_rows%';
+]), 'active source comment waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_comment_drain_target FROM DATABASE dbbranch_comment_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source comment');
+like($stderr, qr/source database "dbbranch_comment_drain_source" has active write transactions/,
+	'active source comment holds db branch writer gate');
+
+$comment_locker->query_safe(q[COMMIT;]);
+$comment_locker->quit;
+$comment_writer->query_until(qr/finish_comment_drain_comment/, '');
+$comment_writer->quit;
+
+my $comment_applied = $node->safe_psql(
+	'dbbranch_comment_drain_source',
+	q[SELECT obj_description('comment_rows'::regclass);]);
+is($comment_applied, 'branch comment', 'source comment finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_comment_drain_source;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136
