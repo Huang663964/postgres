@@ -611,6 +611,54 @@ my $comment_applied = $node->safe_psql(
 is($comment_applied, 'branch comment', 'source comment finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_comment_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_copy_drain_source;]);
+$node->safe_psql(
+	'dbbranch_copy_drain_source',
+	q[
+CREATE TABLE copy_rows (id int PRIMARY KEY);
+INSERT INTO copy_rows VALUES (1);
+CHECKPOINT;
+]);
+
+my $copy_locker = $node->background_psql('dbbranch_copy_drain_source', on_error_stop => 1);
+$copy_locker->query_safe(q[BEGIN; LOCK TABLE copy_rows IN ACCESS EXCLUSIVE MODE;]);
+my $copy_writer = $node->background_psql('dbbranch_copy_drain_source', on_error_stop => 1);
+$copy_writer->query_until(
+	qr/start_copy_drain_copy/,
+	q(\echo start_copy_drain_copy
+COPY copy_rows FROM STDIN;
+2
+\.
+\echo finish_copy_drain_copy
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_copy_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'COPY copy_rows%';
+]), 'active source copy from waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_copy_drain_target FROM DATABASE dbbranch_copy_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source copy from');
+like($stderr, qr/source database "dbbranch_copy_drain_source" has active write transactions/,
+	'active source copy from holds db branch writer gate');
+
+$copy_locker->query_safe(q[COMMIT;]);
+$copy_locker->quit;
+$copy_writer->query_until(qr/finish_copy_drain_copy/, '');
+$copy_writer->quit;
+
+my $copy_rows = $node->safe_psql(
+	'dbbranch_copy_drain_source',
+	q[SELECT count(*) FROM copy_rows;]);
+is($copy_rows, '2', 'source copy from finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_copy_drain_source;]);
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 136

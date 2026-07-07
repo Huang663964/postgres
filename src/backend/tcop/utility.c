@@ -747,9 +747,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_CopyStmt:
 			{
+				CopyStmt   *stmt = (CopyStmt *) parsetree;
 				uint64		processed;
 
-				DoCopy(pstate, (CopyStmt *) parsetree,
+				if (stmt->is_from)
+					LockDBBranchUtilityWriteGate();
+
+				DoCopy(pstate, stmt,
 					   pstmt->stmt_location, pstmt->stmt_len,
 					   &processed);
 				if (qc)
