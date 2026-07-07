@@ -13,6 +13,7 @@ EXTRA_INSTALL=contrib/amcheck \
 	contrib/pg_prewarm \
 	contrib/pg_stat_statements \
 	contrib/test_decoding \
+	src/test/modules/dummy_seclabel \
 	src/test/modules/injection_points
 
 subdir = src/test/recovery

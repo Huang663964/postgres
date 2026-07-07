@@ -1100,6 +1100,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				SecLabelStmt *stmt = (SecLabelStmt *) parsetree;
 
+				LockDBBranchUtilityWriteGate();
 				if (EventTriggerSupportsObjectType(stmt->objtype))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,

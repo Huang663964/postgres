@@ -2961,6 +2961,41 @@ is($comment_role_applied, 'branch role comment',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_comment_role_drain_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_comment_role_waiter;]);
 
+$node->safe_psql(
+	'postgres',
+	q[
+CREATE ROLE dbbranch_seclabel_role_waiter;
+CREATE DATABASE dbbranch_seclabel_role_drain_source;
+]);
+$node->safe_psql('dbbranch_seclabel_role_drain_source', q[CHECKPOINT;]);
+
+my $seclabel_role_writer =
+  $node->background_psql('dbbranch_seclabel_role_drain_source', on_error_stop => 1);
+$seclabel_role_writer->query_safe(
+	q[LOAD 'dummy_seclabel';]);
+$seclabel_role_writer->query_safe(
+	q[BEGIN; SECURITY LABEL FOR 'dummy' ON ROLE dbbranch_seclabel_role_waiter IS 'classified';]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_seclabel_role_drain_target FROM DATABASE dbbranch_seclabel_role_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source security label role');
+like($stderr, qr/source database "dbbranch_seclabel_role_drain_source" has active write transactions/,
+	'active source security label role holds db branch writer gate');
+
+$seclabel_role_writer->query_safe(q[COMMIT;]);
+$seclabel_role_writer->quit;
+
+my $seclabel_role_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT label FROM pg_shseclabel WHERE objoid = 'dbbranch_seclabel_role_waiter'::regrole AND provider = 'dummy';]);
+is($seclabel_role_applied, 'classified',
+	'source security label role finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_seclabel_role_drain_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_seclabel_role_waiter;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_copy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_copy_drain_source',
