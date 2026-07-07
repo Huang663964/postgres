@@ -1954,6 +1954,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterStatsStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterStatistics((AlterStatsStmt *) parsetree);
 				break;
 

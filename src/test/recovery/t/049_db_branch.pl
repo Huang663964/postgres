@@ -1715,6 +1715,58 @@ WHERE datname = 'dbbranch_stats_drain_source'
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_stats_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_stats_drain_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_stats_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_alter_stats_drain_source',
+		q[
+CREATE TABLE alter_stats_rows (id int, grp int);
+INSERT INTO alter_stats_rows SELECT g, g % 3 FROM generate_series(1, 25) g;
+CREATE STATISTICS alter_stats_rows_id_grp ON id, grp FROM alter_stats_rows;
+CHECKPOINT;
+]);
+
+	my $alter_stats_locker = $node->background_psql('dbbranch_alter_stats_drain_source', on_error_stop => 1);
+	$alter_stats_locker->query_safe(q[BEGIN; LOCK TABLE pg_statistic_ext IN ACCESS EXCLUSIVE MODE;]);
+	my $alter_stats_writer = $node->background_psql('dbbranch_alter_stats_drain_source', on_error_stop => 1);
+	$alter_stats_writer->query_until(
+		qr/start_alter_stats_drain_stats/,
+		q(\echo start_alter_stats_drain_stats
+ALTER STATISTICS alter_stats_rows_id_grp SET STATISTICS 2;
+\echo finish_alter_stats_drain_stats
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_stats_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER STATISTICS alter_stats_rows_id_grp%';
+]), 'active source alter statistics waits on source catalog lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_alter_stats_drain_target FROM DATABASE dbbranch_alter_stats_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source alter statistics');
+	like($stderr, qr/source database "dbbranch_alter_stats_drain_source" has active write transactions/,
+		'active source alter statistics holds db branch writer gate');
+
+	$alter_stats_locker->query_safe(q[COMMIT;]);
+	$alter_stats_locker->quit;
+	$alter_stats_writer->query_until(qr/finish_alter_stats_drain_stats/, '');
+	$alter_stats_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_alter_stats_drain_target FROM DATABASE dbbranch_alter_stats_drain_source]);
+	my $alter_stats_target = $node->safe_psql(
+		'dbbranch_alter_stats_drain_target',
+		q[SELECT stxstattarget FROM pg_statistic_ext WHERE stxname = 'alter_stats_rows_id_grp';]);
+	is($alter_stats_target, '2', 'branch succeeds after source alter statistics drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_stats_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_stats_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_publication_drain_source;]);
 	$node->safe_psql(
 		'dbbranch_publication_drain_source',
