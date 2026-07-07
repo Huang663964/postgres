@@ -1062,6 +1062,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				AlterOwnerStmt *stmt = (AlterOwnerStmt *) parsetree;
 
+				LockDBBranchUtilityWriteGate();
 				if (EventTriggerSupportsObjectType(stmt->objectType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
