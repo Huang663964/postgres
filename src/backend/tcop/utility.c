@@ -1807,6 +1807,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateTransformStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateTransform((CreateTransformStmt *) parsetree);
 				break;
 

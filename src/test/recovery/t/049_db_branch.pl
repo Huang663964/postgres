@@ -422,6 +422,60 @@ is($access_method_exists, '1', 'branch succeeds after source create access metho
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_am_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_am_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_transform_drain_source;]);
+$node->safe_psql('dbbranch_transform_drain_source', q[CHECKPOINT;]);
+
+my $transform_writer = $node->background_psql('dbbranch_transform_drain_source', on_error_stop => 1);
+my $transform_locker = $node->background_psql('dbbranch_transform_drain_source', on_error_stop => 1);
+$transform_locker->query_safe(q[BEGIN; LOCK TABLE pg_transform IN ACCESS EXCLUSIVE MODE;]);
+$transform_writer->query_until(
+	qr/start_transform_drain_transform/,
+	q(\echo start_transform_drain_transform
+CREATE TRANSFORM FOR int LANGUAGE SQL (
+    FROM SQL WITH FUNCTION prsd_lextype(internal),
+    TO SQL WITH FUNCTION int4recv(internal));
+\echo finish_transform_drain_transform
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_transform_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE TRANSFORM FOR int LANGUAGE SQL%';
+]), 'active source create transform waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_transform_drain_target FROM DATABASE dbbranch_transform_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create transform');
+like($stderr, qr/source database "dbbranch_transform_drain_source" has active write transactions/,
+	'active source create transform holds db branch writer gate');
+
+$transform_locker->query_safe(q[COMMIT;]);
+$transform_locker->quit;
+$transform_writer->query_until(qr/finish_transform_drain_transform/, '');
+$transform_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_transform_drain_target FROM DATABASE dbbranch_transform_drain_source]);
+my $transform_exists = $node->safe_psql(
+	'dbbranch_transform_drain_target',
+	q[
+SELECT count(*)
+FROM pg_transform tr
+JOIN pg_type ty ON ty.oid = tr.trftype
+JOIN pg_language la ON la.oid = tr.trflang
+WHERE ty.typname = 'int4'
+  AND la.lanname = 'sql';
+]);
+is($transform_exists, '1', 'branch succeeds after source create transform drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_transform_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_transform_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_rule_drain_source;]);
 $node->safe_psql(
 	'dbbranch_rule_drain_source',
