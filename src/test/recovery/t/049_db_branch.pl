@@ -2591,6 +2591,32 @@ my $depends_recorded = $node->safe_psql(
 is($depends_recorded, '1', 'source depends on extension finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_depends_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_role_drain_source;]);
+$node->safe_psql('dbbranch_create_role_drain_source', q[CHECKPOINT;]);
+
+my $create_role_writer =
+  $node->background_psql('dbbranch_create_role_drain_source', on_error_stop => 1);
+$create_role_writer->query_safe(q[BEGIN; CREATE ROLE dbbranch_create_role_waiter;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_create_role_drain_target FROM DATABASE dbbranch_create_role_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create role');
+like($stderr, qr/source database "dbbranch_create_role_drain_source" has active write transactions/,
+	'active source create role holds db branch writer gate');
+
+$create_role_writer->query_safe(q[COMMIT;]);
+$create_role_writer->quit;
+
+my $create_role_exists = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_roles WHERE rolname = 'dbbranch_create_role_waiter';]);
+is($create_role_exists, '1', 'source create role finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_create_role_waiter;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_role_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE ROLE dbbranch_default_reader;]);
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_default_drain_source;]);
 $node->safe_psql('dbbranch_default_drain_source', q[CHECKPOINT;]);

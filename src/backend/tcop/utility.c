@@ -932,21 +932,25 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			 */
 		case T_CreateRoleStmt:
 			/* no event triggers for global objects */
+			LockDBBranchUtilityWriteGate();
 			CreateRole(pstate, (CreateRoleStmt *) parsetree);
 			break;
 
 		case T_AlterRoleStmt:
 			/* no event triggers for global objects */
+			LockDBBranchUtilityWriteGate();
 			AlterRole(pstate, (AlterRoleStmt *) parsetree);
 			break;
 
 		case T_AlterRoleSetStmt:
 			/* no event triggers for global objects */
+			LockDBBranchUtilityWriteGate();
 			AlterRoleSet((AlterRoleSetStmt *) parsetree);
 			break;
 
 		case T_DropRoleStmt:
 			/* no event triggers for global objects */
+			LockDBBranchUtilityWriteGate();
 			DropRole((DropRoleStmt *) parsetree);
 			break;
 
