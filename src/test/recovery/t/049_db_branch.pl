@@ -2928,6 +2928,39 @@ my $comment_applied = $node->safe_psql(
 is($comment_applied, 'branch comment', 'source comment finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_comment_drain_source;]);
 
+$node->safe_psql(
+	'postgres',
+	q[
+CREATE ROLE dbbranch_comment_role_waiter;
+CREATE DATABASE dbbranch_comment_role_drain_source;
+]);
+$node->safe_psql('dbbranch_comment_role_drain_source', q[CHECKPOINT;]);
+
+my $comment_role_writer =
+  $node->background_psql('dbbranch_comment_role_drain_source', on_error_stop => 1);
+$comment_role_writer->query_safe(
+	q[BEGIN; COMMENT ON ROLE dbbranch_comment_role_waiter IS 'branch role comment';]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_comment_role_drain_target FROM DATABASE dbbranch_comment_role_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source comment role');
+like($stderr, qr/source database "dbbranch_comment_role_drain_source" has active write transactions/,
+	'active source comment role holds db branch writer gate');
+
+$comment_role_writer->query_safe(q[COMMIT;]);
+$comment_role_writer->quit;
+
+my $comment_role_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT shobj_description('dbbranch_comment_role_waiter'::regrole, 'pg_authid');]);
+is($comment_role_applied, 'branch role comment',
+	'source comment role finishes after db branch rejects');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_comment_role_drain_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_comment_role_waiter;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_copy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_copy_drain_source',

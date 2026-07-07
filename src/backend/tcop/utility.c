@@ -1089,7 +1089,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 									   context, params, queryEnv,
 									   dest, qc);
 				else
+				{
+					LockDBBranchUtilityWriteGate();
 					CommentObject(stmt);
+				}
 				break;
 			}
 
