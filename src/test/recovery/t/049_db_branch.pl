@@ -4623,6 +4623,73 @@ my $func_lookup = $node->safe_psql(
 	q[SELECT to_regprocedure('pg_create_database_branch(name,name)') IS NULL;]);
 is($func_lookup, 't', 'CREATE BRANCH has no SQL wrapper function');
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_database_drain_source;]);
+$node->safe_psql('dbbranch_alter_database_drain_source', q[CHECKPOINT;]);
+
+my $alter_database_set_writer =
+  $node->background_psql('dbbranch_alter_database_drain_source', on_error_stop => 1);
+$alter_database_set_writer->query_safe(
+	q[BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source SET work_mem = '65MB';]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_database_set_drain_target FROM DATABASE dbbranch_alter_database_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter database set');
+like($stderr, qr/source database "dbbranch_alter_database_drain_source" has active write transactions/,
+	'active source alter database set holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source alter database set writes separate metadata file');
+
+$alter_database_set_writer->query_safe(q[COMMIT;]);
+$alter_database_set_writer->quit;
+
+my $alter_database_work_mem = $node->safe_psql(
+	'dbbranch_alter_database_drain_source',
+	q[SHOW work_mem;]);
+is($alter_database_work_mem, '65MB',
+	'source alter database set finishes after db branch rejects');
+
+my $alter_database_writer =
+  $node->background_psql('dbbranch_alter_database_drain_source', on_error_stop => 1);
+$alter_database_writer->query_safe(
+	q[BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source CONNECTION LIMIT 8;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_database_drain_target FROM DATABASE dbbranch_alter_database_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter database');
+like($stderr, qr/source database "dbbranch_alter_database_drain_source" has active write transactions/,
+	'active source alter database holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source alter database writes separate metadata file');
+
+$alter_database_writer->query_safe(q[COMMIT;]);
+$alter_database_writer->quit;
+
+my $alter_database_connlimit = $node->safe_psql(
+	'postgres',
+	q[SELECT datconnlimit FROM pg_database WHERE datname = 'dbbranch_alter_database_drain_source';]);
+is($alter_database_connlimit, '8',
+	'source alter database finishes after db branch rejects');
+
+$node->safe_psql(
+	'postgres',
+	q[
+ALTER DATABASE dbbranch_alter_database_drain_source RESET work_mem;
+ALTER DATABASE dbbranch_alter_database_drain_source CONNECTION LIMIT -1;
+DROP DATABASE dbbranch_alter_database_drain_source;
+]);
+
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_setting_role LOGIN;');
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_setting_source;');
 $node->safe_psql(
