@@ -966,6 +966,59 @@ is($ctas_row_count, '2', 'branch succeeds after source create table as drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_ctas_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_ctas_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_refresh_matview_drain_source;]);
+$node->safe_psql(
+	'dbbranch_refresh_matview_drain_source',
+	q[
+CREATE TABLE matview_rows (id int);
+INSERT INTO matview_rows VALUES (1);
+CREATE MATERIALIZED VIEW dbbranch_matview AS SELECT * FROM matview_rows;
+INSERT INTO matview_rows VALUES (2);
+CHECKPOINT;
+]);
+
+my $refresh_matview_locker = $node->background_psql('dbbranch_refresh_matview_drain_source', on_error_stop => 1);
+$refresh_matview_locker->query_safe(q[BEGIN; LOCK TABLE matview_rows IN ACCESS EXCLUSIVE MODE;]);
+my $refresh_matview_writer = $node->background_psql('dbbranch_refresh_matview_drain_source', on_error_stop => 1);
+$refresh_matview_writer->query_until(
+	qr/start_refresh_matview_drain_matview/,
+	q(\echo start_refresh_matview_drain_matview
+REFRESH MATERIALIZED VIEW dbbranch_matview;
+\echo finish_refresh_matview_drain_matview
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_refresh_matview_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'REFRESH MATERIALIZED VIEW dbbranch_matview%';
+]), 'active source refresh materialized view waits on source table lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_refresh_matview_drain_target FROM DATABASE dbbranch_refresh_matview_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source refresh materialized view');
+like($stderr, qr/source database "dbbranch_refresh_matview_drain_source" has active write transactions/,
+	'active source refresh materialized view holds db branch writer gate');
+
+$refresh_matview_locker->query_safe(q[COMMIT;]);
+$refresh_matview_locker->quit;
+$refresh_matview_writer->query_until(qr/finish_refresh_matview_drain_matview/, '');
+$refresh_matview_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_refresh_matview_drain_target FROM DATABASE dbbranch_refresh_matview_drain_source]);
+my $matview_row_count = $node->safe_psql(
+	'dbbranch_refresh_matview_drain_target',
+	q[SELECT count(*) FROM dbbranch_matview;]);
+is($matview_row_count, '2', 'branch succeeds after source refresh materialized view drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_refresh_matview_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_refresh_matview_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
 $node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
 

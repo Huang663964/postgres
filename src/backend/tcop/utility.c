@@ -1736,6 +1736,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_RefreshMatViewStmt:
+				LockDBBranchUtilityWriteGate();
 
 				/*
 				 * REFRESH CONCURRENTLY executes some DDL commands internally.
