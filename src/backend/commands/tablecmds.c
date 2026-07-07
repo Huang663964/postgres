@@ -789,6 +789,9 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	LOCKMODE	parentLockmode;
 	Oid			accessMethodId = InvalidOid;
 
+	if (RELKIND_HAS_STORAGE(relkind))
+		LockDBBranchTableWriteGate();
+
 	/*
 	 * Truncate relname to appropriate length (probably a waste of time, as
 	 * parser should have done this already).

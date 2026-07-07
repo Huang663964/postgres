@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 129
+	skip 'Injection points not supported by this build', 132
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -323,6 +323,60 @@ SELECT setval('idle_unlogged_seq', 7);
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-drain');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_idle_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_idle_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_create_drain_source',
+		q[
+CREATE TABLE create_base_rows (id int PRIMARY KEY);
+INSERT INTO create_base_rows VALUES (1);
+CHECKPOINT;
+]);
+	my $create_writer = $node->background_psql('dbbranch_create_drain_source', on_error_stop => 1);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-before-clone', 'wait');]);
+
+	my $create_branch = $node->background_psql('postgres', on_error_stop => 1);
+	$create_branch->query_until(
+		qr/start_create_drain_branch/,
+		q(\echo start_create_drain_branch
+CREATE BRANCH dbbranch_create_drain_target FROM DATABASE dbbranch_create_drain_source;
+\echo finish_create_drain_branch
+	));
+	$node->wait_for_event('client backend', 'db-branch-before-clone');
+
+	$create_writer->query_until(
+		qr/start_create_drain_create/,
+		q(\echo start_create_drain_create
+CREATE TABLE created_during_branch (id int PRIMARY KEY);
+\echo finish_create_drain_create
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_create_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE TABLE created_during_branch%';
+]), 'source create table waits on db branch writer gate');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-clone');]);
+	$create_branch->query_until(qr/finish_create_drain_branch/, '');
+	$create_branch->quit;
+	$create_writer->query_until(qr/finish_create_drain_create/, '');
+	$create_writer->quit;
+
+	my $source_created_table = $node->safe_psql(
+		'dbbranch_create_drain_source',
+		q[SELECT to_regclass('public.created_during_branch') IS NOT NULL;]);
+	is($source_created_table, 't', 'source create table finishes after db branch releases gate');
+	my $branch_created_table = $node->safe_psql(
+		'dbbranch_create_drain_target',
+		q[SELECT to_regclass('public.created_during_branch') IS NULL;]);
+	is($branch_created_table, 't', 'branch excludes source table created after clone started');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-clone');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drain_source;]);
 	$node->safe_psql(
