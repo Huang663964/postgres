@@ -1791,6 +1791,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateOpFamilyStmt:
+				LockDBBranchUtilityWriteGate();
 				address = DefineOpFamily((CreateOpFamilyStmt *) parsetree);
 
 				/*

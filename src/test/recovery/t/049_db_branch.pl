@@ -1121,6 +1121,51 @@ is($cast_count, '1', 'branch succeeds after source create cast drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cast_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_opfamily_drain_source;]);
+$node->safe_psql('dbbranch_opfamily_drain_source', q[CHECKPOINT;]);
+
+my $opfamily_locker = $node->background_psql('dbbranch_opfamily_drain_source', on_error_stop => 1);
+$opfamily_locker->query_safe(q[BEGIN; LOCK TABLE pg_opfamily IN ACCESS EXCLUSIVE MODE;]);
+my $opfamily_writer = $node->background_psql('dbbranch_opfamily_drain_source', on_error_stop => 1);
+$opfamily_writer->query_until(
+	qr/start_opfamily_drain_opfamily/,
+	q(\echo start_opfamily_drain_opfamily
+CREATE OPERATOR FAMILY dbbranch_opfamily USING btree;
+\echo finish_opfamily_drain_opfamily
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_opfamily_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE OPERATOR FAMILY dbbranch_opfamily%';
+]), 'active source create operator family waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_opfamily_drain_target FROM DATABASE dbbranch_opfamily_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create operator family');
+like($stderr, qr/source database "dbbranch_opfamily_drain_source" has active write transactions/,
+	'active source create operator family holds db branch writer gate');
+
+$opfamily_locker->query_safe(q[COMMIT;]);
+$opfamily_locker->quit;
+$opfamily_writer->query_until(qr/finish_opfamily_drain_opfamily/, '');
+$opfamily_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_opfamily_drain_target FROM DATABASE dbbranch_opfamily_drain_source]);
+my $opfamily_count = $node->safe_psql(
+	'dbbranch_opfamily_drain_target',
+	q[SELECT count(*) FROM pg_opfamily WHERE opfname = 'dbbranch_opfamily';]);
+is($opfamily_count, '1', 'branch succeeds after source create operator family drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_opfamily_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_opfamily_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_fdw_drain_source;]);
 $node->safe_psql('dbbranch_fdw_drain_source', q[CHECKPOINT;]);
 
