@@ -1371,6 +1371,8 @@ ProcessUtilitySlow(ParseState *pstate,
 				{
 					AlterDomainStmt *stmt = (AlterDomainStmt *) parsetree;
 
+					LockDBBranchUtilityWriteGate();
+
 					/*
 					 * Some or all of these functions are recursive to cover
 					 * inherited things, so permission checks are done there.
