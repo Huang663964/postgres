@@ -530,6 +530,51 @@ is($function_cost, '2', 'branch succeeds after source alter function drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_domain_drain_source;]);
+$node->safe_psql('dbbranch_domain_drain_source', q[CHECKPOINT;]);
+
+my $domain_locker = $node->background_psql('dbbranch_domain_drain_source', on_error_stop => 1);
+$domain_locker->query_safe(q[BEGIN; LOCK TABLE pg_type IN ACCESS EXCLUSIVE MODE;]);
+my $domain_writer = $node->background_psql('dbbranch_domain_drain_source', on_error_stop => 1);
+$domain_writer->query_until(
+	qr/start_domain_drain_domain/,
+	q(\echo start_domain_drain_domain
+CREATE DOMAIN positive_int AS int CHECK (VALUE > 0);
+\echo finish_domain_drain_domain
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_domain_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE DOMAIN positive_int%';
+]), 'active source create domain waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_domain_drain_target FROM DATABASE dbbranch_domain_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create domain');
+like($stderr, qr/source database "dbbranch_domain_drain_source" has active write transactions/,
+	'active source create domain holds db branch writer gate');
+
+$domain_locker->query_safe(q[COMMIT;]);
+$domain_locker->quit;
+$domain_writer->query_until(qr/finish_domain_drain_domain/, '');
+$domain_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_domain_drain_target FROM DATABASE dbbranch_domain_drain_source]);
+my $domain_exists = $node->safe_psql(
+	'dbbranch_domain_drain_target',
+	q[SELECT count(*) FROM pg_type WHERE typname = 'positive_int';]);
+is($domain_exists, '1', 'branch succeeds after source create domain drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_domain_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_domain_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',

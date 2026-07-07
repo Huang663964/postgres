@@ -1751,6 +1751,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateDomainStmt:
+				LockDBBranchUtilityWriteGate();
 				address = DefineDomain(pstate, (CreateDomainStmt *) parsetree);
 				break;
 
