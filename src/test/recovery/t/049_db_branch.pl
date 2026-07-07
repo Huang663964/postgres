@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 37
+	skip 'Injection points not supported by this build', 53
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -354,6 +354,94 @@ CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-drain');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_fail_source;]);
+	$node->safe_psql(
+		'dbbranch_clone_fail_source',
+		q[
+CREATE TABLE clone_fail_rows (id int PRIMARY KEY);
+INSERT INTO clone_fail_rows VALUES (1);
+CHECKPOINT;
+UPDATE clone_fail_rows SET id = 1 WHERE id = 1;
+]);
+
+	my %clone_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @clone_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-before-clone', 'error');]);
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_clone_fail_target FROM DATABASE dbbranch_clone_fail_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports injected clone setup failure');
+	like($stderr, qr/db-branch-before-clone/,
+		'db branch surfaces clone setup injection failure');
+
+	my $clone_fail_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_clone_fail_target';]);
+	is($clone_fail_branch_count, '0', 'clone setup failure creates no branch database');
+
+	my $clone_fail_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($clone_fail_slot_count, '0', 'clone setup failure releases DB Branch WAL pin');
+
+	my @clone_paths_left = grep { !$clone_base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @clone_paths_left, 0, 'clone setup failure creates no branch storage path');
+
+	my $clone_source_rows = $node->safe_psql(
+		'dbbranch_clone_fail_source',
+		q[
+INSERT INTO clone_fail_rows VALUES (2);
+SELECT count(*) FROM clone_fail_rows;
+]);
+	is($clone_source_rows, '2', 'source accepts writes after clone setup failure');
+
+	my @clone_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @clone_metadata_files, scalar(@clone_metadata_before) + 1,
+		'clone setup failure writes separate metadata file');
+
+	my $clone_metadata = '';
+	for my $path (@clone_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_clone_fail_target$/m)
+		{
+			$clone_metadata = $contents;
+			last;
+		}
+	}
+
+	like($clone_metadata, qr/^wal_pin=released$/m,
+		'clone setup failure metadata records released WAL pin');
+	like($clone_metadata, qr/^redo_ptr=[0-9A-F]+\/[0-9A-F]+$/m,
+		'clone setup failure metadata records redo pointer');
+	unlike($clone_metadata, qr/^redo_ptr=0\/0$/m,
+		'clone setup failure redo pointer is valid');
+	like($clone_metadata, qr/^branch_lsn=[0-9A-F]+\/[0-9A-F]+$/m,
+		'clone setup failure metadata records branch LSN');
+	unlike($clone_metadata, qr/^branch_lsn=0\/0$/m,
+		'clone setup failure branch LSN is valid');
+	like($clone_metadata, qr/^clone_result=not_started$/m,
+		'clone setup failure metadata records clone not started');
+	like($clone_metadata, qr/^cleanup=not_started$/m,
+		'clone setup failure metadata records cleanup not started');
+	like($clone_metadata, qr/^replay_method=not_started$/m,
+		'clone setup failure metadata records replay not started');
+	like($clone_metadata, qr/^status_history=CREATING,FAILED$/m,
+		'clone setup failure metadata records failed transition');
+	like($clone_metadata, qr/^status=FAILED$/m,
+		'clone setup failure metadata final state is FAILED');
+	like($clone_metadata, qr/^failure=.+db-branch-before-clone.*$/m,
+		'clone setup failure metadata records failure reason');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-clone');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_clone_fail_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_gate_source;]);
 	$node->safe_psql(

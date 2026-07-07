@@ -4012,6 +4012,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			FlushDatabaseBuffers(source_dboid);
 		}
 
+		INJECTION_POINT("db-branch-before-clone", NULL);
+
 		INSTR_TIME_SET_CURRENT(clone_start);
 		foreach(cell, tablespace_oids)
 		{
@@ -4213,7 +4215,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
 						  redo_ptr, branch_lsn, clone_path,
 						  "released",
-						  clone_result, cleanup,
+						  clone_paths_created ? clone_result : "not_started", cleanup,
 						  replay_method,
 						  wal_scan,
 						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
