@@ -804,6 +804,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_CreatedbStmt:
 			/* no event triggers for global objects */
 			PreventInTransactionBlock(isTopLevel, "CREATE DATABASE");
+			LockDBBranchUtilityWriteGate();
+			INJECTION_POINT("db-branch-create-database", NULL);
 			createdb(pstate, (CreatedbStmt *) parsetree);
 			break;
 
@@ -828,6 +830,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_DropdbStmt:
 			/* no event triggers for global objects */
 			PreventInTransactionBlock(isTopLevel, "DROP DATABASE");
+			LockDBBranchUtilityWriteGate();
+			INJECTION_POINT("db-branch-drop-database", NULL);
 			DropDatabase(pstate, (DropdbStmt *) parsetree);
 			break;
 

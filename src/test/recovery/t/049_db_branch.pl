@@ -3046,11 +3046,85 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_copy_drain_source;]);
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 145
+	skip 'Injection points not supported by this build', 151
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
 	$node->safe_psql('postgres', q[CREATE EXTENSION IF NOT EXISTS injection_points;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_createdb_drain_source;]);
+	$node->safe_psql('dbbranch_createdb_drain_source', q[CHECKPOINT;]);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-create-database', 'wait');]);
+	my $createdb_writer =
+	  $node->background_psql('dbbranch_createdb_drain_source', on_error_stop => 1);
+	$createdb_writer->query_until(
+		qr/start_createdb_drain_createdb/,
+		q(\echo start_createdb_drain_createdb
+CREATE DATABASE dbbranch_createdb_created;
+\echo finish_createdb_drain_createdb
+));
+	$node->wait_for_event('client backend', 'db-branch-create-database');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_createdb_drain_target FROM DATABASE dbbranch_createdb_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source create database');
+	like($stderr, qr/source database "dbbranch_createdb_drain_source" has active write transactions/,
+		'active source create database holds db branch writer gate');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('db-branch-create-database');]);
+	$createdb_writer->query_until(qr/finish_createdb_drain_createdb/, '');
+	$createdb_writer->quit;
+	my $created_db_exists = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_createdb_created';]);
+	is($created_db_exists, '1',
+		'source create database finishes after db branch rejects');
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_detach('db-branch-create-database');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_createdb_created;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_createdb_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_dropdb_drain_source;]);
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_dropdb_dropped;]);
+	$node->safe_psql('dbbranch_dropdb_drain_source', q[CHECKPOINT;]);
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-drop-database', 'wait');]);
+	my $dropdb_writer =
+	  $node->background_psql('dbbranch_dropdb_drain_source', on_error_stop => 1);
+	$dropdb_writer->query_until(
+		qr/start_dropdb_drain_dropdb/,
+		q(\echo start_dropdb_drain_dropdb
+DROP DATABASE dbbranch_dropdb_dropped;
+\echo finish_dropdb_drain_dropdb
+));
+	$node->wait_for_event('client backend', 'db-branch-drop-database');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_dropdb_drain_target FROM DATABASE dbbranch_dropdb_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source drop database');
+	like($stderr, qr/source database "dbbranch_dropdb_drain_source" has active write transactions/,
+		'active source drop database holds db branch writer gate');
+
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_wakeup('db-branch-drop-database');]);
+	$dropdb_writer->query_until(qr/finish_dropdb_drain_dropdb/, '');
+	$dropdb_writer->quit;
+	my $dropped_db_exists = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_dropdb_dropped';]);
+	is($dropped_db_exists, '0',
+		'source drop database finishes after db branch rejects');
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_detach('db-branch-drop-database');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_dropdb_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_create_tspc_drain_source;]);
 	$node->safe_psql('dbbranch_create_tspc_drain_source', q[CHECKPOINT;]);
