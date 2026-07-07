@@ -1403,6 +1403,74 @@ my ($prepared_clone_path) = $prepared_metadata =~ /^clone_path=(.*)$/m;
 ok($prepared_clone_path eq '' || !-e $node->data_dir . '/' . $prepared_clone_path,
 	'prepared rejection does not create clone staging path');
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_subscription_source;');
+$node->safe_psql(
+	'dbbranch_subscription_source',
+	q[
+CREATE SUBSCRIPTION dbbranch_subscription_sub
+CONNECTION 'dbname=dbbranch_subscription_missing'
+PUBLICATION dbbranch_subscription_pub
+WITH (slot_name = NONE, connect = false);
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_subscription_target FROM DATABASE dbbranch_subscription_source],
+	stderr => \$stderr);
+
+is($result, 3, 'db branch rejects source database with subscription');
+like(
+	$stderr,
+	qr/source database "dbbranch_subscription_source" is being used by logical replication subscription/,
+	'db branch reports subscription limitation');
+
+my $subscription_branch_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_subscription_target';]);
+is($subscription_branch_count, '0', 'subscription source rejection creates no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'subscription source rejection writes separate metadata file');
+
+my $subscription_metadata = '';
+for my $path (@metadata_files)
+{
+	open my $fh, '<', $path or die "could not open $path: $!";
+	my $contents = do { local $/; <$fh> };
+	close $fh;
+	if ($contents =~ /^branch_name=dbbranch_subscription_target$/m)
+	{
+		$subscription_metadata = $contents;
+		last;
+	}
+}
+
+like($subscription_metadata, qr/^wal_pin=not_started$/m,
+	'subscription metadata records WAL pin not started');
+like($subscription_metadata, qr/^clone_result=not_started$/m,
+	'subscription metadata records clone not started');
+like($subscription_metadata, qr/^cleanup=not_started$/m,
+	'subscription metadata records cleanup not started');
+like($subscription_metadata, qr/^replay_method=not_started$/m,
+	'subscription metadata records replay not started');
+like($subscription_metadata, qr/^status=FAILED$/m,
+	'subscription metadata final state is FAILED');
+like(
+	$subscription_metadata,
+	qr/^failure=source database has logical replication subscriptions$/m,
+	'subscription metadata records rejection reason');
+my ($subscription_clone_path) = $subscription_metadata =~ /^clone_path=(.*)$/m;
+ok($subscription_clone_path eq '' || !-e $node->data_dir . '/' . $subscription_clone_path,
+	'subscription rejection does not create clone staging path');
+
+$node->safe_psql(
+	'dbbranch_subscription_source',
+	q[DROP SUBSCRIPTION dbbranch_subscription_sub;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_subscription_source;]);
+
 $node->safe_psql(
 	'postgres',
 	q[

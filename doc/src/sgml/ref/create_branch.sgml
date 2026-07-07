@@ -93,6 +93,12 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   </para>
 
   <para>
+   The source database must not contain logical replication subscriptions.
+   Subscriptions may hold resources outside the source database, so this
+   prototype refuses to clone them into a branch.
+  </para>
+
+  <para>
    The current implementation waits for all existing backends connected to
    the source database, including read-only sessions.  It does not yet use a
    writer-only drain.
