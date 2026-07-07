@@ -4691,6 +4691,65 @@ $node->safe_psql(
 	q[DROP SUBSCRIPTION dbbranch_create_subscription_sub;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_subscription_drain_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_alter_subscription_drain_source;');
+$node->safe_psql(
+	'dbbranch_alter_subscription_drain_source',
+	q[
+CREATE SUBSCRIPTION dbbranch_alter_subscription_sub
+CONNECTION 'dbname=dbbranch_subscription_missing'
+PUBLICATION dbbranch_subscription_pub
+WITH (slot_name = NONE, connect = false);
+CHECKPOINT;
+]);
+
+my $alter_subscription_locker =
+  $node->background_psql('dbbranch_alter_subscription_drain_source', on_error_stop => 1);
+my $alter_subscription_writer =
+  $node->background_psql('dbbranch_alter_subscription_drain_source', on_error_stop => 1);
+$alter_subscription_locker->query_safe(q[BEGIN; LOCK TABLE pg_subscription IN ACCESS EXCLUSIVE MODE;]);
+$alter_subscription_writer->query_until(
+	qr/start_alter_subscription_drain_subscription/,
+	q(\echo start_alter_subscription_drain_subscription
+ALTER SUBSCRIPTION dbbranch_alter_subscription_sub DISABLE;
+\echo finish_alter_subscription_drain_subscription
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_subscription_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER SUBSCRIPTION dbbranch_alter_subscription_sub%';
+]), 'active source alter subscription waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_subscription_drain_target FROM DATABASE dbbranch_alter_subscription_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter subscription');
+like($stderr, qr/source database "dbbranch_alter_subscription_drain_source" has active write transactions/,
+	'active source alter subscription holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source alter subscription writes separate metadata file');
+
+$alter_subscription_locker->query_safe(q[COMMIT;]);
+$alter_subscription_locker->quit;
+$alter_subscription_writer->query_until(qr/finish_alter_subscription_drain_subscription/, '');
+$alter_subscription_writer->quit;
+
+my $alter_subscription_disabled = $node->safe_psql(
+	'dbbranch_alter_subscription_drain_source',
+	q[SELECT NOT subenabled FROM pg_subscription WHERE subname = 'dbbranch_alter_subscription_sub';]);
+is($alter_subscription_disabled, 't', 'source alter subscription completes after drain test');
+
+$node->safe_psql(
+	'dbbranch_alter_subscription_drain_source',
+	q[DROP SUBSCRIPTION dbbranch_alter_subscription_sub;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_subscription_drain_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_subscription_source;');
 $node->safe_psql(
 	'dbbranch_subscription_source',

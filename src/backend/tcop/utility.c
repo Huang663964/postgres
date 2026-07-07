@@ -1946,6 +1946,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterSubscriptionStmt:
+				LockDBBranchUtilityWriteGate();
 				address = AlterSubscription(pstate,
 											(AlterSubscriptionStmt *) parsetree,
 											isTopLevel);
