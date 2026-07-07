@@ -4798,6 +4798,44 @@ $node->safe_psql(
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_setting_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_setting_role;]);
 
+my $tablespace_options_dir = $node->basedir . '/dbbranch_tablespace_options';
+mkdir($tablespace_options_dir) or die "could not create $tablespace_options_dir: $!";
+$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_options_ts LOCATION '$tablespace_options_dir';");
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_tablespace_options_drain_source;]);
+$node->safe_psql('dbbranch_tablespace_options_drain_source', q[CHECKPOINT;]);
+
+my $tablespace_options_writer =
+  $node->background_psql('dbbranch_tablespace_options_drain_source', on_error_stop => 1);
+$tablespace_options_writer->query_safe(
+	q[BEGIN; ALTER TABLESPACE dbbranch_options_ts SET (random_page_cost = 1.7);]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_tablespace_options_drain_target FROM DATABASE dbbranch_tablespace_options_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter tablespace options');
+like($stderr, qr/source database "dbbranch_tablespace_options_drain_source" has active write transactions/,
+	'active source alter tablespace options holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source alter tablespace options writes separate metadata file');
+
+$tablespace_options_writer->query_safe(q[COMMIT;]);
+$tablespace_options_writer->quit;
+
+my $tablespace_option_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT spcoptions @> ARRAY['random_page_cost=1.7'] FROM pg_tablespace WHERE spcname = 'dbbranch_options_ts';]);
+is($tablespace_option_applied, 't',
+	'source alter tablespace options finishes after db branch rejects');
+
+$node->safe_psql('postgres', q[ALTER TABLESPACE dbbranch_options_ts RESET (random_page_cost);]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_tablespace_options_drain_source;]);
+$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_options_ts;]);
+
 my $tablespace_dir = $node->basedir . '/dbbranch_ts';
 mkdir($tablespace_dir) or die "could not create $tablespace_dir: $!";
 $node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_ts LOCATION '$tablespace_dir';");

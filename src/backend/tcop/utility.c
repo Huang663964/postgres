@@ -738,6 +738,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_AlterTableSpaceOptionsStmt:
 			/* no event triggers for global objects */
+			LockDBBranchUtilityWriteGate();
 			AlterTableSpaceOptions((AlterTableSpaceOptionsStmt *) parsetree);
 			break;
 
