@@ -720,6 +720,61 @@ is($range_type_exists, '1', 'branch succeeds after source create range type drai
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_range_type_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_range_type_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_alter_enum_drain_source;]);
+$node->safe_psql(
+	'dbbranch_alter_enum_drain_source',
+	q[
+CREATE TYPE dbbranch_alter_enum AS ENUM ('ready', 'failed');
+CHECKPOINT;
+]);
+
+my $alter_enum_locker = $node->background_psql('dbbranch_alter_enum_drain_source', on_error_stop => 1);
+$alter_enum_locker->query_safe(q[BEGIN; LOCK TABLE pg_enum IN ACCESS EXCLUSIVE MODE;]);
+my $alter_enum_writer = $node->background_psql('dbbranch_alter_enum_drain_source', on_error_stop => 1);
+$alter_enum_writer->query_until(
+	qr/start_alter_enum_drain_enum/,
+	q(\echo start_alter_enum_drain_enum
+ALTER TYPE dbbranch_alter_enum ADD VALUE 'replayed';
+\echo finish_alter_enum_drain_enum
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_alter_enum_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'ALTER TYPE dbbranch_alter_enum%';
+]), 'active source alter enum waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_enum_drain_target FROM DATABASE dbbranch_alter_enum_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter enum');
+like($stderr, qr/source database "dbbranch_alter_enum_drain_source" has active write transactions/,
+	'active source alter enum holds db branch writer gate');
+
+$alter_enum_locker->query_safe(q[COMMIT;]);
+$alter_enum_locker->quit;
+$alter_enum_writer->query_until(qr/finish_alter_enum_drain_enum/, '');
+$alter_enum_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_enum_drain_target FROM DATABASE dbbranch_alter_enum_drain_source]);
+my $altered_enum_label_count = $node->safe_psql(
+	'dbbranch_alter_enum_drain_target',
+	q[
+SELECT count(*)
+FROM pg_type t
+JOIN pg_enum e ON e.enumtypid = t.oid
+WHERE t.typname = 'dbbranch_alter_enum';
+]);
+is($altered_enum_label_count, '3', 'branch succeeds after source alter enum drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_enum_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_enum_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_define_drain_source;]);
 $node->safe_psql('dbbranch_define_drain_source', q[CHECKPOINT;]);
 

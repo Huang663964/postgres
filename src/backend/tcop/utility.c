@@ -1688,6 +1688,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_AlterEnumStmt:	/* ALTER TYPE (enum) */
+				LockDBBranchUtilityWriteGate();
 				address = AlterEnum((AlterEnumStmt *) parsetree);
 				break;
 
