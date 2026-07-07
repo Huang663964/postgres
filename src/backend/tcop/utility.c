@@ -1677,6 +1677,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateEnumStmt:	/* CREATE TYPE AS ENUM */
+				LockDBBranchUtilityWriteGate();
 				address = DefineEnum((CreateEnumStmt *) parsetree);
 				break;
 

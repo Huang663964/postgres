@@ -575,6 +575,56 @@ is($domain_exists, '1', 'branch succeeds after source create domain drains');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_domain_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_domain_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_enum_drain_source;]);
+$node->safe_psql('dbbranch_enum_drain_source', q[CHECKPOINT;]);
+
+my $enum_locker = $node->background_psql('dbbranch_enum_drain_source', on_error_stop => 1);
+$enum_locker->query_safe(q[BEGIN; LOCK TABLE pg_type IN ACCESS EXCLUSIVE MODE;]);
+my $enum_writer = $node->background_psql('dbbranch_enum_drain_source', on_error_stop => 1);
+$enum_writer->query_until(
+	qr/start_enum_drain_enum/,
+	q(\echo start_enum_drain_enum
+CREATE TYPE dbbranch_enum AS ENUM ('ready', 'failed');
+\echo finish_enum_drain_enum
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_enum_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE TYPE dbbranch_enum%';
+]), 'active source create enum waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_enum_drain_target FROM DATABASE dbbranch_enum_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create enum');
+like($stderr, qr/source database "dbbranch_enum_drain_source" has active write transactions/,
+	'active source create enum holds db branch writer gate');
+
+$enum_locker->query_safe(q[COMMIT;]);
+$enum_locker->quit;
+$enum_writer->query_until(qr/finish_enum_drain_enum/, '');
+$enum_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_enum_drain_target FROM DATABASE dbbranch_enum_drain_source]);
+my $enum_label_count = $node->safe_psql(
+	'dbbranch_enum_drain_target',
+	q[
+SELECT count(*)
+FROM pg_type t
+JOIN pg_enum e ON e.enumtypid = t.oid
+WHERE t.typname = 'dbbranch_enum';
+]);
+is($enum_label_count, '2', 'branch succeeds after source create enum drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_enum_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_enum_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_define_drain_source;]);
 $node->safe_psql('dbbranch_define_drain_source', q[CHECKPOINT;]);
 
