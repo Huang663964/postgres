@@ -1769,6 +1769,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreatePLangStmt:
+				LockDBBranchUtilityWriteGate();
 				address = CreateProceduralLanguage((CreatePLangStmt *) parsetree);
 				break;
 

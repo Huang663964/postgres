@@ -332,6 +332,51 @@ my $trigger_exists = $node->safe_psql(
 is($trigger_exists, '1', 'source create trigger finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_trigger_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_language_drain_source;]);
+$node->safe_psql('dbbranch_language_drain_source', q[CHECKPOINT;]);
+
+my $language_writer = $node->background_psql('dbbranch_language_drain_source', on_error_stop => 1);
+my $language_locker = $node->background_psql('dbbranch_language_drain_source', on_error_stop => 1);
+$language_locker->query_safe(q[BEGIN; LOCK TABLE pg_language IN ACCESS EXCLUSIVE MODE;]);
+$language_writer->query_until(
+	qr/start_language_drain_language/,
+	q(\echo start_language_drain_language
+CREATE LANGUAGE dbbranch_lang HANDLER plpgsql_call_handler;
+\echo finish_language_drain_language
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_language_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE LANGUAGE dbbranch_lang%';
+]), 'active source create language waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_language_drain_target FROM DATABASE dbbranch_language_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create language');
+like($stderr, qr/source database "dbbranch_language_drain_source" has active write transactions/,
+	'active source create language holds db branch writer gate');
+
+$language_locker->query_safe(q[COMMIT;]);
+$language_locker->quit;
+$language_writer->query_until(qr/finish_language_drain_language/, '');
+$language_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_language_drain_target FROM DATABASE dbbranch_language_drain_source]);
+my $language_exists = $node->safe_psql(
+	'dbbranch_language_drain_target',
+	q[SELECT count(*) FROM pg_language WHERE lanname = 'dbbranch_lang';]);
+is($language_exists, '1', 'branch succeeds after source create language drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_language_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_language_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_rule_drain_source;]);
 $node->safe_psql(
 	'dbbranch_rule_drain_source',
