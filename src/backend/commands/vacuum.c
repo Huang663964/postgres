@@ -35,6 +35,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
 #include "commands/async.h"
@@ -125,11 +126,22 @@ static void vac_truncate_clog(TransactionId frozenXID,
 							  MultiXactId minMulti,
 							  TransactionId lastSaneFrozenXid,
 							  MultiXactId lastSaneMinMulti);
+static void LockDBBranchVacuumWriteGate(void);
 static bool vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
 					   BufferAccessStrategy bstrategy);
 static double compute_parallel_delay(void);
 static VacOptValue get_vacoptval_from_boolean(DefElem *def);
 static bool vac_tid_reaped(ItemPointer itemptr, void *state);
+
+static void
+LockDBBranchVacuumWriteGate(void)
+{
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	/* ponytail: VACUUM can dirty relation pages without assigning an XID. */
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+}
 
 /*
  * GUC check function to ensure GUC value specified is within the allowable
@@ -2038,6 +2050,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params,
 
 	/* Begin a transaction for vacuuming this relation */
 	StartTransactionCommand();
+	LockDBBranchVacuumWriteGate();
 
 	if (!(params->options & VACOPT_FULL))
 	{

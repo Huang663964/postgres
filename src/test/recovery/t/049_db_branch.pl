@@ -261,7 +261,7 @@ is($slot_count, '0', 'db branch releases WAL pin slot');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 101
+	skip 'Injection points not supported by this build', 105
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -374,6 +374,58 @@ CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-drain');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drain_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_vacuum_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_vacuum_drain_source',
+		q[
+CREATE TABLE vacuum_rows (id int PRIMARY KEY, note text) WITH (autovacuum_enabled = false);
+INSERT INTO vacuum_rows SELECT g, repeat('x', 100) FROM generate_series(1, 50) g;
+DELETE FROM vacuum_rows WHERE id <= 25;
+CHECKPOINT;
+]);
+
+	my $vacuum_locker = $node->background_psql('dbbranch_vacuum_drain_source', on_error_stop => 1);
+	$vacuum_locker->query_safe(q[BEGIN; LOCK TABLE vacuum_rows IN ACCESS EXCLUSIVE MODE;]);
+	my $vacuum_writer = $node->background_psql('dbbranch_vacuum_drain_source', on_error_stop => 1);
+	$vacuum_writer->query_until(
+		qr/start_vacuum_drain_vacuum/,
+		q(\echo start_vacuum_drain_vacuum
+VACUUM (INDEX_CLEANUP ON) vacuum_rows;
+\echo finish_vacuum_drain_vacuum
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_vacuum_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'VACUUM%';
+]), 'active source vacuum waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_vacuum_drain_target FROM DATABASE dbbranch_vacuum_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source vacuum');
+	like($stderr, qr/source database "dbbranch_vacuum_drain_source" has active write transactions/,
+		'active source vacuum holds db branch writer gate');
+
+	$vacuum_locker->query_safe(q[COMMIT;]);
+	$vacuum_locker->quit;
+	$vacuum_writer->query_until(qr/finish_vacuum_drain_vacuum/, '');
+	$vacuum_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_vacuum_drain_target FROM DATABASE dbbranch_vacuum_drain_source]);
+	my $vacuum_rows = $node->safe_psql(
+		'dbbranch_vacuum_drain_target',
+		q[SELECT count(*) FROM vacuum_rows;]);
+	is($vacuum_rows, '25', 'branch succeeds after source vacuum drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_drain_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_clone_fail_source;]);
 	$node->safe_psql(
