@@ -816,6 +816,62 @@ is($server_options, 't', 'branch succeeds after source alter foreign server drai
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_server_drain_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_server_drain_source;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_user_mapping_drain_source;]);
+$node->safe_psql(
+	'dbbranch_user_mapping_drain_source',
+	q[
+CREATE FOREIGN DATA WRAPPER dbbranch_fdw;
+CREATE SERVER dbbranch_server FOREIGN DATA WRAPPER dbbranch_fdw;
+CHECKPOINT;
+]);
+
+my $user_mapping_locker = $node->background_psql('dbbranch_user_mapping_drain_source', on_error_stop => 1);
+$user_mapping_locker->query_safe(q[BEGIN; LOCK TABLE pg_user_mapping IN ACCESS EXCLUSIVE MODE;]);
+my $user_mapping_writer = $node->background_psql('dbbranch_user_mapping_drain_source', on_error_stop => 1);
+$user_mapping_writer->query_until(
+	qr/start_user_mapping_drain_mapping/,
+	q(\echo start_user_mapping_drain_mapping
+CREATE USER MAPPING FOR CURRENT_USER SERVER dbbranch_server OPTIONS (user 'branch_user');
+\echo finish_user_mapping_drain_mapping
+));
+ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_user_mapping_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'CREATE USER MAPPING%';
+]), 'active source create user mapping waits on source catalog lock');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_user_mapping_drain_target FROM DATABASE dbbranch_user_mapping_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source create user mapping');
+like($stderr, qr/source database "dbbranch_user_mapping_drain_source" has active write transactions/,
+	'active source create user mapping holds db branch writer gate');
+
+$user_mapping_locker->query_safe(q[COMMIT;]);
+$user_mapping_locker->quit;
+$user_mapping_writer->query_until(qr/finish_user_mapping_drain_mapping/, '');
+$user_mapping_writer->quit;
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_user_mapping_drain_target FROM DATABASE dbbranch_user_mapping_drain_source]);
+my $user_mapping_exists = $node->safe_psql(
+	'dbbranch_user_mapping_drain_target',
+	q[
+SELECT count(*)
+FROM pg_user_mapping m
+JOIN pg_foreign_server s ON s.oid = m.umserver
+WHERE s.srvname = 'dbbranch_server';
+]);
+is($user_mapping_exists, '1', 'branch succeeds after source create user mapping drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_user_mapping_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_user_mapping_drain_source;]);
+
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_policy_drain_source;]);
 $node->safe_psql(
 	'dbbranch_policy_drain_source',
