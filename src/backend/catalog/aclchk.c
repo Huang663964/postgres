@@ -52,6 +52,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
@@ -432,6 +433,13 @@ ExecuteGrantStmt(GrantStmt *stmt)
 		default:
 			elog(ERROR, "unrecognized GrantStmt.targtype: %d",
 				 (int) stmt->targtype);
+	}
+
+	if (stmt->objtype == OBJECT_DATABASE && !IsBootstrapProcessingMode())
+	{
+		foreach(cell, istmt.objects)
+			LockSharedObject(DbBranchRelationId, lfirst_oid(cell), 0,
+							 RowExclusiveLock);
 	}
 
 	/* all_privs to be filled below */

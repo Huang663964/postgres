@@ -4907,6 +4907,46 @@ ALTER DATABASE dbbranch_alter_database_drain_source CONNECTION LIMIT -1;
 DROP DATABASE dbbranch_alter_database_drain_source;
 ]);
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_database_grant_drain_role LOGIN;');
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_database_grant_drain_source;]);
+$node->safe_psql('dbbranch_database_grant_drain_source', q[CHECKPOINT;]);
+
+my $database_grant_writer =
+  $node->background_psql('postgres', on_error_stop => 1);
+$database_grant_writer->query_safe(
+	q[BEGIN; GRANT CONNECT ON DATABASE dbbranch_database_grant_drain_source TO dbbranch_database_grant_drain_role;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_database_grant_drain_target FROM DATABASE dbbranch_database_grant_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source database grant');
+like($stderr, qr/source database "dbbranch_database_grant_drain_source" has active write transactions/,
+	'active source database grant holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source database grant writes separate metadata file');
+
+$database_grant_writer->query_safe(q[COMMIT;]);
+$database_grant_writer->quit;
+
+my $database_grant_applied = $node->safe_psql(
+	'postgres',
+	q[SELECT has_database_privilege('dbbranch_database_grant_drain_role', 'dbbranch_database_grant_drain_source', 'connect');]);
+is($database_grant_applied, 't',
+	'source database grant finishes after db branch rejects');
+
+$node->safe_psql(
+	'postgres',
+	q[
+REVOKE CONNECT ON DATABASE dbbranch_database_grant_drain_source FROM dbbranch_database_grant_drain_role;
+DROP DATABASE dbbranch_database_grant_drain_source;
+DROP ROLE dbbranch_database_grant_drain_role;
+]);
+
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_role_setting_drain_role LOGIN;');
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_role_setting_drain_source;]);
 $node->safe_psql('dbbranch_role_setting_drain_source', q[CHECKPOINT;]);
