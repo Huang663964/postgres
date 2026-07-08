@@ -4734,17 +4734,26 @@ SELECT count(*) FROM replay_redo_fail_rows;
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-during-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_redo_fail_source;]);
 
+	my $install_fail_tablespace_dir = $node->basedir . '/dbbranch_install_fail_ts';
+	mkdir($install_fail_tablespace_dir)
+	  or die "could not create $install_fail_tablespace_dir: $!";
+	$node->safe_psql('postgres',
+		"CREATE TABLESPACE dbbranch_install_fail_ts LOCATION '$install_fail_tablespace_dir';");
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_install_fail_source;]);
 	$node->safe_psql(
 		'dbbranch_install_fail_source',
 		q[
 CREATE TABLE install_fail_rows (id int PRIMARY KEY);
+CREATE TABLE install_fail_ts_rows (id int PRIMARY KEY) TABLESPACE dbbranch_install_fail_ts;
 INSERT INTO install_fail_rows VALUES (1);
+INSERT INTO install_fail_ts_rows VALUES (1);
 CHECKPOINT;
 INSERT INTO install_fail_rows VALUES (2);
 ]);
 
-	my %base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my %install_storage_before = map { $_ => 1 } (
+		glob($node->data_dir . '/base/*'),
+		glob($node->data_dir . '/pg_tblspc/*/*/*'));
 	my @install_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_attach('db-branch-before-install', 'wait');]);
@@ -4755,10 +4764,13 @@ INSERT INTO install_fail_rows VALUES (2);
 		q(\echo start_install_branch
 CREATE BRANCH dbbranch_install_fail_target FROM DATABASE dbbranch_install_fail_source;
 \echo finish_install_branch
-));
+	));
 	$node->wait_for_event('client backend', 'db-branch-before-install');
-	my @install_clone_paths = grep { !$base_before{$_} } glob $node->data_dir . '/base/*';
-	is(scalar @install_clone_paths, 1, 'install failure creates one branch storage path before catalog install');
+	my @install_clone_paths = grep { !$install_storage_before{$_} } (
+		glob($node->data_dir . '/base/*'),
+		glob($node->data_dir . '/pg_tblspc/*/*/*'));
+	is(scalar @install_clone_paths, 2,
+		'install failure creates branch storage paths in all tablespaces before catalog install');
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_install_fail_target;]);
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-install');]);
@@ -4822,6 +4834,7 @@ SELECT count(*) FROM install_fail_rows;
 		'install failure metadata records failure reason');
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_install_fail_source;]);
+	$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_install_fail_ts;]);
 }
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
