@@ -4503,6 +4503,32 @@ CREATE BRANCH dbbranch_cancel_target FROM DATABASE dbbranch_cancel_source;
 	is(scalar @cancel_clone_paths, 1,
 		'cancelable db branch has cloned storage before replay');
 
+	my @cancel_replay_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @cancel_replay_metadata_files, scalar(@cancel_metadata_before) + 1,
+		'db branch writes in-progress replay metadata before replay');
+	my $cancel_replay_metadata = '';
+	for my $path (@cancel_replay_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_cancel_target$/m)
+		{
+			$cancel_replay_metadata = $contents;
+			last;
+		}
+	}
+	like($cancel_replay_metadata, qr/^wal_pin=active$/m,
+		'in-progress db branch metadata records active WAL pin');
+	like($cancel_replay_metadata, qr/^clone_result=done$/m,
+		'in-progress db branch metadata records completed clone');
+	like($cancel_replay_metadata, qr/^cleanup=not_started$/m,
+		'in-progress db branch metadata records no cleanup yet');
+	like($cancel_replay_metadata, qr/^status_history=CREATING,COPYING,REPLAYING$/m,
+		'in-progress db branch metadata records replaying transition');
+	like($cancel_replay_metadata, qr/^status=REPLAYING$/m,
+		'in-progress db branch metadata final state is REPLAYING');
+
 	my $cancel_pid = $node->safe_psql(
 		'postgres',
 		q[SELECT pid FROM pg_stat_activity WHERE query LIKE 'CREATE BRANCH dbbranch_cancel_target%' AND wait_event = 'db-branch-cancel-before-replay';]);

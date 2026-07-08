@@ -4313,6 +4313,14 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		INSTR_TIME_SUBTRACT(elapsed, source_block_start);
 		source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
 
+		WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+					  redo_ptr, branch_lsn, clone_path,
+					  "active",
+					  clone_result, "not_started", "not_started",
+					  wal_scan,
+					  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
+					  "CREATING,COPYING,REPLAYING", "REPLAYING", "");
+
 		/*
 		 * source freeze ends after branch_lsn is fixed and storage is cloned;
 		 * replay must not keep source connections blocked.
