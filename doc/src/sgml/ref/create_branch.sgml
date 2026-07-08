@@ -173,6 +173,16 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   </para>
 
   <para>
+   If the server stops before a branch reaches <literal>READY</literal>, the
+   current prototype does not automatically resume replay or remove cloned
+   branch storage during restart.  No <structname>pg_dbbranch</structname>
+   catalog row is committed for the incomplete branch.  The diagnostic state
+   file remains available for operators to identify the last durable status,
+   such as <literal>REPLAYING</literal>, and the cloned storage path that may
+   need investigation or manual cleanup.
+  </para>
+
+  <para>
    This prototype does not enforce a DB Branch quota.  Storage limits,
    replication slot limits, and filesystem errors are enforced by the
    underlying system; <command>CREATE BRANCH</command> fails and records the
