@@ -5974,6 +5974,7 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_rel_ts;]);
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_wal_source;');
 $node->safe_psql(
 	'dbbranch_wal_source',
@@ -5982,6 +5983,8 @@ CREATE TABLE wal_rows (id int PRIMARY KEY, payload text NOT NULL);
 CREATE TABLE gin_rows (id int PRIMARY KEY, tags text[] NOT NULL);
 CREATE INDEX gin_rows_tags_idx ON gin_rows USING gin (tags);
 CREATE SEQUENCE wal_seq CACHE 1;
+CREATE TABLE owned_rows (id int PRIMARY KEY);
+ALTER TABLE owned_rows OWNER TO dbbranch_wal_owner;
 INSERT INTO wal_rows VALUES (1, repeat('a', 9000)), (2, repeat('b', 9000));
 SELECT nextval('wal_seq');
 CHECKPOINT;
@@ -6041,8 +6044,26 @@ my $branch_sequence = $node->safe_psql(
 is($branch_sequence, $source_sequence,
 	'branch sequence durable state matches source');
 
+my $branch_owned_table = $node->safe_psql(
+	'dbbranch_wal_target',
+	q[SELECT relowner = 'dbbranch_wal_owner'::regrole FROM pg_class WHERE relname = 'owned_rows';]);
+is($branch_owned_table, 't', 'branch keeps copied table owner');
+
+my $branch_owner_shdepend = $node->safe_psql(
+	'postgres',
+	q[
+SELECT count(*) > 0
+FROM pg_shdepend
+WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_wal_target')
+  AND refclassid = 'pg_authid'::regclass
+  AND refobjid = 'dbbranch_wal_owner'::regrole;
+]);
+is($branch_owner_shdepend, 't',
+	'branch copies shared dependencies for owned source objects');
+
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_wal_owner;]);
 
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_partition_source;');
 $node->safe_psql(
