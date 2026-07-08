@@ -3955,7 +3955,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	char	   *clone_path;
 	char		wal_pin_name[NAMEDATALEN];
 	char		failure[MAXPGPATH * 2];
-	const char *ficlone_required = "db_branch storage clone requires FICLONE";
 	instr_time	source_block_start;
 	instr_time	clone_start;
 	instr_time	replay_start;
@@ -4267,51 +4266,39 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			if (!CloneDBBranchDirectory(frompath, topath, failure, sizeof(failure)))
 			{
 				bool		cleanup_ok = CleanupDBBranchClonePath(topath);
+				ListCell   *cleanup_cell;
 
-				if (strncmp(failure, ficlone_required,
-							strlen(ficlone_required)) == 0 && cleanup_ok)
+				foreach(cleanup_cell, tablespace_oids)
 				{
-					/* ponytail: fallback keeps the prototype runnable on ext4 without reflink. */
-					copydir(frompath, topath, false);
-					RemoveDBBranchSkippedCloneFiles(topath);
-					clone_result = "copy_fallback";
+					char	   *path = GetDatabasePath(branch_dboid,
+												  lfirst_oid(cleanup_cell));
+
+					if (!CleanupDBBranchClonePath(path))
+						cleanup_ok = false;
+					pfree(path);
 				}
-				else
-				{
-					ListCell   *cleanup_cell;
 
-					foreach(cleanup_cell, tablespace_oids)
-					{
-						char	   *path = GetDatabasePath(branch_dboid,
-													  lfirst_oid(cleanup_cell));
-
-						if (!CleanupDBBranchClonePath(path))
-							cleanup_ok = false;
-						pfree(path);
-					}
-
-					pfree(frompath);
-					pfree(topath);
-					INSTR_TIME_SET_CURRENT(elapsed);
-					INSTR_TIME_SUBTRACT(elapsed, clone_start);
-					clone_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
-					INSTR_TIME_SET_CURRENT(elapsed);
-					INSTR_TIME_SUBTRACT(elapsed, source_block_start);
-					source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
-					ReleaseDBBranchWalPin();
-					failure_metadata_written = true;
-					WriteDBBranchMetadata(source_dboid, source_name, branch_name,
-								  redo_ptr, branch_lsn, clone_path,
-								  "released",
-								  "failed", cleanup_ok ? "done" : "failed",
-								  "not_started",
-								  NULL,
-								  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
-								  "CREATING,COPYING,FAILED", "FAILED", failure);
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("%s", failure)));
-				}
+				pfree(frompath);
+				pfree(topath);
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, clone_start);
+				clone_elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+				INSTR_TIME_SET_CURRENT(elapsed);
+				INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+				source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+				ReleaseDBBranchWalPin();
+				failure_metadata_written = true;
+				WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+							  redo_ptr, branch_lsn, clone_path,
+							  "released",
+							  "failed", cleanup_ok ? "done" : "failed",
+							  "not_started",
+							  NULL,
+							  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
+							  "CREATING,COPYING,FAILED", "FAILED", failure);
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("%s", failure)));
 			}
 
 			pfree(frompath);
@@ -4335,6 +4322,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		UnlockSharedObject(DatabaseRelationId, source_dboid, 0, ShareLock);
 		source_lock_held = false;
 
+		INJECTION_POINT("db-branch-cancel-before-replay", NULL);
 		INJECTION_POINT("db-branch-before-replay", NULL);
 
 		INSTR_TIME_SET_CURRENT(replay_start);

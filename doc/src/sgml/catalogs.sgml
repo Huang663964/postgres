@@ -3234,6 +3234,10 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
    The catalog <structname>pg_dbbranch</structname> records committed
    <link linkend="sql-createbranch"><command>CREATE BRANCH</command></link>
    operations.
+   Failed or in-progress branch attempts are not catalog rows; their durable
+   diagnostics are written to
+   <filename>global/pg_dbbranch_<replaceable>source_oid</replaceable>_<replaceable>branch_hash</replaceable>.state</filename>
+   instead.
   </para>
 
   <para>
@@ -3430,8 +3434,7 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
        <structfield>clone_result</structfield> <type>text</type>
       </para>
       <para>
-       Storage clone result, such as <literal>done</literal> or
-       <literal>copy_fallback</literal>.
+       Storage clone result, such as <literal>done</literal>.
       </para></entry>
      </row>
 

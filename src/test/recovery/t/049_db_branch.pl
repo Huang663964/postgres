@@ -15,6 +15,8 @@ $node->init(allows_streaming => 1);
 $node->append_conf('postgresql.conf', 'max_prepared_transactions = 10');
 $node->start;
 
+note('DB Branch section: primary clone, replay, metadata, and isolation');
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_source;');
 $node->safe_psql(
 	'dbbranch_source',
@@ -62,6 +64,10 @@ like($stderr, qr/source database "dbbranch_source" has temporary relation catalo
 $metadata_file_count++;
 is(scalar @metadata_files, $metadata_file_count,
 	'live source temp relation rejection writes separate metadata file');
+my $failed_catalog_rows = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_dbbranch WHERE source_db_oid = ] . $source_oid . q[;]);
+is($failed_catalog_rows, '0', 'failed branch attempt is not inserted into pg_dbbranch');
 
 $source_temp->quit;
 $source_temp_file = 't999_888';
@@ -137,7 +143,7 @@ like($metadata, qr/^replay_method=rmgr_redo$/m, 'metadata records rmgr redo repl
 my ($clone_path) = $metadata =~ /^clone_path=(.+)$/m;
 if ($result == 0)
 {
-	like($metadata, qr/^clone_result=(done|copy_fallback)$/m, 'metadata records storage clone success');
+	like($metadata, qr/^clone_result=done$/m, 'metadata records storage clone success');
 	like($metadata, qr/^cleanup=not_needed$/m, 'metadata records no failed clone cleanup needed');
 	like($metadata, qr/^status_history=CREATING,COPYING,REPLAYING,READY$/m, 'metadata records READY transition');
 	like($metadata, qr/^status=READY$/m, 'metadata final state is READY');
@@ -190,7 +196,7 @@ if ($result == 0)
 
 	my $catalog_clone_result = $node->safe_psql(
 		'postgres',
-		q[SELECT clone_result IN ('done', 'copy_fallback') FROM pg_dbbranch WHERE branch_db_oid = ]
+		q[SELECT clone_result = 'done' FROM pg_dbbranch WHERE branch_db_oid = ]
 		  . $branch_oid
 		  . q[;]);
 	is(
@@ -316,6 +322,8 @@ my $slot_count = $node->safe_psql(
 	'postgres',
 	q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%']);
 is($slot_count, '0', 'db branch releases WAL pin slot');
+
+note('DB Branch section: source utility and DDL writer gates');
 
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_trigger_drain_source;]);
 $node->safe_psql(
@@ -3081,6 +3089,8 @@ my $copy_rows = $node->safe_psql(
 is($copy_rows, '2', 'source copy from finishes after db branch rejects');
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_copy_drain_source;]);
 
+note('DB Branch section: injection-point failure and cleanup paths');
+
 SKIP:
 {
 	skip 'Injection points not supported by this build', 159
@@ -4466,6 +4476,98 @@ CREATE BRANCH dbbranch_replay_gate_target FROM DATABASE dbbranch_replay_gate_sou
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_cancel_source;]);
+	$node->safe_psql(
+		'dbbranch_cancel_source',
+		q[
+CREATE TABLE cancel_rows (id int PRIMARY KEY);
+INSERT INTO cancel_rows VALUES (1);
+CHECKPOINT;
+UPDATE cancel_rows SET id = 1 WHERE id = 1;
+]);
+	my %cancel_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @cancel_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-cancel-before-replay', 'wait');]);
+
+	my $cancel_branch = $node->background_psql('postgres', on_error_stop => 0);
+	$cancel_branch->query_until(
+		qr/start_cancel_branch/,
+		q(\echo start_cancel_branch
+CREATE BRANCH dbbranch_cancel_target FROM DATABASE dbbranch_cancel_source;
+\echo finish_cancel_branch
+));
+	$node->wait_for_event('client backend', 'db-branch-cancel-before-replay');
+
+	my @cancel_clone_paths = grep { !$cancel_base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @cancel_clone_paths, 1,
+		'cancelable db branch has cloned storage before replay');
+
+	my $cancel_pid = $node->safe_psql(
+		'postgres',
+		q[SELECT pid FROM pg_stat_activity WHERE query LIKE 'CREATE BRANCH dbbranch_cancel_target%' AND wait_event = 'db-branch-cancel-before-replay';]);
+	is(
+		$node->safe_psql('postgres', q[SELECT pg_cancel_backend(] . $cancel_pid . q[);]),
+		't',
+		'canceling db branch backend');
+	$cancel_branch->query_until(qr/finish_cancel_branch/, '');
+	like($cancel_branch->{stderr}, qr/canceling statement due to user request/,
+		'db branch reports user cancellation');
+	$cancel_branch->quit;
+
+	my $cancel_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_cancel_target';]);
+	is($cancel_branch_count, '0', 'canceled db branch creates no branch database');
+
+	my $cancel_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($cancel_slot_count, '0', 'canceled db branch releases WAL pin');
+
+	my @cancel_clone_left = grep { -e $_ } @cancel_clone_paths;
+	is(scalar @cancel_clone_left, 0,
+		'canceled db branch removes cloned storage path');
+
+	my @cancel_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @cancel_metadata_files, scalar(@cancel_metadata_before) + 1,
+		'canceled db branch writes separate metadata file');
+
+	my $cancel_metadata = '';
+	for my $path (@cancel_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_cancel_target$/m)
+		{
+			$cancel_metadata = $contents;
+			last;
+		}
+	}
+
+	like($cancel_metadata, qr/^wal_pin=released$/m,
+		'canceled db branch metadata records released WAL pin');
+	like($cancel_metadata, qr/^clone_result=done$/m,
+		'canceled db branch metadata records clone result');
+	like($cancel_metadata, qr/^cleanup=done$/m,
+		'canceled db branch metadata records clone cleanup');
+	like($cancel_metadata, qr/^status=FAILED$/m,
+		'canceled db branch metadata final state is FAILED');
+	like($cancel_metadata, qr/^failure=canceling statement due to user request$/m,
+		'canceled db branch metadata records failure reason');
+
+	my $cancel_source_rows = $node->safe_psql(
+		'dbbranch_cancel_source',
+		q[
+INSERT INTO cancel_rows VALUES (2);
+SELECT count(*) FROM cancel_rows;
+]);
+	is($cancel_source_rows, '2', 'source accepts writes after db branch cancellation');
+
+	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-cancel-before-replay');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cancel_source;]);
+
 	my $drop_during_tablespace_dir = $node->basedir . '/dbbranch_drop_during_ts';
 	mkdir($drop_during_tablespace_dir)
 	  or die "could not create $drop_during_tablespace_dir: $!";
@@ -4553,7 +4655,7 @@ CREATE BRANCH dbbranch_drop_during_target FROM DATABASE dbbranch_drop_during_sou
 
 	like($drop_during_metadata, qr/^wal_pin=released$/m,
 		'source-drop race metadata records released WAL pin');
-	like($drop_during_metadata, qr/^clone_result=(done|copy_fallback)$/m,
+	like($drop_during_metadata, qr/^clone_result=done$/m,
 		'source-drop race metadata records clone result');
 	like($drop_during_metadata, qr/^cleanup=done$/m,
 		'source-drop race metadata records clone cleanup');
@@ -4654,7 +4756,7 @@ SELECT count(*) FROM replay_fail_rows;
 		'replay failure metadata records branch LSN');
 	unlike($replay_metadata, qr/^branch_lsn=0\/0$/m,
 		'replay failure branch LSN is valid');
-	like($replay_metadata, qr/^clone_result=(done|copy_fallback)$/m,
+	like($replay_metadata, qr/^clone_result=done$/m,
 		'replay failure metadata records clone result');
 	like($replay_metadata, qr/^cleanup=done$/m,
 		'replay failure metadata records clone cleanup');
@@ -4733,7 +4835,7 @@ SELECT count(*) FROM replay_redo_fail_rows;
 
 	like($replay_redo_metadata, qr/^wal_pin=released$/m,
 		'rmgr replay failure metadata records released WAL pin');
-	like($replay_redo_metadata, qr/^clone_result=(done|copy_fallback)$/m,
+	like($replay_redo_metadata, qr/^clone_result=done$/m,
 		'rmgr replay failure metadata records clone result');
 	like($replay_redo_metadata, qr/^cleanup=done$/m,
 		'rmgr replay failure metadata records clone cleanup');
@@ -4931,6 +5033,8 @@ like(
 	$stderr,
 	qr/database "dbbranch_existing_target" already exists/,
 	'db branch reports existing target database name');
+
+note('DB Branch section: control validation and database-level gates');
 
 $node->safe_psql('postgres', q[
 CREATE DATABASE dbbranch_no_conn_source;
@@ -5430,6 +5534,8 @@ $node->safe_psql(
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_setting_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_setting_role;]);
 
+note('DB Branch section: tablespaces, unlogged relations, and unsupported source states');
+
 my $tablespace_options_dir = $node->basedir . '/dbbranch_tablespace_options';
 mkdir($tablespace_options_dir) or die "could not create $tablespace_options_dir: $!";
 $node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_options_ts LOCATION '$tablespace_options_dir';");
@@ -5512,7 +5618,7 @@ like($tablespace_metadata, qr/^wal_source_records=[1-9][0-9]*$/m, 'tablespace me
 like($tablespace_metadata, qr/^clone_path=pg_tblspc\/[0-9]+\/[^\/]+\/[0-9]+$/m,
 	'tablespace metadata records tablespace branch storage path');
 like($tablespace_metadata, qr/^wal_pin=released$/m, 'tablespace metadata records released WAL pin');
-like($tablespace_metadata, qr/^clone_result=(done|copy_fallback)$/m, 'tablespace metadata records clone success');
+like($tablespace_metadata, qr/^clone_result=done$/m, 'tablespace metadata records clone success');
 like($tablespace_metadata, qr/^cleanup=not_needed$/m, 'tablespace metadata records no cleanup');
 like($tablespace_metadata, qr/^replay_method=rmgr_redo$/m, 'tablespace metadata records rmgr replay');
 like($tablespace_metadata, qr/^status=READY$/m, 'tablespace metadata final state is READY');
@@ -5572,7 +5678,7 @@ for my $path (@metadata_files)
 }
 
 like($unlogged_metadata, qr/^wal_pin=released$/m, 'unlogged metadata records released WAL pin');
-like($unlogged_metadata, qr/^clone_result=(done|copy_fallback)$/m, 'unlogged metadata records clone success');
+like($unlogged_metadata, qr/^clone_result=done$/m, 'unlogged metadata records clone success');
 like($unlogged_metadata, qr/^cleanup=not_needed$/m, 'unlogged metadata records no cleanup');
 like($unlogged_metadata, qr/^replay_method=rmgr_redo$/m, 'unlogged metadata records rmgr replay');
 like($unlogged_metadata, qr/^status=READY$/m, 'unlogged metadata final state is READY');
@@ -5979,6 +6085,8 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_rel_ts;]);
 
+note('DB Branch section: WAL replay matrix and data correctness');
+
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_wal_source;');
 $node->safe_psql(
@@ -6057,6 +6165,13 @@ is($branch_owned_table, 't', 'branch keeps copied table owner');
 my $wal_branch_oid = $node->safe_psql(
 	'postgres',
 	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_wal_target';]);
+my $wal_replay_matrix = $node->safe_psql(
+	'postgres',
+	q[SELECT wal_source_records > wal_replayed_records AND wal_replayed_records > 0 FROM pg_dbbranch WHERE branch_db_oid = ]
+	  . $wal_branch_oid
+	  . q[;]);
+is($wal_replay_matrix, 't',
+	'pg_dbbranch records skipped source sequence WAL and replayed source WAL');
 my $branch_owner_shdepend = $node->safe_psql(
 	'postgres',
 	q[
@@ -6298,7 +6413,7 @@ like(
 	'non-FPI metadata records source WAL outside FPI replay');
 like(
 	$nonfpi_metadata,
-	qr/^clone_result=(done|copy_fallback)$/m,
+	qr/^clone_result=done$/m,
 	'non-FPI metadata records storage clone success');
 like(
 	$nonfpi_metadata,
@@ -6359,6 +6474,7 @@ $node->safe_psql('postgres', q[ALTER DATABASE dbbranch_template_source IS_TEMPLA
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_template_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_template_createdb;]);
 
+note('DB Branch section: client command behavior and cluster configuration failures');
 
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_cmdtag_source;]);
 $node->safe_psql(
