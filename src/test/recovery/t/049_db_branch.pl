@@ -6049,12 +6049,15 @@ my $branch_owned_table = $node->safe_psql(
 	q[SELECT relowner = 'dbbranch_wal_owner'::regrole FROM pg_class WHERE relname = 'owned_rows';]);
 is($branch_owned_table, 't', 'branch keeps copied table owner');
 
+my $wal_branch_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_wal_target';]);
 my $branch_owner_shdepend = $node->safe_psql(
 	'postgres',
 	q[
 SELECT count(*) > 0
 FROM pg_shdepend
-WHERE dbid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_wal_target')
+WHERE dbid = ] . $wal_branch_oid . q[
   AND refclassid = 'pg_authid'::regclass
   AND refobjid = 'dbbranch_wal_owner'::regrole;
 ]);
@@ -6062,6 +6065,12 @@ is($branch_owner_shdepend, 't',
 	'branch copies shared dependencies for owned source objects');
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_target;]);
+my $branch_owner_shdepend_after_drop = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_shdepend WHERE dbid = ] . $wal_branch_oid . q[;]);
+is($branch_owner_shdepend_after_drop, '0',
+	'dropping branch removes copied shared dependencies');
+
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_wal_owner;]);
 
