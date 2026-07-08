@@ -38,6 +38,8 @@ WHERE locktype = 'object'
 ]);
 is($gate_lock, 't', 'active source DML writer holds DB Branch writer gate');
 
+my @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+my $metadata_file_count = scalar @metadata_files;
 my $stderr = '';
 my $result = $node->psql(
 	'postgres',
@@ -51,6 +53,27 @@ my $target_count = $node->safe_psql(
 	'postgres',
 	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_dml_gate_target';]);
 is($target_count, '0', 'active source DML writer creates no branch database');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, $metadata_file_count + 1,
+	'active source DML writer rejection writes metadata file');
+my $metadata = '';
+for my $metadata_file (@metadata_files)
+{
+	open my $metadata_fh, '<', $metadata_file
+	  or die "could not open $metadata_file: $!";
+	my $contents = do { local $/; <$metadata_fh> };
+	close $metadata_fh;
+	if ($contents =~ /^branch_name=dbbranch_dml_gate_target$/m)
+	{
+		$metadata = $contents;
+		last;
+	}
+}
+like($metadata, qr/^status=FAILED$/m,
+	'active source DML writer metadata final state is FAILED');
+like($metadata, qr/^failure=source database has active write transactions$/m,
+	'active source DML writer metadata records failure');
 
 $writer->query_safe(q[COMMIT;]);
 $writer->quit;
