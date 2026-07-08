@@ -5061,6 +5061,28 @@ my $alter_database_connlimit = $node->safe_psql(
 is($alter_database_connlimit, '8',
 	'source alter database finishes after db branch rejects');
 
+my $alter_database_refresh_writer =
+  $node->background_psql('postgres', on_error_stop => 1);
+$alter_database_refresh_writer->query_safe(
+	q[SET client_min_messages = warning; BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source REFRESH COLLATION VERSION;]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_database_refresh_drain_target FROM DATABASE dbbranch_alter_database_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source alter database refresh collation');
+like($stderr, qr/source database "dbbranch_alter_database_drain_source" has active write transactions/,
+	'active source alter database refresh collation holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source alter database refresh collation writes separate metadata file');
+
+$alter_database_refresh_writer->query_safe(q[COMMIT;]);
+$alter_database_refresh_writer->quit;
+
 $node->safe_psql(
 	'postgres',
 	q[
