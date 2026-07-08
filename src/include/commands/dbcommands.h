@@ -21,6 +21,7 @@
 
 extern Oid	createdb(ParseState *pstate, const CreatedbStmt *stmt);
 extern Oid	CreateDatabaseBranch(const char *source_name, const char *branch_name);
+extern void CleanupDBBranchStartupState(void);
 extern void dropdb(const char *dbname, bool missing_ok, bool force);
 extern void DropDatabase(ParseState *pstate, DropdbStmt *stmt);
 extern ObjectAddress RenameDatabase(const char *oldname, const char *newname);

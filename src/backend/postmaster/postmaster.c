@@ -92,6 +92,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
+#include "commands/dbcommands.h"
 #include "common/file_perm.h"
 #include "common/pg_prng.h"
 #include "lib/ilist.h"
@@ -1317,6 +1318,7 @@ PostmasterMain(int argc, char *argv[])
 	 * Postgres processes running in this directory, so this should be safe.
 	 */
 	RemovePgTempFiles();
+	CleanupDBBranchStartupState();
 
 	/*
 	 * Initialize the autovacuum subsystem (again, no process start yet)

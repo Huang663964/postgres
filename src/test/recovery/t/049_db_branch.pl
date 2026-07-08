@@ -4670,12 +4670,21 @@ CREATE BRANCH dbbranch_crash_target FROM DATABASE dbbranch_crash_source;
 			last;
 		}
 	}
-	like($crash_metadata, qr/^status=REPLAYING$/m,
-		'crashed db branch metadata still diagnoses incomplete replay');
+	like($crash_metadata, qr/^wal_pin=released$/m,
+		'crashed db branch startup cleanup records released WAL pin');
+	like($crash_metadata, qr/^cleanup=done$/m,
+		'crashed db branch startup cleanup records clone cleanup');
+	like($crash_metadata, qr/^status_history=CREATING,COPYING,REPLAYING,FAILED$/m,
+		'crashed db branch startup cleanup records failed transition');
+	like($crash_metadata, qr/^status=FAILED$/m,
+		'crashed db branch metadata records startup cleanup failure state');
 	like($crash_metadata, qr/^clone_path=\Q$crash_clone_path\E$/m,
-		'crashed db branch metadata still identifies cloned storage path');
-	ok(-d $node->data_dir . '/' . $crash_clone_path,
-		'crashed db branch cloned storage path remains diagnosable after restart');
+		'crashed db branch metadata still identifies cleaned storage path');
+	like($crash_metadata,
+		qr/^failure=startup cleanup removed stale DB Branch clone$/m,
+		'crashed db branch metadata records startup cleanup reason');
+	ok(!-e $node->data_dir . '/' . $crash_clone_path,
+		'crashed db branch startup cleanup removes cloned storage path');
 
 	my $crash_source_rows = $node->safe_psql(
 		'dbbranch_crash_source',

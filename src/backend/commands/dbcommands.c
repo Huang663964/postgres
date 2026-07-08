@@ -197,6 +197,11 @@ static bool ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 										DBBranchWalScan *wal_scan,
 										char *failure, Size failure_len);
 static bool CleanupDBBranchClonePath(const char *clone_path);
+static bool DBBranchAllDigits(const char *str);
+static bool DBBranchStartupClonePathIsSafe(const char *clone_path);
+static bool DBBranchStartupStatusNeedsCleanup(const char *status);
+static bool DBBranchStateFileName(const char *name);
+static void RewriteDBBranchStartupState(const char *state_path, bool cleanup_ok);
 static Oid AllocateDBBranchDatabaseOid(void);
 static void InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_name,
 								   const char *clone_path,
@@ -3376,6 +3381,215 @@ CleanupDBBranchClonePath(const char *clone_path)
 		return errno == ENOENT;
 
 	return rmtree(clone_path, true);
+}
+
+static bool
+DBBranchAllDigits(const char *str)
+{
+	if (str[0] == '\0')
+		return false;
+
+	for (const char *p = str; *p; p++)
+	{
+		if (*p < '0' || *p > '9')
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+DBBranchStartupClonePathIsSafe(const char *clone_path)
+{
+	const char *last_slash;
+
+	if (clone_path[0] == '\0' || clone_path[0] == '/' ||
+		strstr(clone_path, "..") != NULL ||
+		strstr(clone_path, "//") != NULL)
+		return false;
+
+	if (strncmp(clone_path, "base/", 5) == 0)
+		return DBBranchAllDigits(clone_path + 5);
+
+	if (strncmp(clone_path, "pg_tblspc/", 10) != 0)
+		return false;
+
+	last_slash = strrchr(clone_path, '/');
+	return last_slash != NULL && DBBranchAllDigits(last_slash + 1);
+}
+
+static bool
+DBBranchStartupStatusNeedsCleanup(const char *status)
+{
+	return strcmp(status, "COPYING") == 0 ||
+		strcmp(status, "REPLAYING") == 0;
+}
+
+static bool
+DBBranchStateFileName(const char *name)
+{
+	size_t		len = strlen(name);
+	const char *suffix = ".state";
+	size_t		suffix_len = strlen(suffix);
+
+	return strncmp(name, "pg_dbbranch_", 12) == 0 &&
+		len > suffix_len &&
+		strcmp(name + len - suffix_len, suffix) == 0;
+}
+
+static void
+RewriteDBBranchStartupState(const char *state_path, bool cleanup_ok)
+{
+	char		temp_path[MAXPGPATH];
+	char		line[MAXPGPATH * 2];
+	FILE	   *src;
+	FILE	   *dst;
+	bool		ok = true;
+
+	snprintf(temp_path, sizeof(temp_path), "%s.tmp", state_path);
+
+	src = AllocateFile(state_path, PG_BINARY_R);
+	if (src == NULL)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not open DB Branch state file \"%s\": %m",
+						state_path)));
+		return;
+	}
+
+	dst = AllocateFile(temp_path, PG_BINARY_W);
+	if (dst == NULL)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not create DB Branch state file \"%s\": %m",
+						temp_path)));
+		FreeFile(src);
+		return;
+	}
+
+	while (fgets(line, sizeof(line), src) != NULL)
+	{
+		if (strncmp(line, "wal_pin=", 8) == 0)
+			ok = ok && fprintf(dst, "wal_pin=released\n") >= 0;
+		else if (strncmp(line, "cleanup=", 8) == 0)
+			ok = ok && fprintf(dst, "cleanup=%s\n",
+							   cleanup_ok ? "done" : "failed") >= 0;
+		else if (strncmp(line, "status_history=", 15) == 0)
+			ok = ok && fprintf(dst, "status_history=CREATING,COPYING,REPLAYING,FAILED\n") >= 0;
+		else if (strncmp(line, "status=", 7) == 0)
+			ok = ok && fprintf(dst, "status=FAILED\n") >= 0;
+		else if (strncmp(line, "failure=", 8) == 0)
+			ok = ok && fprintf(dst, "failure=%s\n",
+							   cleanup_ok ?
+							   "startup cleanup removed stale DB Branch clone" :
+							   "startup cleanup could not remove stale DB Branch clone") >= 0;
+		else
+			ok = ok && fputs(line, dst) >= 0;
+	}
+
+	if (ferror(src) || ferror(dst))
+		ok = false;
+	if (FreeFile(src))
+		ok = false;
+	if (FreeFile(dst))
+		ok = false;
+
+	if (!ok)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not rewrite DB Branch state file \"%s\": %m",
+						state_path)));
+		(void) unlink(temp_path);
+		return;
+	}
+
+	if (rename(temp_path, state_path) != 0)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not rename DB Branch state file \"%s\" to \"%s\": %m",
+						temp_path, state_path)));
+		(void) unlink(temp_path);
+		return;
+	}
+
+	fsync_fname(state_path, false);
+	fsync_fname("global", true);
+}
+
+void
+CleanupDBBranchStartupState(void)
+{
+	DIR		   *dir;
+	struct dirent *de;
+
+	dir = AllocateDir("global");
+	if (dir == NULL)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not open directory \"global\": %m")));
+		return;
+	}
+
+	while ((de = ReadDir(dir, "global")) != NULL)
+	{
+		char		state_path[MAXPGPATH];
+		char		status[64] = "";
+		char		clone_path[MAXPGPATH] = "";
+		char		line[MAXPGPATH * 2];
+		FILE	   *file;
+		bool		cleanup_ok;
+
+		if (!DBBranchStateFileName(de->d_name))
+			continue;
+
+		snprintf(state_path, sizeof(state_path), "global/%s", de->d_name);
+		file = AllocateFile(state_path, PG_BINARY_R);
+		if (file == NULL)
+		{
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not open DB Branch state file \"%s\": %m",
+							state_path)));
+			continue;
+		}
+
+		while (fgets(line, sizeof(line), file) != NULL)
+		{
+			if (strncmp(line, "status=", 7) == 0)
+			{
+				strlcpy(status, line + 7, sizeof(status));
+				status[strcspn(status, "\r\n")] = '\0';
+			}
+			else if (strncmp(line, "clone_path=", 11) == 0)
+			{
+				strlcpy(clone_path, line + 11, sizeof(clone_path));
+				clone_path[strcspn(clone_path, "\r\n")] = '\0';
+			}
+		}
+		FreeFile(file);
+
+		if (!DBBranchStartupStatusNeedsCleanup(status) ||
+			clone_path[0] == '\0')
+			continue;
+
+		if (!DBBranchStartupClonePathIsSafe(clone_path))
+		{
+			ereport(LOG,
+					(errmsg("skipping unsafe DB Branch startup cleanup path \"%s\"",
+							clone_path)));
+			continue;
+		}
+
+		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+		RewriteDBBranchStartupState(state_path, cleanup_ok);
+	}
+
+	FreeDir(dir);
 }
 
 static Oid
