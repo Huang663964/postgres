@@ -123,6 +123,9 @@ like($metadata, qr/^status=FAILED$/m,
 	'active source DML writer metadata final state is FAILED');
 like($metadata, qr/^failure=source database has active write transactions$/m,
 	'active source DML writer metadata records failure');
+my ($metadata_source_blocking_ms) = $metadata =~ /^source_blocking_ms=([0-9]+(?:\.[0-9]+)?)$/m;
+ok(defined $metadata_source_blocking_ms && $metadata_source_blocking_ms > 0,
+	'active source DML writer metadata records source blocking time');
 like($metadata, qr/^wal_pin=not_started$/m,
 	'active source DML writer metadata records WAL pin not started');
 like($metadata, qr/^clone_result=not_started$/m,
