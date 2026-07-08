@@ -21,6 +21,32 @@ my $source_oid = $node->safe_psql(
 	'postgres',
 	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_dml_gate_source';]);
 
+my $reader = $node->background_psql('dbbranch_dml_gate_source', on_error_stop => 1);
+$reader->query_safe(q[BEGIN; SELECT count(*) FROM dml_gate_rows;]);
+my $reader_gate = $node->safe_psql(
+	'postgres',
+	q[
+SELECT count(*)
+FROM pg_locks
+WHERE locktype = 'object'
+  AND classid = 'pg_dbbranch'::regclass
+  AND objid = ] . $source_oid . q[
+  AND objsubid = 0
+  AND mode = 'RowExclusiveLock';
+]);
+is($reader_gate, '0', 'active source reader takes no DB Branch writer gate');
+
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_reader_gate_target FROM DATABASE dbbranch_dml_gate_source]);
+my $reader_branch_rows = $node->safe_psql(
+	'dbbranch_reader_gate_target',
+	q[SELECT string_agg(id::text, ',' ORDER BY id) FROM dml_gate_rows;]);
+is($reader_branch_rows, '1', 'db branch succeeds while source reader is active');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reader_gate_target;]);
+$reader->query_safe(q[COMMIT;]);
+$reader->quit;
+
 my $writer = $node->background_psql('dbbranch_dml_gate_source', on_error_stop => 1);
 $writer->query_safe(q[BEGIN; INSERT INTO dml_gate_rows VALUES (2);]);
 
