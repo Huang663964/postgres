@@ -96,6 +96,15 @@ my $rows = $node->safe_psql(
 	q[SELECT string_agg(id::text, ',' ORDER BY id) FROM dml_gate_rows;]);
 is($rows, '1,2', 'source DML writer commits normally');
 
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_dml_gate_drained_target FROM DATABASE dbbranch_dml_gate_source]);
+my $branch_rows = $node->safe_psql(
+	'dbbranch_dml_gate_drained_target',
+	q[SELECT string_agg(id::text, ',' ORDER BY id) FROM dml_gate_rows;]);
+is($branch_rows, '1,2', 'db branch succeeds after source DML writer drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_dml_gate_drained_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_dml_gate_source;]);
 $node->stop;
 
