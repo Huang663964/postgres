@@ -6,7 +6,7 @@ use PostgreSQL::Test::Cluster;
 use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('node');
-$node->init;
+$node->init(allows_streaming => 1);
 $node->start;
 
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_dml_gate_source;]);
@@ -37,6 +37,20 @@ WHERE locktype = 'object'
   AND granted;
 ]);
 is($gate_lock, 't', 'active source DML writer holds DB Branch writer gate');
+
+my $stderr = '';
+my $result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_dml_gate_target FROM DATABASE dbbranch_dml_gate_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source DML writer');
+like($stderr, qr/source database "dbbranch_dml_gate_source" has active write transactions/,
+	'active source DML writer blocks CREATE BRANCH');
+
+my $target_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_dml_gate_target';]);
+is($target_count, '0', 'active source DML writer creates no branch database');
 
 $writer->query_safe(q[COMMIT;]);
 $writer->quit;
