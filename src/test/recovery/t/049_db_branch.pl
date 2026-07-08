@@ -3604,6 +3604,11 @@ CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 		'dbbranch_drain_target',
 		q[SELECT string_agg(id::text, ',' ORDER BY id) FROM drain_rows;]);
 	is($drain_rows, '1,2', 'db branch waits for a short source writer to drain');
+	my $drain_blocking_recorded = $node->safe_psql(
+		'postgres',
+		q[SELECT source_blocking_ms > 0 FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_drain_target');]);
+	is($drain_blocking_recorded, 't',
+		'pg_dbbranch records source blocking time for writer drain');
 
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-drain');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drain_target;]);
