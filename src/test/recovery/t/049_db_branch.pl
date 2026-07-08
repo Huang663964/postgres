@@ -4594,15 +4594,28 @@ SELECT count(*) FROM cancel_rows;
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-cancel-before-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cancel_source;]);
 
+	my $crash_tablespace_dir = $node->basedir . '/dbbranch_crash_ts';
+	mkdir($crash_tablespace_dir)
+	  or die "could not create $crash_tablespace_dir: $!";
+	$node->safe_psql('postgres',
+		"CREATE TABLESPACE dbbranch_crash_ts LOCATION '$crash_tablespace_dir';");
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_crash_source;]);
 	$node->safe_psql(
 		'dbbranch_crash_source',
 		q[
 CREATE TABLE crash_rows (id int PRIMARY KEY);
+CREATE TABLE crash_ts_rows (id int PRIMARY KEY) TABLESPACE dbbranch_crash_ts;
 INSERT INTO crash_rows VALUES (1);
+INSERT INTO crash_ts_rows VALUES (1);
 CHECKPOINT;
 UPDATE crash_rows SET id = 1 WHERE id = 1;
+UPDATE crash_ts_rows SET id = 1 WHERE id = 1;
 ]);
+	my $crash_source_ts_relpath = $node->safe_psql(
+		'dbbranch_crash_source',
+		q[SELECT pg_relation_filepath('crash_ts_rows');]);
+	like($crash_source_ts_relpath, qr{^pg_tblspc/[0-9]+/[^/]+/[0-9]+/[0-9]+$},
+		'crash source relation tablespace path is under pg_tblspc');
 	my @crash_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_attach('db-branch-cancel-before-replay', 'wait');]);
@@ -4639,6 +4652,12 @@ CREATE BRANCH dbbranch_crash_target FROM DATABASE dbbranch_crash_source;
 		'pre-crash db branch metadata records clone path');
 	ok(-d $node->data_dir . '/' . $crash_clone_path,
 		'pre-crash db branch cloned storage path exists');
+	my ($crash_branch_dboid) = $crash_clone_path =~ m{^base/([0-9]+)$};
+	my ($crash_tablespace_prefix) =
+	  $crash_source_ts_relpath =~ m{^(pg_tblspc/[0-9]+/[^/]+)/[0-9]+/[0-9]+$};
+	my $crash_tablespace_clone_path = $crash_tablespace_prefix . '/' . $crash_branch_dboid;
+	ok(-d $node->data_dir . '/' . $crash_tablespace_clone_path,
+		'pre-crash db branch relation tablespace cloned storage path exists');
 
 	$node->stop('immediate');
 	$crash_branch->{run}->finish;
@@ -4685,6 +4704,8 @@ CREATE BRANCH dbbranch_crash_target FROM DATABASE dbbranch_crash_source;
 		'crashed db branch metadata records startup cleanup reason');
 	ok(!-e $node->data_dir . '/' . $crash_clone_path,
 		'crashed db branch startup cleanup removes cloned storage path');
+	ok(!-e $node->data_dir . '/' . $crash_tablespace_clone_path,
+		'crashed db branch startup cleanup removes relation tablespace cloned storage path');
 
 	my $crash_source_rows = $node->safe_psql(
 		'dbbranch_crash_source',
@@ -4695,6 +4716,7 @@ SELECT count(*) FROM crash_rows;
 	is($crash_source_rows, '2', 'source accepts writes after db branch crash restart');
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_crash_source;]);
+	$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_crash_ts;]);
 
 	my $drop_during_tablespace_dir = $node->basedir . '/dbbranch_drop_during_ts';
 	mkdir($drop_during_tablespace_dir)

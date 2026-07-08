@@ -175,9 +175,11 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   <para>
    If the server stops before a branch reaches <literal>READY</literal>, the
    current prototype does not automatically resume replay during restart.  It
-   scans diagnostic state files, removes stale cloned branch storage for
-   in-progress branches when the recorded path is safe to clean, and rewrites
-   the state as <literal>FAILED</literal>.  No
+   scans diagnostic state files after recovery, derives the branch database
+   OID from a safe recorded clone path, removes stale cloned branch storage
+   under <filename>base</filename> and per-database
+   <filename>pg_tblspc</filename> directories, and rewrites the state as
+   <literal>FAILED</literal>.  No
    <structname>pg_dbbranch</structname> catalog row is committed for the
    incomplete branch.  The diagnostic state file remains available for
    operators to identify the last durable clone path and startup cleanup

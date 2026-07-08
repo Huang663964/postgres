@@ -1318,7 +1318,6 @@ PostmasterMain(int argc, char *argv[])
 	 * Postgres processes running in this directory, so this should be safe.
 	 */
 	RemovePgTempFiles();
-	CleanupDBBranchStartupState();
 
 	/*
 	 * Initialize the autovacuum subsystem (again, no process start yet)
@@ -2319,6 +2318,8 @@ process_pm_child_exit(void)
 			FatalError = false;
 			AbortStartTime = 0;
 			ReachedNormalRunning = true;
+			/* Recovery may restore tablespace symlinks needed for cleanup. */
+			CleanupDBBranchStartupState();
 			UpdatePMState(PM_RUN);
 			connsAllowed = true;
 

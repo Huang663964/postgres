@@ -199,6 +199,9 @@ static bool ReplayDBBranchWalRecord(Oid source_dboid, Oid branch_dboid,
 static bool CleanupDBBranchClonePath(const char *clone_path);
 static bool DBBranchAllDigits(const char *str);
 static bool DBBranchStartupClonePathIsSafe(const char *clone_path);
+static bool DBBranchStartupClonePathBranchOid(const char *clone_path,
+											 Oid *branch_dboid);
+static bool CleanupDBBranchStartupClonePaths(Oid branch_dboid);
 static bool DBBranchStartupStatusNeedsCleanup(const char *status);
 static bool DBBranchStateFileName(const char *name);
 static void RewriteDBBranchStartupState(const char *state_path, bool cleanup_ok);
@@ -3419,6 +3422,91 @@ DBBranchStartupClonePathIsSafe(const char *clone_path)
 }
 
 static bool
+DBBranchStartupClonePathBranchOid(const char *clone_path, Oid *branch_dboid)
+{
+	const char *dboid_str;
+	char	   *endptr;
+	unsigned long value;
+
+	if (!DBBranchStartupClonePathIsSafe(clone_path))
+		return false;
+
+	if (strncmp(clone_path, "base/", 5) == 0)
+		dboid_str = clone_path + 5;
+	else
+		dboid_str = strrchr(clone_path, '/') + 1;
+
+	errno = 0;
+	value = strtoul(dboid_str, &endptr, 10);
+	if (errno != 0 || *endptr != '\0' || value > PG_UINT32_MAX ||
+		!OidIsValid((Oid) value))
+		return false;
+
+	*branch_dboid = (Oid) value;
+	return true;
+}
+
+static bool
+CleanupDBBranchStartupClonePaths(Oid branch_dboid)
+{
+	DIR		   *spc_dir;
+	struct dirent *spc_de;
+	char		spc_path[MAXPGPATH];
+	char		path[MAXPGPATH];
+	bool		cleanup_ok = true;
+
+	snprintf(path, sizeof(path), "base/%u", branch_dboid);
+	if (!CleanupDBBranchClonePath(path))
+		cleanup_ok = false;
+
+	spc_dir = AllocateDir(PG_TBLSPC_DIR);
+	if (spc_dir == NULL)
+	{
+		ereport(LOG,
+				(errcode_for_file_access(),
+				 errmsg("could not open directory \"%s\": %m", PG_TBLSPC_DIR)));
+		return false;
+	}
+
+	while ((spc_de = ReadDirExtended(spc_dir, PG_TBLSPC_DIR, LOG)) != NULL)
+	{
+		DIR		   *version_dir;
+		struct dirent *version_de;
+
+		if (strcmp(spc_de->d_name, ".") == 0 ||
+			strcmp(spc_de->d_name, "..") == 0 ||
+			!DBBranchAllDigits(spc_de->d_name))
+			continue;
+
+		snprintf(spc_path, sizeof(spc_path), "%s/%s",
+				 PG_TBLSPC_DIR, spc_de->d_name);
+		version_dir = AllocateDir(spc_path);
+		if (version_dir == NULL)
+		{
+			cleanup_ok = false;
+			continue;
+		}
+
+		while ((version_de = ReadDirExtended(version_dir, spc_path, LOG)) != NULL)
+		{
+			if (strcmp(version_de->d_name, ".") == 0 ||
+				strcmp(version_de->d_name, "..") == 0 ||
+				strncmp(version_de->d_name, "PG_", 3) != 0)
+				continue;
+
+			snprintf(path, sizeof(path), "%s/%s/%u",
+					 spc_path, version_de->d_name, branch_dboid);
+			if (!CleanupDBBranchClonePath(path))
+				cleanup_ok = false;
+		}
+		FreeDir(version_dir);
+	}
+	FreeDir(spc_dir);
+
+	return cleanup_ok;
+}
+
+static bool
 DBBranchStartupStatusNeedsCleanup(const char *status)
 {
 	return strcmp(status, "COPYING") == 0 ||
@@ -3542,6 +3630,7 @@ CleanupDBBranchStartupState(void)
 		char		clone_path[MAXPGPATH] = "";
 		char		line[MAXPGPATH * 2];
 		FILE	   *file;
+		Oid			branch_dboid;
 		bool		cleanup_ok;
 
 		if (!DBBranchStateFileName(de->d_name))
@@ -3577,7 +3666,7 @@ CleanupDBBranchStartupState(void)
 			clone_path[0] == '\0')
 			continue;
 
-		if (!DBBranchStartupClonePathIsSafe(clone_path))
+		if (!DBBranchStartupClonePathBranchOid(clone_path, &branch_dboid))
 		{
 			ereport(LOG,
 					(errmsg("skipping unsafe DB Branch startup cleanup path \"%s\"",
@@ -3585,7 +3674,7 @@ CleanupDBBranchStartupState(void)
 			continue;
 		}
 
-		cleanup_ok = CleanupDBBranchClonePath(clone_path);
+		cleanup_ok = CleanupDBBranchStartupClonePaths(branch_dboid);
 		RewriteDBBranchStartupState(state_path, cleanup_ok);
 	}
 
