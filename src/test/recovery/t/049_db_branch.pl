@@ -4461,17 +4461,26 @@ CREATE BRANCH dbbranch_replay_gate_target FROM DATABASE dbbranch_replay_gate_sou
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_replay_gate_source;]);
 
+	my $drop_during_tablespace_dir = $node->basedir . '/dbbranch_drop_during_ts';
+	mkdir($drop_during_tablespace_dir)
+	  or die "could not create $drop_during_tablespace_dir: $!";
+	$node->safe_psql('postgres',
+		"CREATE TABLESPACE dbbranch_drop_during_ts LOCATION '$drop_during_tablespace_dir';");
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_drop_during_source;]);
 	$node->safe_psql(
 		'dbbranch_drop_during_source',
 		q[
 CREATE TABLE drop_during_rows (id int PRIMARY KEY);
+CREATE TABLE drop_during_ts_rows (id int PRIMARY KEY) TABLESPACE dbbranch_drop_during_ts;
 INSERT INTO drop_during_rows VALUES (1);
+INSERT INTO drop_during_ts_rows VALUES (1);
 CHECKPOINT;
 UPDATE drop_during_rows SET id = 1 WHERE id = 1;
 ]);
 
-	my %drop_during_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my %drop_during_storage_before = map { $_ => 1 } (
+		glob($node->data_dir . '/base/*'),
+		glob($node->data_dir . '/pg_tblspc/*/*/*'));
 	my @drop_during_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_attach('db-branch-before-replay', 'wait');]);
@@ -4482,12 +4491,14 @@ UPDATE drop_during_rows SET id = 1 WHERE id = 1;
 		q(\echo start_drop_during_branch
 CREATE BRANCH dbbranch_drop_during_target FROM DATABASE dbbranch_drop_during_source;
 \echo finish_drop_during_branch
-));
+	));
 	$node->wait_for_event('client backend', 'db-branch-before-replay');
 
-	my @drop_during_clone_paths = grep { !$drop_during_base_before{$_} } glob $node->data_dir . '/base/*';
-	is(scalar @drop_during_clone_paths, 1,
-		'source-drop race has cloned branch storage before replay');
+	my @drop_during_clone_paths = grep { !$drop_during_storage_before{$_} } (
+		glob($node->data_dir . '/base/*'),
+		glob($node->data_dir . '/pg_tblspc/*/*/*'));
+	is(scalar @drop_during_clone_paths, 2,
+		'source-drop race has cloned branch storage in all tablespaces before replay');
 
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_during_source;]);
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-replay');]);
@@ -4552,6 +4563,7 @@ CREATE BRANCH dbbranch_drop_during_target FROM DATABASE dbbranch_drop_during_sou
 		'source-drop race metadata records failure reason');
 
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-before-replay');]);
+	$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_drop_during_ts;]);
 
 	my $replay_fail_tablespace_dir = $node->basedir . '/dbbranch_replay_fail_ts';
 	mkdir($replay_fail_tablespace_dir)
