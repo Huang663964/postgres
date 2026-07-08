@@ -47,6 +47,29 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_reader_gate_target;]);
 $reader->query_safe(q[COMMIT;]);
 $reader->quit;
 
+my $subxact_writer = $node->background_psql('dbbranch_dml_gate_source', on_error_stop => 1);
+$subxact_writer->query_safe(q[
+BEGIN;
+SAVEPOINT dbbranch_subxact_writer;
+INSERT INTO dml_gate_rows VALUES (3);
+]);
+my $subxact_gate = $node->safe_psql(
+	'postgres',
+	q[
+SELECT count(*) > 0
+FROM pg_locks
+WHERE locktype = 'object'
+  AND classid = 'pg_dbbranch'::regclass
+  AND objid = ] . $source_oid . q[
+  AND objsubid = 0
+  AND mode = 'RowExclusiveLock'
+  AND granted;
+]);
+is($subxact_gate, 't', 'source subtransaction DML writer holds DB Branch writer gate');
+$subxact_writer->query_safe(q[COMMIT;]);
+$subxact_writer->quit;
+$node->safe_psql('dbbranch_dml_gate_source', q[DELETE FROM dml_gate_rows WHERE id = 3;]);
+
 my $writer = $node->background_psql('dbbranch_dml_gate_source', on_error_stop => 1);
 $writer->query_safe(q[BEGIN; INSERT INTO dml_gate_rows VALUES (2);]);
 
