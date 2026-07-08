@@ -4594,6 +4594,99 @@ SELECT count(*) FROM cancel_rows;
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-cancel-before-replay');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cancel_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_crash_source;]);
+	$node->safe_psql(
+		'dbbranch_crash_source',
+		q[
+CREATE TABLE crash_rows (id int PRIMARY KEY);
+INSERT INTO crash_rows VALUES (1);
+CHECKPOINT;
+UPDATE crash_rows SET id = 1 WHERE id = 1;
+]);
+	my @crash_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		q[SELECT injection_points_attach('db-branch-cancel-before-replay', 'wait');]);
+
+	my $crash_branch = $node->background_psql('postgres', on_error_stop => 0);
+	$crash_branch->query_until(
+		qr/start_crash_branch/,
+		q(\echo start_crash_branch
+CREATE BRANCH dbbranch_crash_target FROM DATABASE dbbranch_crash_source;
+\echo finish_crash_branch
+));
+	$node->wait_for_event('client backend', 'db-branch-cancel-before-replay');
+
+	my @crash_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @crash_metadata_files, scalar(@crash_metadata_before) + 1,
+		'crashing db branch writes in-progress metadata before restart');
+	my $crash_metadata = '';
+	for my $path (@crash_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_crash_target$/m)
+		{
+			$crash_metadata = $contents;
+			last;
+		}
+	}
+
+	like($crash_metadata, qr/^status=REPLAYING$/m,
+		'pre-crash db branch metadata records replaying state');
+	my ($crash_clone_path) = $crash_metadata =~ /^clone_path=(.+)$/m;
+	like($crash_clone_path, qr/^base\/[0-9]+$/,
+		'pre-crash db branch metadata records clone path');
+	ok(-d $node->data_dir . '/' . $crash_clone_path,
+		'pre-crash db branch cloned storage path exists');
+
+	$node->stop('immediate');
+	$crash_branch->{run}->finish;
+	$node->start;
+
+	my $crash_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_crash_target';]);
+	is($crash_branch_count, '0', 'crashed db branch creates no branch database after restart');
+	my $crash_catalog_rows = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_dbbranch WHERE source_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_crash_source');]);
+	is($crash_catalog_rows, '0', 'crashed db branch inserts no READY catalog row after restart');
+	my $crash_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($crash_slot_count, '0', 'crashed db branch leaves no active WAL pin after restart');
+
+	@crash_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$crash_metadata = '';
+	for my $path (@crash_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_crash_target$/m)
+		{
+			$crash_metadata = $contents;
+			last;
+		}
+	}
+	like($crash_metadata, qr/^status=REPLAYING$/m,
+		'crashed db branch metadata still diagnoses incomplete replay');
+	like($crash_metadata, qr/^clone_path=\Q$crash_clone_path\E$/m,
+		'crashed db branch metadata still identifies cloned storage path');
+	ok(-d $node->data_dir . '/' . $crash_clone_path,
+		'crashed db branch cloned storage path remains diagnosable after restart');
+
+	my $crash_source_rows = $node->safe_psql(
+		'dbbranch_crash_source',
+		q[
+INSERT INTO crash_rows VALUES (2);
+SELECT count(*) FROM crash_rows;
+]);
+	is($crash_source_rows, '2', 'source accepts writes after db branch crash restart');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_crash_source;]);
+
 	my $drop_during_tablespace_dir = $node->basedir . '/dbbranch_drop_during_ts';
 	mkdir($drop_during_tablespace_dir)
 	  or die "could not create $drop_during_tablespace_dir: $!";
