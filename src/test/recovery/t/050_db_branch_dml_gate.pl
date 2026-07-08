@@ -16,10 +16,17 @@ $node->safe_psql(
 CREATE TABLE dml_gate_rows (id int PRIMARY KEY);
 INSERT INTO dml_gate_rows VALUES (1);
 ]);
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_dml_gate_other;]);
+$node->safe_psql(
+	'dbbranch_dml_gate_other',
+	q[CREATE TABLE other_rows (id int PRIMARY KEY);]);
 
 my $source_oid = $node->safe_psql(
 	'postgres',
 	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_dml_gate_source';]);
+my $other_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_dml_gate_other';]);
 
 my $reader = $node->background_psql('dbbranch_dml_gate_source', on_error_stop => 1);
 $reader->query_safe(q[BEGIN; SELECT count(*) FROM dml_gate_rows;]);
@@ -46,6 +53,32 @@ is($reader_branch_rows, '1', 'db branch succeeds while source reader is active')
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_reader_gate_target;]);
 $reader->query_safe(q[COMMIT;]);
 $reader->quit;
+
+my $other_writer = $node->background_psql('dbbranch_dml_gate_other', on_error_stop => 1);
+$other_writer->query_safe(q[BEGIN; INSERT INTO other_rows VALUES (1);]);
+my $other_gate = $node->safe_psql(
+	'postgres',
+	q[
+SELECT count(*) > 0
+FROM pg_locks
+WHERE locktype = 'object'
+  AND classid = 'pg_dbbranch'::regclass
+  AND objid = ] . $other_oid . q[
+  AND objsubid = 0
+  AND mode = 'RowExclusiveLock'
+  AND granted;
+]);
+is($other_gate, 't', 'other database DML writer holds its own DB Branch writer gate');
+$node->safe_psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_other_writer_target FROM DATABASE dbbranch_dml_gate_source]);
+my $other_writer_branch_rows = $node->safe_psql(
+	'dbbranch_other_writer_target',
+	q[SELECT string_agg(id::text, ',' ORDER BY id) FROM dml_gate_rows;]);
+is($other_writer_branch_rows, '1', 'db branch ignores other database active DML writer');
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_other_writer_target;]);
+$other_writer->query_safe(q[COMMIT;]);
+$other_writer->quit;
 
 my $subxact_writer = $node->background_psql('dbbranch_dml_gate_source', on_error_stop => 1);
 $subxact_writer->query_safe(q[
@@ -166,6 +199,7 @@ is($branch_rows, '1,2', 'db branch succeeds after source DML writer drains');
 
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_dml_gate_drained_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_dml_gate_source;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_dml_gate_other;]);
 $node->stop;
 
 done_testing();
