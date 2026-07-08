@@ -100,6 +100,14 @@ like($metadata, qr/^status=FAILED$/m,
 	'active source DML writer metadata final state is FAILED');
 like($metadata, qr/^failure=source database has active write transactions$/m,
 	'active source DML writer metadata records failure');
+like($metadata, qr/^wal_pin=not_started$/m,
+	'active source DML writer metadata records WAL pin not started');
+like($metadata, qr/^clone_result=not_started$/m,
+	'active source DML writer metadata records clone not started');
+like($metadata, qr/^cleanup=not_started$/m,
+	'active source DML writer metadata records cleanup not started');
+like($metadata, qr/^replay_method=not_started$/m,
+	'active source DML writer metadata records replay not started');
 
 $writer->query_safe(q[COMMIT;]);
 $writer->quit;
