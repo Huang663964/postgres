@@ -57,7 +57,8 @@ tests += {
       't/046_checkpoint_logical_slot.pl',
       't/047_checkpoint_physical_slot.pl',
       't/048_vacuum_horizon_floor.pl',
-      't/049_db_branch.pl'
+      't/049_db_branch.pl',
+      't/050_db_branch_dml_gate.pl'
     ],
   },
 }
