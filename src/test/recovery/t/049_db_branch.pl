@@ -7709,6 +7709,61 @@ is($drop_function_lifecycle_missing, '0', 'branch does not expose dropped functi
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_function_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_function_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_procedure_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_procedure_lifecycle_source',
+	q[
+CREATE TABLE procedure_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO procedure_lifecycle_rows VALUES (1, 'before-procedure');
+CHECKPOINT;
+CREATE PROCEDURE procedure_lifecycle_add(id_arg int, note_arg text)
+	LANGUAGE SQL
+	AS $$
+		INSERT INTO procedure_lifecycle_rows VALUES (id_arg, note_arg)
+	$$;
+CALL procedure_lifecycle_add(2, 'after-procedure');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_procedure_lifecycle_target FROM DATABASE dbbranch_procedure_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports created procedures');
+
+my $procedure_lifecycle_rows = $node->safe_psql(
+	'dbbranch_procedure_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM procedure_lifecycle_rows;]);
+is($procedure_lifecycle_rows,
+	'1:before-procedure,2:after-procedure',
+	'branch reads rows after procedure creation');
+my $procedure_lifecycle_catalog = $node->safe_psql(
+	'dbbranch_procedure_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'procedure_lifecycle_add'
+  AND p.prokind = 'p';
+]);
+is($procedure_lifecycle_catalog, '1', 'branch exposes created procedure');
+$node->safe_psql(
+	'dbbranch_procedure_lifecycle_target',
+	q[CALL procedure_lifecycle_add(3, 'branch-call');]);
+my $procedure_lifecycle_call_rows = $node->safe_psql(
+	'dbbranch_procedure_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM procedure_lifecycle_rows;]);
+is($procedure_lifecycle_call_rows,
+	'1:before-procedure,2:after-procedure,3:branch-call',
+	'branch can call created procedure');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_procedure_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_procedure_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
