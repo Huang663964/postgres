@@ -6843,6 +6843,50 @@ is($drop_toast_rel_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_toast_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_toast_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_part_source;');
+$node->safe_psql(
+	'dbbranch_drop_part_source',
+	q[
+CREATE TABLE drop_part_keep_rows (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE drop_part_gone_rows (id int NOT NULL, name text NOT NULL)
+	PARTITION BY RANGE (id);
+CREATE TABLE drop_part_gone_rows_low PARTITION OF drop_part_gone_rows
+	FOR VALUES FROM (0) TO (100);
+CREATE TABLE drop_part_gone_rows_high PARTITION OF drop_part_gone_rows
+	FOR VALUES FROM (100) TO (200);
+INSERT INTO drop_part_keep_rows VALUES (1, 'before-drop');
+INSERT INTO drop_part_gone_rows VALUES (1, 'low'), (101, 'high');
+CHECKPOINT;
+DROP TABLE drop_part_gone_rows;
+INSERT INTO drop_part_keep_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_part_target FROM DATABASE dbbranch_drop_part_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped partitioned tables');
+
+my $drop_part_keep_rows = $node->safe_psql(
+	'dbbranch_drop_part_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_part_keep_rows;]);
+is($drop_part_keep_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after partitioned table drop');
+my $drop_part_missing = $node->safe_psql(
+	'dbbranch_drop_part_target',
+	q[
+SELECT
+  to_regclass('public.drop_part_gone_rows') IS NULL AND
+  to_regclass('public.drop_part_gone_rows_low') IS NULL AND
+  to_regclass('public.drop_part_gone_rows_high') IS NULL;
+]);
+is($drop_part_missing, 't',
+	'branch does not expose dropped partitioned table or partitions');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_part_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_part_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_index_source;');
 $node->safe_psql(
 	'dbbranch_drop_index_source',
