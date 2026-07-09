@@ -6509,6 +6509,73 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_ts_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_rel_ts;]);
 
+my $multi_rel_ts_a_dir = $node->basedir . '/dbbranch_multi_rel_ts_a';
+my $multi_rel_ts_b_dir = $node->basedir . '/dbbranch_multi_rel_ts_b';
+mkdir($multi_rel_ts_a_dir) or die "could not create $multi_rel_ts_a_dir: $!";
+mkdir($multi_rel_ts_b_dir) or die "could not create $multi_rel_ts_b_dir: $!";
+$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_multi_rel_ts_a LOCATION '$multi_rel_ts_a_dir';");
+$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_multi_rel_ts_b LOCATION '$multi_rel_ts_b_dir';");
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_multi_rel_ts_source;');
+$node->safe_psql(
+	'dbbranch_multi_rel_ts_source',
+	q[
+CREATE TABLE multi_default_rows (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE multi_ts_a_rows (id int PRIMARY KEY, name text NOT NULL) TABLESPACE dbbranch_multi_rel_ts_a;
+CREATE TABLE multi_ts_b_rows (id int PRIMARY KEY, name text NOT NULL) TABLESPACE dbbranch_multi_rel_ts_b;
+INSERT INTO multi_default_rows VALUES (1, 'default');
+INSERT INTO multi_ts_a_rows VALUES (1, 'ts-a');
+INSERT INTO multi_ts_b_rows VALUES (1, 'ts-b');
+CHECKPOINT;
+INSERT INTO multi_default_rows VALUES (2, 'default-redo');
+INSERT INTO multi_ts_a_rows VALUES (2, 'ts-a-redo');
+INSERT INTO multi_ts_b_rows VALUES (2, 'ts-b-redo');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_multi_rel_ts_target FROM DATABASE dbbranch_multi_rel_ts_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports multiple relation tablespaces in one source');
+
+my $multi_rel_rows = $node->safe_psql(
+	'dbbranch_multi_rel_ts_target',
+	q[
+SELECT
+  (SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM multi_default_rows) || ';' ||
+  (SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM multi_ts_a_rows) || ';' ||
+  (SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM multi_ts_b_rows);
+]);
+is($multi_rel_rows,
+	'1:default,2:default-redo;1:ts-a,2:ts-a-redo;1:ts-b,2:ts-b-redo',
+	'branch reads default and multiple relation tablespace rows');
+
+my $multi_rel_ts_a_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_tablespace WHERE spcname = 'dbbranch_multi_rel_ts_a';]);
+my $multi_rel_ts_b_oid = $node->safe_psql(
+	'postgres',
+	q[SELECT oid FROM pg_tablespace WHERE spcname = 'dbbranch_multi_rel_ts_b';]);
+my $multi_rel_ts_a_path = $node->safe_psql(
+	'dbbranch_multi_rel_ts_target',
+	q[SELECT pg_relation_filepath('multi_ts_a_rows');]);
+my $multi_rel_ts_b_path = $node->safe_psql(
+	'dbbranch_multi_rel_ts_target',
+	q[SELECT pg_relation_filepath('multi_ts_b_rows');]);
+like($multi_rel_ts_a_path, qr/^pg_tblspc\/\Q$multi_rel_ts_a_oid\E\/[^\/]+\/[0-9]+\/[0-9]+$/,
+	'multi relation tablespace A file stays under its pg_tblspc path');
+like($multi_rel_ts_b_path, qr/^pg_tblspc\/\Q$multi_rel_ts_b_oid\E\/[^\/]+\/[0-9]+\/[0-9]+$/,
+	'multi relation tablespace B file stays under its pg_tblspc path');
+ok(-f $node->data_dir . '/' . $multi_rel_ts_a_path,
+	'multi relation tablespace A branch file exists');
+ok(-f $node->data_dir . '/' . $multi_rel_ts_b_path,
+	'multi relation tablespace B branch file exists');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_multi_rel_ts_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_multi_rel_ts_source;]);
+$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_multi_rel_ts_a;]);
+$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_multi_rel_ts_b;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
