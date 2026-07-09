@@ -7003,6 +7003,44 @@ is($drop_index_concurrently_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_concurrently_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_concurrently_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_reindex_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_reindex_lifecycle_source',
+	q[
+CREATE TABLE reindex_lifecycle_rows (
+	id int PRIMARY KEY,
+	name text NOT NULL
+);
+CREATE INDEX reindex_lifecycle_rows_name_idx ON reindex_lifecycle_rows (name);
+INSERT INTO reindex_lifecycle_rows VALUES (1, 'before-reindex'), (2, 'kept');
+CHECKPOINT;
+REINDEX INDEX reindex_lifecycle_rows_name_idx;
+INSERT INTO reindex_lifecycle_rows VALUES (3, 'after-reindex');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_reindex_lifecycle_target FROM DATABASE dbbranch_reindex_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports reindexed indexes');
+
+my $reindex_lifecycle_exists = $node->safe_psql(
+	'dbbranch_reindex_lifecycle_target',
+	q[SELECT to_regclass('public.reindex_lifecycle_rows_name_idx') IS NOT NULL;]);
+is($reindex_lifecycle_exists, 't', 'branch exposes reindexed index');
+my $reindex_lifecycle_lookup = $node->safe_psql(
+	'dbbranch_reindex_lifecycle_target',
+	q[
+SET enable_seqscan = off;
+SELECT id FROM reindex_lifecycle_rows WHERE name = 'after-reindex';
+]);
+is($reindex_lifecycle_lookup, '3',
+	'branch reads rows through reindexed index predicate');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
