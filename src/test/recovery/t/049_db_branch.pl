@@ -7764,6 +7764,63 @@ is($procedure_lifecycle_call_rows,
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_procedure_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_procedure_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_alter_procedure_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_alter_procedure_lifecycle_source',
+	q[
+CREATE TABLE alter_procedure_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE PROCEDURE alter_procedure_lifecycle_add(id_arg int, note_arg text)
+	LANGUAGE SQL
+	AS $$
+		INSERT INTO alter_procedure_lifecycle_rows VALUES (id_arg, note_arg)
+	$$;
+INSERT INTO alter_procedure_lifecycle_rows VALUES (1, 'before-alter-procedure');
+CHECKPOINT;
+ALTER PROCEDURE alter_procedure_lifecycle_add(int, text) SECURITY DEFINER;
+CALL alter_procedure_lifecycle_add(2, 'after-alter-procedure');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_procedure_lifecycle_target FROM DATABASE dbbranch_alter_procedure_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports altered procedures');
+
+my $alter_procedure_lifecycle_rows = $node->safe_psql(
+	'dbbranch_alter_procedure_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM alter_procedure_lifecycle_rows;]);
+is($alter_procedure_lifecycle_rows,
+	'1:before-alter-procedure,2:after-alter-procedure',
+	'branch reads rows after procedure alteration');
+my $alter_procedure_lifecycle_catalog = $node->safe_psql(
+	'dbbranch_alter_procedure_lifecycle_target',
+	q[
+SELECT prosecdef::text
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'alter_procedure_lifecycle_add'
+  AND p.prokind = 'p';
+]);
+is($alter_procedure_lifecycle_catalog, 'true',
+	'branch exposes altered procedure attributes');
+$node->safe_psql(
+	'dbbranch_alter_procedure_lifecycle_target',
+	q[CALL alter_procedure_lifecycle_add(3, 'branch-call');]);
+my $alter_procedure_lifecycle_call_rows = $node->safe_psql(
+	'dbbranch_alter_procedure_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM alter_procedure_lifecycle_rows;]);
+is($alter_procedure_lifecycle_call_rows,
+	'1:before-alter-procedure,2:after-alter-procedure,3:branch-call',
+	'branch can call altered procedure');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_procedure_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_procedure_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
