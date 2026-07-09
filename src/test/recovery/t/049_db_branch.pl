@@ -7664,6 +7664,51 @@ is($alter_function_lifecycle_call,
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_function_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_function_lifecycle_source',
+	q[
+CREATE TABLE drop_function_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE FUNCTION drop_function_lifecycle_note(prefix text) RETURNS text LANGUAGE SQL
+	RETURN prefix || ':' ||
+		(SELECT string_agg(id || ':' || note, ',' ORDER BY id)
+		 FROM drop_function_lifecycle_rows);
+INSERT INTO drop_function_lifecycle_rows VALUES (1, 'before-drop-function');
+CHECKPOINT;
+DROP FUNCTION drop_function_lifecycle_note(text);
+INSERT INTO drop_function_lifecycle_rows VALUES (2, 'after-drop-function');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_function_lifecycle_target FROM DATABASE dbbranch_drop_function_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped functions');
+
+my $drop_function_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_function_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_function_lifecycle_rows;]);
+is($drop_function_lifecycle_rows,
+	'1:before-drop-function,2:after-drop-function',
+	'branch reads rows after function drop');
+my $drop_function_lifecycle_missing = $node->safe_psql(
+	'dbbranch_drop_function_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'drop_function_lifecycle_note';
+]);
+is($drop_function_lifecycle_missing, '0', 'branch does not expose dropped function');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_function_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_function_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
