@@ -3093,7 +3093,7 @@ note('DB Branch section: injection-point failure and cleanup paths');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 165
+	skip 'Injection points not supported by this build', 178
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -4583,6 +4583,86 @@ CHECKPOINT;
 		qq[SELECT injection_points_detach('db-branch-before-file-clone-$pending_unlink_probe_name');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_pending_unlink_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_pending_unlink_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_active_enoent_source;]);
+	$node->safe_psql(
+		'dbbranch_active_enoent_source',
+		q[
+CREATE TABLE active_enoent_rows (id int PRIMARY KEY);
+INSERT INTO active_enoent_rows VALUES (1);
+CHECKPOINT;
+]);
+	my $active_enoent_relpath = $node->safe_psql(
+		'dbbranch_active_enoent_source',
+		q[SELECT pg_relation_filepath('active_enoent_rows');]);
+	my ($active_enoent_file_name) = $active_enoent_relpath =~ m{/([^/]+)$};
+	my $active_enoent_file_path = $node->data_dir . '/' . $active_enoent_relpath;
+	ok(-f $active_enoent_file_path,
+		'active ENOENT test source relation file exists before clone');
+
+	my %active_enoent_base_before = map { $_ => 1 } glob $node->data_dir . '/base/*';
+	my @active_enoent_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	$node->safe_psql('postgres',
+		qq[SELECT injection_points_attach('db-branch-before-file-clone-$active_enoent_file_name', 'unlink');]);
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_active_enoent_target FROM DATABASE dbbranch_active_enoent_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch rejects active source relation ENOENT');
+	like($stderr, qr/could not open file .*No such file or directory/,
+		'db branch reports active source relation ENOENT');
+	ok(!-e $active_enoent_file_path,
+		'active ENOENT injection removed source relation file');
+
+	my $active_enoent_branch_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_active_enoent_target';]);
+	is($active_enoent_branch_count, '0',
+		'active relation ENOENT creates no branch database');
+	my $active_enoent_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($active_enoent_slot_count, '0',
+		'active relation ENOENT releases DB Branch WAL pin');
+	my @active_enoent_paths_left =
+	  grep { !$active_enoent_base_before{$_} } glob $node->data_dir . '/base/*';
+	is(scalar @active_enoent_paths_left, 0,
+		'active relation ENOENT removes branch storage path');
+
+	my @active_enoent_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+	is(scalar @active_enoent_metadata_files, scalar(@active_enoent_metadata_before) + 1,
+		'active relation ENOENT writes separate metadata file');
+	my $active_enoent_metadata = '';
+	for my $path (@active_enoent_metadata_files)
+	{
+		open my $fh, '<', $path or die "could not open $path: $!";
+		my $contents = do { local $/; <$fh> };
+		close $fh;
+		if ($contents =~ /^branch_name=dbbranch_active_enoent_target$/m)
+		{
+			$active_enoent_metadata = $contents;
+			last;
+		}
+	}
+	like($active_enoent_metadata, qr/^wal_pin=released$/m,
+		'active relation ENOENT metadata records released WAL pin');
+	like($active_enoent_metadata, qr/^clone_result=failed$/m,
+		'active relation ENOENT metadata records clone failure');
+	like($active_enoent_metadata, qr/^cleanup=done$/m,
+		'active relation ENOENT metadata records clone cleanup');
+	like($active_enoent_metadata, qr/^status=FAILED$/m,
+		'active relation ENOENT metadata final state is FAILED');
+	like($active_enoent_metadata, qr/^failure=could not open file.*No such file or directory.*$/m,
+		'active relation ENOENT metadata records failure reason');
+
+	open my $active_enoent_restore_fh, '>', $active_enoent_file_path
+	  or die "could not restore $active_enoent_file_path: $!";
+	close $active_enoent_restore_fh;
+	$node->safe_psql('postgres',
+		qq[SELECT injection_points_detach('db-branch-before-file-clone-$active_enoent_file_name');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_active_enoent_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_gate_source;]);
 	$node->safe_psql(
