@@ -3934,6 +3934,53 @@ WHERE datname = 'dbbranch_alter_drain_source'
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_drain_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_rewrite_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_rewrite_drain_source',
+		q[
+CREATE TABLE rewrite_rows (id int PRIMARY KEY, amount text NOT NULL);
+INSERT INTO rewrite_rows VALUES (1, '10'), (2, '20');
+CHECKPOINT;
+]);
+
+	my $rewrite_writer =
+	  $node->background_psql('dbbranch_rewrite_drain_source', on_error_stop => 1);
+	$rewrite_writer->query_safe(
+		q[
+BEGIN;
+ALTER TABLE rewrite_rows ALTER COLUMN amount TYPE integer USING amount::integer;
+INSERT INTO rewrite_rows VALUES (3, 30);
+]);
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_rewrite_drain_target FROM DATABASE dbbranch_rewrite_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source relation rewrite');
+	like($stderr, qr/source database "dbbranch_rewrite_drain_source" has active write transactions/,
+		'active source relation rewrite holds db branch writer gate');
+
+	$rewrite_writer->query_safe(q[COMMIT;]);
+	$rewrite_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_rewrite_drain_target FROM DATABASE dbbranch_rewrite_drain_source]);
+	my $rewrite_amount_type = $node->safe_psql(
+		'dbbranch_rewrite_drain_target',
+		q[SELECT pg_typeof(amount)::text FROM rewrite_rows LIMIT 1;]);
+	is($rewrite_amount_type, 'integer',
+		'branch sees rewritten relation column type after source rewrite drains');
+	my $rewrite_rows = $node->safe_psql(
+		'dbbranch_rewrite_drain_target',
+		q[SELECT string_agg(id || ':' || amount::text, ',' ORDER BY id) FROM rewrite_rows;]);
+	is($rewrite_rows, '1:10,2:20,3:30',
+		'branch reads rows after source relation rewrite drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rewrite_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rewrite_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_index_drain_source;]);
 	$node->safe_psql(
 		'dbbranch_index_drain_source',
