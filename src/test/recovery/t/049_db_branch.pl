@@ -6885,6 +6885,39 @@ is($drop_matview_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_matview_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_matview_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_view_source;');
+$node->safe_psql(
+	'dbbranch_drop_view_source',
+	q[
+CREATE TABLE drop_view_rows (id int PRIMARY KEY, name text NOT NULL);
+INSERT INTO drop_view_rows VALUES (1, 'before-drop');
+CREATE VIEW drop_view_v AS SELECT * FROM drop_view_rows;
+CHECKPOINT;
+DROP VIEW drop_view_v;
+INSERT INTO drop_view_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_view_target FROM DATABASE dbbranch_drop_view_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped views');
+
+my $drop_view_rows = $node->safe_psql(
+	'dbbranch_drop_view_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_view_rows;]);
+is($drop_view_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after view drop');
+my $drop_view_missing = $node->safe_psql(
+	'dbbranch_drop_view_target',
+	q[SELECT to_regclass('public.drop_view_v') IS NULL;]);
+is($drop_view_missing, 't',
+	'branch does not expose dropped view');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_view_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_view_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
