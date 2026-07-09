@@ -5952,6 +5952,62 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_ts_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_ts_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_ts;]);
 
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_set_unlogged_drain_source;]);
+$node->safe_psql(
+	'dbbranch_set_unlogged_drain_source',
+	q[
+CREATE TABLE set_unlogged_rows (id int PRIMARY KEY, note text NOT NULL);
+INSERT INTO set_unlogged_rows VALUES (1, 'logged'), (2, 'before-unlogged');
+CHECKPOINT;
+]);
+
+my $set_unlogged_writer =
+  $node->background_psql('dbbranch_set_unlogged_drain_source', on_error_stop => 1);
+$set_unlogged_writer->query_safe(
+	q[
+BEGIN;
+ALTER TABLE set_unlogged_rows SET UNLOGGED;
+INSERT INTO set_unlogged_rows VALUES (3, 'after-unlogged');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_set_unlogged_drain_target FROM DATABASE dbbranch_set_unlogged_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source set unlogged rewrite');
+like($stderr, qr/source database "dbbranch_set_unlogged_drain_source" has active write transactions/,
+	'active source set unlogged rewrite holds db branch writer gate');
+
+$set_unlogged_writer->query_safe(q[COMMIT;]);
+$set_unlogged_writer->quit;
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_set_unlogged_drain_target FROM DATABASE dbbranch_set_unlogged_drain_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch succeeds after source set unlogged rewrite drains');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'set unlogged branch writes separate metadata file');
+
+my $set_unlogged_persistence = $node->safe_psql(
+	'dbbranch_set_unlogged_drain_target',
+	q[SELECT relpersistence FROM pg_class WHERE relname = 'set_unlogged_rows';]);
+is($set_unlogged_persistence, 'u',
+	'branch sees unlogged persistence after source set unlogged drains');
+my $set_unlogged_rows = $node->safe_psql(
+	'dbbranch_set_unlogged_drain_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM set_unlogged_rows;]);
+is($set_unlogged_rows, '1:logged,2:before-unlogged,3:after-unlogged',
+	'branch reads rows after source set unlogged drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_set_unlogged_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_set_unlogged_drain_source;]);
+
 
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_unlogged_source;');
 $node->safe_psql(
