@@ -7061,6 +7061,47 @@ is($drop_column_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_column_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_column_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_rename_column_source;');
+$node->safe_psql(
+	'dbbranch_rename_column_source',
+	q[
+CREATE TABLE rename_column_rows (
+	id int PRIMARY KEY,
+	old_name text NOT NULL
+);
+INSERT INTO rename_column_rows VALUES (1, 'before-rename');
+CHECKPOINT;
+ALTER TABLE rename_column_rows RENAME COLUMN old_name TO new_name;
+INSERT INTO rename_column_rows VALUES (2, 'after-rename');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_rename_column_target FROM DATABASE dbbranch_rename_column_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports renamed table columns');
+
+my $rename_column_rows = $node->safe_psql(
+	'dbbranch_rename_column_target',
+	q[SELECT string_agg(id || ':' || new_name, ',' ORDER BY id) FROM rename_column_rows;]);
+is($rename_column_rows, '1:before-rename,2:after-rename',
+	'branch reads rows after column rename');
+my $rename_column_names = $node->safe_psql(
+	'dbbranch_rename_column_target',
+	q[
+SELECT sum((column_name = 'old_name')::int) || '|' ||
+       sum((column_name = 'new_name')::int)
+FROM information_schema.columns
+WHERE table_name = 'rename_column_rows'
+  AND column_name IN ('old_name', 'new_name');
+]);
+is($rename_column_names, '0|1',
+	'branch exposes renamed table column only under the new name');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_column_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_column_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
