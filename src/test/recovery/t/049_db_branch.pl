@@ -7152,6 +7152,43 @@ is($alter_stats_lifecycle_target, '7',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_stats_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_stats_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_stats_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_stats_lifecycle_source',
+	q[
+CREATE TABLE drop_stats_lifecycle_rows (
+	id int PRIMARY KEY,
+	grp int NOT NULL,
+	name text NOT NULL
+);
+INSERT INTO drop_stats_lifecycle_rows VALUES (1, 1, 'before-drop-stats'), (2, 0, 'kept');
+CREATE STATISTICS drop_stats_lifecycle_id_grp ON id, grp FROM drop_stats_lifecycle_rows;
+CHECKPOINT;
+DROP STATISTICS drop_stats_lifecycle_id_grp;
+INSERT INTO drop_stats_lifecycle_rows VALUES (3, 1, 'after-drop-stats');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_stats_lifecycle_target FROM DATABASE dbbranch_drop_stats_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped extended statistics');
+
+my $drop_stats_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_stats_lifecycle_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_stats_lifecycle_rows;]);
+is($drop_stats_lifecycle_rows, '1:before-drop-stats,2:kept,3:after-drop-stats',
+	'branch reads rows after extended statistics drop');
+my $drop_stats_lifecycle_missing = $node->safe_psql(
+	'dbbranch_drop_stats_lifecycle_target',
+	q[SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'drop_stats_lifecycle_id_grp';]);
+is($drop_stats_lifecycle_missing, '0',
+	'branch does not expose dropped extended statistics');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_stats_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_stats_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
