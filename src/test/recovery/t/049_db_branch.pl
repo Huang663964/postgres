@@ -7401,6 +7401,57 @@ is($drop_rule_lifecycle_branch_log, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rule_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rule_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_policy_lifecycle_reader;');
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_policy_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_policy_lifecycle_source',
+	q[
+CREATE TABLE policy_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+ALTER TABLE policy_lifecycle_rows ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON policy_lifecycle_rows TO dbbranch_policy_lifecycle_reader;
+INSERT INTO policy_lifecycle_rows VALUES (1, 'before-policy');
+CHECKPOINT;
+CREATE POLICY policy_lifecycle_rows_select
+	ON policy_lifecycle_rows
+	FOR SELECT
+	TO dbbranch_policy_lifecycle_reader
+	USING (id > 1);
+INSERT INTO policy_lifecycle_rows VALUES (2, 'after-policy');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_policy_lifecycle_target FROM DATABASE dbbranch_policy_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports created policies');
+
+my $policy_lifecycle_rows = $node->safe_psql(
+	'dbbranch_policy_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM policy_lifecycle_rows;]);
+is($policy_lifecycle_rows, '1:before-policy,2:after-policy',
+	'branch reads rows after policy creation');
+my $policy_lifecycle_exists = $node->safe_psql(
+	'dbbranch_policy_lifecycle_target',
+	q[SELECT count(*) FROM pg_policy WHERE polname = 'policy_lifecycle_rows_select';]);
+is($policy_lifecycle_exists, '1', 'branch exposes created policy');
+my $policy_lifecycle_filtered = $node->safe_psql(
+	'dbbranch_policy_lifecycle_target',
+	q[
+SET ROLE dbbranch_policy_lifecycle_reader;
+SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM policy_lifecycle_rows;
+RESET ROLE;
+]);
+is($policy_lifecycle_filtered, '2:after-policy',
+	'created policy filters branch reads for non-owner role');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_policy_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_policy_lifecycle_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_policy_lifecycle_reader;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
