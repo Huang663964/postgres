@@ -6785,6 +6785,39 @@ is($drop_rel_base_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_base_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_base_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_index_source;');
+$node->safe_psql(
+	'dbbranch_drop_index_source',
+	q[
+CREATE TABLE drop_index_rows (id int PRIMARY KEY, name text NOT NULL);
+CREATE INDEX drop_index_rows_name_idx ON drop_index_rows (name);
+INSERT INTO drop_index_rows VALUES (1, 'before-drop'), (2, 'kept');
+CHECKPOINT;
+DROP INDEX drop_index_rows_name_idx;
+INSERT INTO drop_index_rows VALUES (3, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_index_target FROM DATABASE dbbranch_drop_index_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped secondary indexes');
+
+my $drop_index_rows = $node->safe_psql(
+	'dbbranch_drop_index_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_index_rows;]);
+is($drop_index_rows, '1:before-drop,2:kept,3:after-drop',
+	'branch reads rows after secondary index drop');
+my $drop_index_missing = $node->safe_psql(
+	'dbbranch_drop_index_target',
+	q[SELECT to_regclass('public.drop_index_rows_name_idx') IS NULL;]);
+is($drop_index_missing, 't',
+	'branch does not expose dropped secondary index');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
