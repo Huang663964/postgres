@@ -7239,6 +7239,58 @@ is($trigger_lifecycle_branch_note, 'triggered',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_trigger_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_trigger_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_trigger_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_trigger_lifecycle_source',
+	q[
+CREATE TABLE drop_trigger_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text
+);
+CREATE FUNCTION drop_trigger_lifecycle_touch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	NEW.note := coalesce(NEW.note, 'triggered');
+	RETURN NEW;
+END
+$$;
+CREATE TRIGGER drop_trigger_lifecycle_rows_bi
+	BEFORE INSERT ON drop_trigger_lifecycle_rows
+	FOR EACH ROW EXECUTE FUNCTION drop_trigger_lifecycle_touch();
+INSERT INTO drop_trigger_lifecycle_rows(id) VALUES (1);
+CHECKPOINT;
+DROP TRIGGER drop_trigger_lifecycle_rows_bi ON drop_trigger_lifecycle_rows;
+INSERT INTO drop_trigger_lifecycle_rows(id) VALUES (2);
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_trigger_lifecycle_target FROM DATABASE dbbranch_drop_trigger_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped triggers');
+
+my $drop_trigger_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_trigger_lifecycle_target',
+	q[SELECT string_agg(id || ':' || coalesce(note, 'not-triggered'), ',' ORDER BY id) FROM drop_trigger_lifecycle_rows;]);
+is($drop_trigger_lifecycle_rows, '1:triggered,2:not-triggered',
+	'branch reads rows after trigger drop');
+my $drop_trigger_lifecycle_missing = $node->safe_psql(
+	'dbbranch_drop_trigger_lifecycle_target',
+	q[SELECT count(*) FROM pg_trigger WHERE tgname = 'drop_trigger_lifecycle_rows_bi';]);
+is($drop_trigger_lifecycle_missing, '0',
+	'branch does not expose dropped trigger');
+$node->safe_psql(
+	'dbbranch_drop_trigger_lifecycle_target',
+	q[INSERT INTO drop_trigger_lifecycle_rows(id) VALUES (3);]);
+my $drop_trigger_lifecycle_branch_note = $node->safe_psql(
+	'dbbranch_drop_trigger_lifecycle_target',
+	q[SELECT coalesce(note, 'not-triggered') FROM drop_trigger_lifecycle_rows WHERE id = 3;]);
+is($drop_trigger_lifecycle_branch_note, 'not-triggered',
+	'dropped trigger does not fire on branch');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_trigger_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_trigger_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
