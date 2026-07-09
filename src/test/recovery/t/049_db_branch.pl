@@ -6576,6 +6576,44 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_multi_rel_ts_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_multi_rel_ts_a;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_multi_rel_ts_b;]);
 
+my $drop_rel_ts_dir = $node->basedir . '/dbbranch_drop_rel_ts';
+mkdir($drop_rel_ts_dir) or die "could not create $drop_rel_ts_dir: $!";
+$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_drop_rel_ts LOCATION '$drop_rel_ts_dir';");
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_rel_ts_source;');
+$node->safe_psql(
+	'dbbranch_drop_rel_ts_source',
+	q[
+CREATE TABLE drop_rel_keep_rows (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE drop_rel_gone_rows (id int PRIMARY KEY, name text NOT NULL) TABLESPACE dbbranch_drop_rel_ts;
+INSERT INTO drop_rel_keep_rows VALUES (1, 'before-drop');
+INSERT INTO drop_rel_gone_rows VALUES (1, 'drop-me');
+CHECKPOINT;
+DROP TABLE drop_rel_gone_rows;
+INSERT INTO drop_rel_keep_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_rel_ts_target FROM DATABASE dbbranch_drop_rel_ts_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped relation tablespace relations');
+
+my $drop_rel_keep_rows = $node->safe_psql(
+	'dbbranch_drop_rel_ts_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_rel_keep_rows;]);
+is($drop_rel_keep_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after relation tablespace drop');
+my $drop_rel_missing = $node->safe_psql(
+	'dbbranch_drop_rel_ts_target',
+	q[SELECT to_regclass('public.drop_rel_gone_rows') IS NULL;]);
+is($drop_rel_missing, 't',
+	'branch does not expose dropped relation tablespace relation');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_ts_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_ts_source;]);
+$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_drop_rel_ts;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
