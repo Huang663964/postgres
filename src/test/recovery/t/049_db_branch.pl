@@ -7020,6 +7020,47 @@ is($drop_view_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_view_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_view_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_column_source;');
+$node->safe_psql(
+	'dbbranch_drop_column_source',
+	q[
+CREATE TABLE drop_column_rows (
+	id int PRIMARY KEY,
+	name text NOT NULL,
+	obsolete text NOT NULL
+);
+INSERT INTO drop_column_rows VALUES (1, 'before-drop', 'old');
+CHECKPOINT;
+ALTER TABLE drop_column_rows DROP COLUMN obsolete;
+INSERT INTO drop_column_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_column_target FROM DATABASE dbbranch_drop_column_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped table columns');
+
+my $drop_column_rows = $node->safe_psql(
+	'dbbranch_drop_column_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_column_rows;]);
+is($drop_column_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after column drop');
+my $drop_column_missing = $node->safe_psql(
+	'dbbranch_drop_column_target',
+	q[
+SELECT count(*) = 0
+FROM information_schema.columns
+WHERE table_name = 'drop_column_rows'
+  AND column_name = 'obsolete';
+]);
+is($drop_column_missing, 't',
+	'branch does not expose dropped table column');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_column_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_column_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
