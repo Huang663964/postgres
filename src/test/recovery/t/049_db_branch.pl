@@ -7189,6 +7189,56 @@ is($drop_stats_lifecycle_missing, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_stats_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_stats_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_trigger_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_trigger_lifecycle_source',
+	q[
+CREATE TABLE trigger_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text
+);
+CREATE FUNCTION trigger_lifecycle_touch() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	NEW.note := coalesce(NEW.note, 'triggered');
+	RETURN NEW;
+END
+$$;
+INSERT INTO trigger_lifecycle_rows VALUES (1, 'before-trigger');
+CHECKPOINT;
+CREATE TRIGGER trigger_lifecycle_rows_bi
+	BEFORE INSERT ON trigger_lifecycle_rows
+	FOR EACH ROW EXECUTE FUNCTION trigger_lifecycle_touch();
+INSERT INTO trigger_lifecycle_rows(id) VALUES (2);
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_trigger_lifecycle_target FROM DATABASE dbbranch_trigger_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports created triggers');
+
+my $trigger_lifecycle_rows = $node->safe_psql(
+	'dbbranch_trigger_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM trigger_lifecycle_rows;]);
+is($trigger_lifecycle_rows, '1:before-trigger,2:triggered',
+	'branch reads rows after trigger creation');
+my $trigger_lifecycle_exists = $node->safe_psql(
+	'dbbranch_trigger_lifecycle_target',
+	q[SELECT count(*) FROM pg_trigger WHERE tgname = 'trigger_lifecycle_rows_bi';]);
+is($trigger_lifecycle_exists, '1', 'branch exposes created trigger');
+$node->safe_psql(
+	'dbbranch_trigger_lifecycle_target',
+	q[INSERT INTO trigger_lifecycle_rows(id) VALUES (3);]);
+my $trigger_lifecycle_branch_note = $node->safe_psql(
+	'dbbranch_trigger_lifecycle_target',
+	q[SELECT note FROM trigger_lifecycle_rows WHERE id = 3;]);
+is($trigger_lifecycle_branch_note, 'triggered',
+	'created trigger fires on branch');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_trigger_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_trigger_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
