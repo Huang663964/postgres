@@ -6785,6 +6785,64 @@ is($drop_rel_base_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_base_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_base_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_toast_source;');
+$node->safe_psql(
+	'dbbranch_drop_toast_source',
+	q[
+CREATE TABLE drop_toast_keep_rows (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE drop_toast_gone_rows (id int PRIMARY KEY, payload text NOT NULL);
+ALTER TABLE drop_toast_gone_rows ALTER COLUMN payload SET STORAGE EXTERNAL;
+INSERT INTO drop_toast_keep_rows VALUES (1, 'before-drop');
+INSERT INTO drop_toast_gone_rows
+SELECT 1, string_agg(md5(g::text), '' ORDER BY g)
+FROM generate_series(1, 2000) g;
+]);
+
+my $drop_toast_rel = $node->safe_psql(
+	'dbbranch_drop_toast_source',
+	q[SELECT reltoastrelid::regclass::text FROM pg_class WHERE relname = 'drop_toast_gone_rows';]);
+like($drop_toast_rel, qr/^pg_toast\.pg_toast_[0-9]+$/,
+	'source dropped table has toast relation before drop');
+my $drop_toast_chunks = $node->safe_psql(
+	'dbbranch_drop_toast_source',
+	q[SELECT count(*) > 0 FROM ] . $drop_toast_rel . q[;]);
+is($drop_toast_chunks, 't',
+	'source dropped table has toast chunks before drop');
+
+$node->safe_psql(
+	'dbbranch_drop_toast_source',
+	q[
+CHECKPOINT;
+DROP TABLE drop_toast_gone_rows;
+INSERT INTO drop_toast_keep_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_toast_target FROM DATABASE dbbranch_drop_toast_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped toasted tables');
+
+my $drop_toast_keep_rows = $node->safe_psql(
+	'dbbranch_drop_toast_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_toast_keep_rows;]);
+is($drop_toast_keep_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after toasted table drop');
+my $drop_toast_heap_missing = $node->safe_psql(
+	'dbbranch_drop_toast_target',
+	q[SELECT to_regclass('public.drop_toast_gone_rows') IS NULL;]);
+is($drop_toast_heap_missing, 't',
+	'branch does not expose dropped toasted table');
+my $drop_toast_rel_missing = $node->safe_psql(
+	'dbbranch_drop_toast_target',
+	q[SELECT to_regclass('] . $drop_toast_rel . q[') IS NULL;]);
+is($drop_toast_rel_missing, 't',
+	'branch does not expose dropped table toast relation');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_toast_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_toast_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_index_source;');
 $node->safe_psql(
 	'dbbranch_drop_index_source',
