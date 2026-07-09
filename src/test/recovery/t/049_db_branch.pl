@@ -5778,6 +5778,67 @@ $node->safe_psql('postgres', q[ALTER TABLESPACE dbbranch_options_ts RESET (rando
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_tablespace_options_drain_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_options_ts;]);
 
+my $rel_move_tablespace_dir = $node->basedir . '/dbbranch_rel_move_ts';
+mkdir($rel_move_tablespace_dir) or die "could not create $rel_move_tablespace_dir: $!";
+$node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_rel_move_ts LOCATION '$rel_move_tablespace_dir';");
+$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_rel_move_drain_source;]);
+$node->safe_psql(
+	'dbbranch_rel_move_drain_source',
+	q[
+CREATE TABLE rel_move_rows (id int PRIMARY KEY, name text NOT NULL);
+INSERT INTO rel_move_rows VALUES (1, 'base'), (2, 'before-move');
+CHECKPOINT;
+]);
+
+my $rel_move_writer =
+  $node->background_psql('dbbranch_rel_move_drain_source', on_error_stop => 1);
+$rel_move_writer->query_safe(
+	q[
+BEGIN;
+ALTER TABLE rel_move_rows SET TABLESPACE dbbranch_rel_move_ts;
+INSERT INTO rel_move_rows VALUES (3, 'after-move');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_rel_move_drain_target FROM DATABASE dbbranch_rel_move_drain_source],
+	stderr => \$stderr);
+is($result, 3, 'db branch reports active source relation tablespace move');
+like($stderr, qr/source database "dbbranch_rel_move_drain_source" has active write transactions/,
+	'active source relation tablespace move holds db branch writer gate');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+$metadata_file_count++;
+is(scalar @metadata_files, $metadata_file_count,
+	'active source relation tablespace move writes separate metadata file');
+
+$rel_move_writer->query_safe(q[COMMIT;]);
+$rel_move_writer->quit;
+
+my $rel_move_source_path = $node->safe_psql(
+	'dbbranch_rel_move_drain_source',
+	q[SELECT pg_relation_filepath('rel_move_rows');]);
+like($rel_move_source_path, qr/^pg_tblspc\/[0-9]+\/[^\/]+\/[0-9]+\/[0-9]+$/,
+	'source relation tablespace move finishes after db branch rejects');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_rel_move_drain_target FROM DATABASE dbbranch_rel_move_drain_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch succeeds after source relation tablespace move drains');
+
+my $rel_move_branch_rows = $node->safe_psql(
+	'dbbranch_rel_move_drain_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM rel_move_rows;]);
+is($rel_move_branch_rows, '1:base,2:before-move,3:after-move',
+	'branch reads rows after source relation tablespace move drains');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_move_drain_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rel_move_drain_source;]);
+$node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_rel_move_ts;]);
+
 my $tablespace_dir = $node->basedir . '/dbbranch_ts';
 mkdir($tablespace_dir) or die "could not create $tablespace_dir: $!";
 $node->safe_psql('postgres', "CREATE TABLESPACE dbbranch_ts LOCATION '$tablespace_dir';");
