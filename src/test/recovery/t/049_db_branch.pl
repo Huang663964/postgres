@@ -6818,6 +6818,40 @@ is($drop_index_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
+$node->safe_psql(
+	'dbbranch_drop_sequence_source',
+	q[
+CREATE TABLE drop_sequence_rows (id int PRIMARY KEY, name text NOT NULL);
+CREATE SEQUENCE drop_sequence_seq CACHE 1;
+INSERT INTO drop_sequence_rows VALUES (1, 'before-drop');
+SELECT nextval('drop_sequence_seq');
+CHECKPOINT;
+DROP SEQUENCE drop_sequence_seq;
+INSERT INTO drop_sequence_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_sequence_target FROM DATABASE dbbranch_drop_sequence_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped sequences');
+
+my $drop_sequence_rows = $node->safe_psql(
+	'dbbranch_drop_sequence_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_sequence_rows;]);
+is($drop_sequence_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after sequence drop');
+my $drop_sequence_missing = $node->safe_psql(
+	'dbbranch_drop_sequence_target',
+	q[SELECT to_regclass('public.drop_sequence_seq') IS NULL;]);
+is($drop_sequence_missing, 't',
+	'branch does not expose dropped sequence');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_sequence_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_sequence_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
