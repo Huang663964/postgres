@@ -6751,6 +6751,40 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_ts_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_ts_source;]);
 $node->safe_psql('postgres', q[DROP TABLESPACE dbbranch_drop_rel_ts;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_rel_base_source;');
+$node->safe_psql(
+	'dbbranch_drop_rel_base_source',
+	q[
+CREATE TABLE drop_rel_base_keep_rows (id int PRIMARY KEY, name text NOT NULL);
+CREATE TABLE drop_rel_base_gone_rows (id int PRIMARY KEY, name text NOT NULL);
+INSERT INTO drop_rel_base_keep_rows VALUES (1, 'before-drop');
+INSERT INTO drop_rel_base_gone_rows VALUES (1, 'drop-me');
+CHECKPOINT;
+DROP TABLE drop_rel_base_gone_rows;
+INSERT INTO drop_rel_base_keep_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_rel_base_target FROM DATABASE dbbranch_drop_rel_base_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped default tablespace relations');
+
+my $drop_rel_base_keep_rows = $node->safe_psql(
+	'dbbranch_drop_rel_base_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_rel_base_keep_rows;]);
+is($drop_rel_base_keep_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after default tablespace relation drop');
+my $drop_rel_base_missing = $node->safe_psql(
+	'dbbranch_drop_rel_base_target',
+	q[SELECT to_regclass('public.drop_rel_base_gone_rows') IS NULL;]);
+is($drop_rel_base_missing, 't',
+	'branch does not expose dropped default tablespace relation');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_base_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rel_base_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
