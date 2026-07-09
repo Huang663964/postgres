@@ -7611,6 +7611,59 @@ is($function_lifecycle_call,
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_alter_function_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_alter_function_lifecycle_source',
+	q[
+CREATE TABLE alter_function_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE FUNCTION alter_function_lifecycle_note(prefix text) RETURNS text
+	LANGUAGE SQL VOLATILE COST 100
+	RETURN prefix || ':' ||
+		(SELECT string_agg(id || ':' || note, ',' ORDER BY id)
+		 FROM alter_function_lifecycle_rows);
+INSERT INTO alter_function_lifecycle_rows VALUES (1, 'before-alter-function');
+CHECKPOINT;
+ALTER FUNCTION alter_function_lifecycle_note(text) STABLE COST 7;
+INSERT INTO alter_function_lifecycle_rows VALUES (2, 'after-alter-function');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_function_lifecycle_target FROM DATABASE dbbranch_alter_function_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports altered functions');
+
+my $alter_function_lifecycle_rows = $node->safe_psql(
+	'dbbranch_alter_function_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM alter_function_lifecycle_rows;]);
+is($alter_function_lifecycle_rows,
+	'1:before-alter-function,2:after-alter-function',
+	'branch reads rows after function alteration');
+my $alter_function_lifecycle_catalog = $node->safe_psql(
+	'dbbranch_alter_function_lifecycle_target',
+	q[
+SELECT provolatile::text || ':' || procost::int
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'alter_function_lifecycle_note';
+]);
+is($alter_function_lifecycle_catalog, 's:7',
+	'branch exposes altered function attributes');
+my $alter_function_lifecycle_call = $node->safe_psql(
+	'dbbranch_alter_function_lifecycle_target',
+	q[SELECT alter_function_lifecycle_note('branch');]);
+is($alter_function_lifecycle_call,
+	'branch:1:before-alter-function,2:after-alter-function',
+	'branch can call altered function');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_function_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
