@@ -6962,6 +6962,47 @@ is($create_index_concurrently_lookup, '3',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_index_concurrently_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_index_concurrently_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_index_concurrently_source;');
+$node->safe_psql(
+	'dbbranch_drop_index_concurrently_source',
+	q[
+CREATE TABLE drop_index_concurrently_rows (
+	id int PRIMARY KEY,
+	name text NOT NULL
+);
+CREATE INDEX drop_index_concurrently_rows_name_idx ON drop_index_concurrently_rows (name);
+INSERT INTO drop_index_concurrently_rows VALUES (1, 'before-concurrent-drop'), (2, 'kept');
+CHECKPOINT;
+]);
+$node->safe_psql(
+	'dbbranch_drop_index_concurrently_source',
+	q[DROP INDEX CONCURRENTLY drop_index_concurrently_rows_name_idx;]);
+$node->safe_psql(
+	'dbbranch_drop_index_concurrently_source',
+	q[INSERT INTO drop_index_concurrently_rows VALUES (3, 'after-concurrent-drop');]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_index_concurrently_target FROM DATABASE dbbranch_drop_index_concurrently_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports concurrently-dropped indexes');
+
+my $drop_index_concurrently_rows = $node->safe_psql(
+	'dbbranch_drop_index_concurrently_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_index_concurrently_rows;]);
+is($drop_index_concurrently_rows,
+	'1:before-concurrent-drop,2:kept,3:after-concurrent-drop',
+	'branch reads rows after concurrent index drop');
+my $drop_index_concurrently_missing = $node->safe_psql(
+	'dbbranch_drop_index_concurrently_target',
+	q[SELECT to_regclass('public.drop_index_concurrently_rows_name_idx') IS NULL;]);
+is($drop_index_concurrently_missing, 't',
+	'branch does not expose concurrently-dropped index');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_concurrently_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_concurrently_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
