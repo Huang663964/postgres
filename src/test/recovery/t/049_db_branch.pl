@@ -7102,6 +7102,47 @@ is($rename_column_names, '0|1',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_column_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rename_column_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_add_column_source;');
+$node->safe_psql(
+	'dbbranch_add_column_source',
+	q[
+CREATE TABLE add_column_rows (
+	id int PRIMARY KEY,
+	name text NOT NULL
+);
+INSERT INTO add_column_rows VALUES (1, 'before-add');
+CHECKPOINT;
+ALTER TABLE add_column_rows ADD COLUMN added text DEFAULT 'default-added' NOT NULL;
+INSERT INTO add_column_rows (id, name, added) VALUES (2, 'after-add', 'explicit-added');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_add_column_target FROM DATABASE dbbranch_add_column_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports added table columns');
+
+my $add_column_rows = $node->safe_psql(
+	'dbbranch_add_column_target',
+	q[SELECT string_agg(id || ':' || name || ':' || added, ',' ORDER BY id) FROM add_column_rows;]);
+is($add_column_rows, '1:before-add:default-added,2:after-add:explicit-added',
+	'branch reads rows after column add');
+my $add_column_exists = $node->safe_psql(
+	'dbbranch_add_column_target',
+	q[
+SELECT count(*) = 1
+FROM information_schema.columns
+WHERE table_name = 'add_column_rows'
+  AND column_name = 'added'
+  AND is_nullable = 'NO';
+]);
+is($add_column_exists, 't',
+	'branch exposes added table column');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_add_column_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_add_column_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
