@@ -7291,6 +7291,60 @@ is($drop_trigger_lifecycle_branch_note, 'not-triggered',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_trigger_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_trigger_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_rule_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_rule_lifecycle_source',
+	q[
+CREATE TABLE rule_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE TABLE rule_lifecycle_log (
+	row_id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO rule_lifecycle_rows VALUES (1, 'before-rule');
+CHECKPOINT;
+CREATE RULE rule_lifecycle_rows_ai AS
+	ON INSERT TO rule_lifecycle_rows DO ALSO
+	INSERT INTO rule_lifecycle_log(row_id, note)
+	VALUES (NEW.id, NEW.note);
+INSERT INTO rule_lifecycle_rows VALUES (2, 'after-rule');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_rule_lifecycle_target FROM DATABASE dbbranch_rule_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports created rules');
+
+my $rule_lifecycle_rows = $node->safe_psql(
+	'dbbranch_rule_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM rule_lifecycle_rows;]);
+is($rule_lifecycle_rows, '1:before-rule,2:after-rule',
+	'branch reads rows after rule creation');
+my $rule_lifecycle_log = $node->safe_psql(
+	'dbbranch_rule_lifecycle_target',
+	q[SELECT string_agg(row_id || ':' || note, ',' ORDER BY row_id) FROM rule_lifecycle_log;]);
+is($rule_lifecycle_log, '2:after-rule',
+	'branch reads rule side effects from source');
+my $rule_lifecycle_exists = $node->safe_psql(
+	'dbbranch_rule_lifecycle_target',
+	q[SELECT count(*) FROM pg_rewrite WHERE rulename = 'rule_lifecycle_rows_ai';]);
+is($rule_lifecycle_exists, '1', 'branch exposes created rule');
+$node->safe_psql(
+	'dbbranch_rule_lifecycle_target',
+	q[INSERT INTO rule_lifecycle_rows VALUES (3, 'branch-rule');]);
+my $rule_lifecycle_branch_log = $node->safe_psql(
+	'dbbranch_rule_lifecycle_target',
+	q[SELECT note FROM rule_lifecycle_log WHERE row_id = 3;]);
+is($rule_lifecycle_branch_log, 'branch-rule',
+	'created rule fires on branch');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rule_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_rule_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
