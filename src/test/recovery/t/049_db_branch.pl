@@ -3676,6 +3676,60 @@ WHERE datname = 'dbbranch_vacuum_drain_source'
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_drain_target;]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_drain_source;]);
 
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_vacuum_full_drain_source;]);
+	$node->safe_psql(
+		'dbbranch_vacuum_full_drain_source',
+		q[
+CREATE TABLE vacuum_full_rows (id int PRIMARY KEY, note text) WITH (autovacuum_enabled = false);
+INSERT INTO vacuum_full_rows SELECT g, repeat('x', 100) FROM generate_series(1, 50) g;
+DELETE FROM vacuum_full_rows WHERE id <= 25;
+CHECKPOINT;
+]);
+
+	my $vacuum_full_locker =
+	  $node->background_psql('dbbranch_vacuum_full_drain_source', on_error_stop => 1);
+	$vacuum_full_locker->query_safe(q[BEGIN; LOCK TABLE vacuum_full_rows IN ACCESS SHARE MODE;]);
+	my $vacuum_full_writer =
+	  $node->background_psql('dbbranch_vacuum_full_drain_source', on_error_stop => 1);
+	$vacuum_full_writer->query_until(
+		qr/start_vacuum_full_drain_vacuum/,
+		q(\echo start_vacuum_full_drain_vacuum
+VACUUM (FULL) vacuum_full_rows;
+\echo finish_vacuum_full_drain_vacuum
+));
+	ok($node->poll_query_until('postgres', q[
+SELECT count(*) > 0
+FROM pg_stat_activity
+WHERE datname = 'dbbranch_vacuum_full_drain_source'
+  AND wait_event_type = 'Lock'
+  AND query LIKE 'VACUUM%FULL%';
+]), 'active source vacuum full waits on source table lock');
+
+	$stderr = '';
+	$result = $node->psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_vacuum_full_drain_target FROM DATABASE dbbranch_vacuum_full_drain_source],
+		stderr => \$stderr);
+	is($result, 3, 'db branch reports active source vacuum full');
+	like($stderr, qr/source database "dbbranch_vacuum_full_drain_source" has active write transactions/,
+		'active source vacuum full holds db branch writer gate');
+
+	$vacuum_full_locker->query_safe(q[COMMIT;]);
+	$vacuum_full_locker->quit;
+	$vacuum_full_writer->query_until(qr/finish_vacuum_full_drain_vacuum/, '');
+	$vacuum_full_writer->quit;
+
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_vacuum_full_drain_target FROM DATABASE dbbranch_vacuum_full_drain_source]);
+	my $vacuum_full_rows = $node->safe_psql(
+		'dbbranch_vacuum_full_drain_target',
+		q[SELECT count(*) FROM vacuum_full_rows;]);
+	is($vacuum_full_rows, '25', 'branch succeeds after source vacuum full drains');
+
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_full_drain_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_vacuum_full_drain_source;]);
+
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_cluster_drain_source;]);
 	$node->safe_psql(
 		'dbbranch_cluster_drain_source',
