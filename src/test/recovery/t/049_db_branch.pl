@@ -7821,6 +7821,54 @@ is($alter_procedure_lifecycle_call_rows,
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_procedure_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_procedure_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_procedure_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_procedure_lifecycle_source',
+	q[
+CREATE TABLE drop_procedure_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE PROCEDURE drop_procedure_lifecycle_add(id_arg int, note_arg text)
+	LANGUAGE SQL
+	AS $$
+		INSERT INTO drop_procedure_lifecycle_rows VALUES (id_arg, note_arg)
+	$$;
+INSERT INTO drop_procedure_lifecycle_rows VALUES (1, 'before-drop-procedure');
+CHECKPOINT;
+DROP PROCEDURE drop_procedure_lifecycle_add(int, text);
+INSERT INTO drop_procedure_lifecycle_rows VALUES (2, 'after-drop-procedure');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_procedure_lifecycle_target FROM DATABASE dbbranch_drop_procedure_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped procedures');
+
+my $drop_procedure_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_procedure_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_procedure_lifecycle_rows;]);
+is($drop_procedure_lifecycle_rows,
+	'1:before-drop-procedure,2:after-drop-procedure',
+	'branch reads rows after procedure drop');
+my $drop_procedure_lifecycle_missing = $node->safe_psql(
+	'dbbranch_drop_procedure_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'drop_procedure_lifecycle_add'
+  AND p.prokind = 'p';
+]);
+is($drop_procedure_lifecycle_missing, '0',
+	'branch does not expose dropped procedure');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_procedure_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_procedure_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
