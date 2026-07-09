@@ -7041,6 +7041,44 @@ is($reindex_lifecycle_lookup, '3',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_reindex_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_cluster_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_cluster_lifecycle_source',
+	q[
+CREATE TABLE cluster_lifecycle_rows (
+	id int PRIMARY KEY,
+	name text NOT NULL
+);
+CREATE INDEX cluster_lifecycle_rows_name_idx ON cluster_lifecycle_rows (name);
+INSERT INTO cluster_lifecycle_rows VALUES (2, 'kept'), (1, 'before-cluster');
+CHECKPOINT;
+CLUSTER cluster_lifecycle_rows USING cluster_lifecycle_rows_name_idx;
+INSERT INTO cluster_lifecycle_rows VALUES (3, 'after-cluster');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_cluster_lifecycle_target FROM DATABASE dbbranch_cluster_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports clustered tables');
+
+my $cluster_lifecycle_exists = $node->safe_psql(
+	'dbbranch_cluster_lifecycle_target',
+	q[SELECT to_regclass('public.cluster_lifecycle_rows_name_idx') IS NOT NULL;]);
+is($cluster_lifecycle_exists, 't', 'branch exposes clustered index');
+my $cluster_lifecycle_lookup = $node->safe_psql(
+	'dbbranch_cluster_lifecycle_target',
+	q[
+SET enable_seqscan = off;
+SELECT id FROM cluster_lifecycle_rows WHERE name = 'after-cluster';
+]);
+is($cluster_lifecycle_lookup, '3',
+	'branch reads rows through clustered index predicate');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
