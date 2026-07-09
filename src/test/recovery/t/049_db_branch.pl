@@ -6852,6 +6852,39 @@ is($drop_sequence_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_sequence_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_sequence_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_matview_source;');
+$node->safe_psql(
+	'dbbranch_drop_matview_source',
+	q[
+CREATE TABLE drop_matview_rows (id int PRIMARY KEY, name text NOT NULL);
+INSERT INTO drop_matview_rows VALUES (1, 'before-drop');
+CREATE MATERIALIZED VIEW drop_matview_mv AS SELECT * FROM drop_matview_rows;
+CHECKPOINT;
+DROP MATERIALIZED VIEW drop_matview_mv;
+INSERT INTO drop_matview_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_matview_target FROM DATABASE dbbranch_drop_matview_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped materialized views');
+
+my $drop_matview_rows = $node->safe_psql(
+	'dbbranch_drop_matview_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM drop_matview_rows;]);
+is($drop_matview_rows, '1:before-drop,2:after-drop',
+	'branch reads rows after materialized view drop');
+my $drop_matview_missing = $node->safe_psql(
+	'dbbranch_drop_matview_target',
+	q[SELECT to_regclass('public.drop_matview_mv') IS NULL;]);
+is($drop_matview_missing, 't',
+	'branch does not expose dropped materialized view');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_matview_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_matview_source;]);
+
 note('DB Branch section: WAL replay matrix and data correctness');
 
 $node->safe_psql('postgres', 'CREATE ROLE dbbranch_wal_owner;');
