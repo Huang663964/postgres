@@ -7508,6 +7508,59 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_policy_lifecycle_tar
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_policy_lifecycle_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_alter_policy_lifecycle_reader;]);
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_drop_policy_lifecycle_reader;');
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_policy_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_policy_lifecycle_source',
+	q[
+CREATE TABLE drop_policy_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+ALTER TABLE drop_policy_lifecycle_rows ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON drop_policy_lifecycle_rows TO dbbranch_drop_policy_lifecycle_reader;
+CREATE POLICY drop_policy_lifecycle_rows_select
+	ON drop_policy_lifecycle_rows
+	FOR SELECT
+	TO dbbranch_drop_policy_lifecycle_reader
+	USING (id > 0);
+INSERT INTO drop_policy_lifecycle_rows VALUES (1, 'before-drop-policy');
+CHECKPOINT;
+DROP POLICY drop_policy_lifecycle_rows_select ON drop_policy_lifecycle_rows;
+INSERT INTO drop_policy_lifecycle_rows VALUES (2, 'after-drop-policy');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_policy_lifecycle_target FROM DATABASE dbbranch_drop_policy_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped policies');
+
+my $drop_policy_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_policy_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_policy_lifecycle_rows;]);
+is($drop_policy_lifecycle_rows,
+	'1:before-drop-policy,2:after-drop-policy',
+	'branch reads rows after policy drop');
+my $drop_policy_lifecycle_missing = $node->safe_psql(
+	'dbbranch_drop_policy_lifecycle_target',
+	q[SELECT count(*) FROM pg_policy WHERE polname = 'drop_policy_lifecycle_rows_select';]);
+is($drop_policy_lifecycle_missing, '0', 'branch does not expose dropped policy');
+my $drop_policy_lifecycle_filtered = $node->safe_psql(
+	'dbbranch_drop_policy_lifecycle_target',
+	q[
+SET ROLE dbbranch_drop_policy_lifecycle_reader;
+SELECT count(*) FROM drop_policy_lifecycle_rows;
+RESET ROLE;
+]);
+is($drop_policy_lifecycle_filtered, '0',
+	'dropped policy leaves branch non-owner reads denied by default RLS');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_policy_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_policy_lifecycle_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_drop_policy_lifecycle_reader;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
