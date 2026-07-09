@@ -7079,6 +7079,41 @@ is($cluster_lifecycle_lookup, '3',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_cluster_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_stats_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_stats_lifecycle_source',
+	q[
+CREATE TABLE stats_lifecycle_rows (
+	id int PRIMARY KEY,
+	grp int NOT NULL,
+	name text NOT NULL
+);
+INSERT INTO stats_lifecycle_rows VALUES (1, 1, 'before-stats'), (2, 0, 'kept');
+CHECKPOINT;
+CREATE STATISTICS stats_lifecycle_id_grp ON id, grp FROM stats_lifecycle_rows;
+INSERT INTO stats_lifecycle_rows VALUES (3, 1, 'after-stats');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_stats_lifecycle_target FROM DATABASE dbbranch_stats_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports extended statistics');
+
+my $stats_lifecycle_rows = $node->safe_psql(
+	'dbbranch_stats_lifecycle_target',
+	q[SELECT string_agg(id || ':' || name, ',' ORDER BY id) FROM stats_lifecycle_rows;]);
+is($stats_lifecycle_rows, '1:before-stats,2:kept,3:after-stats',
+	'branch reads rows after extended statistics creation');
+my $stats_lifecycle_exists = $node->safe_psql(
+	'dbbranch_stats_lifecycle_target',
+	q[SELECT count(*) FROM pg_statistic_ext WHERE stxname = 'stats_lifecycle_id_grp';]);
+is($stats_lifecycle_exists, '1', 'branch exposes extended statistics');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_stats_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_stats_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
