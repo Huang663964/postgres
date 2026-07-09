@@ -6344,6 +6344,94 @@ is($branch_owner_shdepend_after_drop, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_wal_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_wal_owner;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_oltp_source;');
+$node->safe_psql(
+	'dbbranch_oltp_source',
+	q[
+CREATE TABLE customers (
+	id int PRIMARY KEY,
+	email text UNIQUE NOT NULL,
+	status text NOT NULL
+);
+CREATE TABLE orders (
+	id int PRIMARY KEY,
+	customer_id int NOT NULL REFERENCES customers(id),
+	total int NOT NULL,
+	status text NOT NULL
+);
+CREATE TABLE order_items (
+	order_id int NOT NULL REFERENCES orders(id),
+	sku text NOT NULL,
+	qty int NOT NULL,
+	price int NOT NULL,
+	PRIMARY KEY (order_id, sku)
+);
+CREATE INDEX orders_customer_status_idx ON orders(customer_id, status);
+INSERT INTO customers VALUES
+	(1, 'alice@example.test', 'active'),
+	(2, 'bob@example.test', 'active');
+INSERT INTO orders VALUES
+	(10, 1, 100, 'open'),
+	(11, 2, 75, 'paid');
+INSERT INTO order_items VALUES
+	(10, 'sku-keep', 1, 50),
+	(10, 'sku-old', 1, 50),
+	(11, 'sku-paid', 1, 75);
+CHECKPOINT;
+UPDATE customers SET status = 'vip' WHERE id = 1;
+UPDATE orders SET total = 130 WHERE id = 10;
+UPDATE order_items SET qty = 2 WHERE order_id = 10 AND sku = 'sku-keep';
+DELETE FROM order_items WHERE order_id = 10 AND sku = 'sku-old';
+INSERT INTO orders VALUES (12, 1, 45, 'open');
+INSERT INTO order_items VALUES (12, 'sku-new', 3, 15);
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_oltp_target FROM DATABASE dbbranch_oltp_source],
+	stderr => \$stderr);
+
+is($result, 0, 'db branch supports common OLTP workload replay');
+
+my $oltp_customers = $node->safe_psql(
+	'dbbranch_oltp_target',
+	q[SELECT string_agg(id || ':' || email || ':' || status, ',' ORDER BY id) FROM customers;]);
+is($oltp_customers, '1:alice@example.test:vip,2:bob@example.test:active',
+	'branch sees replayed customer update');
+
+my $oltp_orders = $node->safe_psql(
+	'dbbranch_oltp_target',
+	q[SELECT string_agg(id || ':' || customer_id || ':' || total || ':' || status, ',' ORDER BY id) FROM orders;]);
+is($oltp_orders, '10:1:130:open,11:2:75:paid,12:1:45:open',
+	'branch sees replayed order update and insert');
+
+my $oltp_items = $node->safe_psql(
+	'dbbranch_oltp_target',
+	q[SELECT string_agg(order_id || ':' || sku || ':' || qty || ':' || price, ',' ORDER BY order_id, sku) FROM order_items;]);
+is($oltp_items, '10:sku-keep:2:50,11:sku-paid:1:75,12:sku-new:3:15',
+	'branch sees replayed order item update, delete, and insert');
+
+my $oltp_index_lookup = $node->safe_psql(
+	'dbbranch_oltp_target',
+	q[
+SET enable_seqscan = off;
+SELECT string_agg(id::text, ',' ORDER BY id) FROM orders WHERE customer_id = 1 AND status = 'open';
+]);
+is($oltp_index_lookup, '10,12', 'branch secondary index lookup sees replayed OLTP rows');
+
+$stderr = '';
+$result = $node->psql(
+	'dbbranch_oltp_target',
+	q[INSERT INTO orders VALUES (99, 99, 1, 'bad')],
+	stderr => \$stderr);
+isnt($result, 0, 'branch keeps OLTP foreign key constraints');
+like($stderr, qr/violates foreign key constraint/,
+	'branch reports OLTP foreign key failure');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_oltp_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_oltp_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_partition_source;');
 $node->safe_psql(
 	'dbbranch_partition_source',
