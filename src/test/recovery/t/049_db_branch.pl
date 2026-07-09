@@ -6589,6 +6589,40 @@ $node->append_conf('postgresql.conf', 'full_page_writes = on');
 $node->reload;
 
 $node->safe_psql('postgres', q[
+CREATE ROLE dbbranch_permission_plain LOGIN;
+CREATE ROLE dbbranch_permission_createdb LOGIN CREATEDB;
+CREATE DATABASE dbbranch_permission_source;
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_permission_plain_target FROM DATABASE dbbranch_permission_source],
+	stderr => \$stderr,
+	extra_params => [ '--username' => 'dbbranch_permission_plain' ]);
+isnt($result, 0, 'db branch rejects role without CREATEDB privilege');
+like(
+	$stderr,
+	qr/permission denied to create database/,
+	'db branch reports missing CREATEDB privilege');
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_permission_nonowner_target FROM DATABASE dbbranch_permission_source],
+	stderr => \$stderr,
+	extra_params => [ '--username' => 'dbbranch_permission_createdb' ]);
+isnt($result, 0, 'db branch rejects CREATEDB role that does not own non-template source');
+like(
+	$stderr,
+	qr/permission denied to copy database "dbbranch_permission_source"/,
+	'db branch reports source ownership failure');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_permission_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_permission_createdb;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_permission_plain;]);
+
+$node->safe_psql('postgres', q[
 CREATE ROLE dbbranch_template_createdb LOGIN CREATEDB;
 CREATE DATABASE dbbranch_template_source;
 ALTER DATABASE dbbranch_template_source IS_TEMPLATE true;
