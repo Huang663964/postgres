@@ -7345,6 +7345,62 @@ is($rule_lifecycle_branch_log, 'branch-rule',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rule_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_rule_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_rule_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_rule_lifecycle_source',
+	q[
+CREATE TABLE drop_rule_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE TABLE drop_rule_lifecycle_log (
+	row_id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE RULE drop_rule_lifecycle_rows_ai AS
+	ON INSERT TO drop_rule_lifecycle_rows DO ALSO
+	INSERT INTO drop_rule_lifecycle_log(row_id, note)
+	VALUES (NEW.id, NEW.note);
+INSERT INTO drop_rule_lifecycle_rows VALUES (1, 'before-drop-rule');
+CHECKPOINT;
+DROP RULE drop_rule_lifecycle_rows_ai ON drop_rule_lifecycle_rows;
+INSERT INTO drop_rule_lifecycle_rows VALUES (2, 'after-drop-rule');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_rule_lifecycle_target FROM DATABASE dbbranch_drop_rule_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped rules');
+
+my $drop_rule_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_rule_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_rule_lifecycle_rows;]);
+is($drop_rule_lifecycle_rows, '1:before-drop-rule,2:after-drop-rule',
+	'branch reads rows after rule drop');
+my $drop_rule_lifecycle_log = $node->safe_psql(
+	'dbbranch_drop_rule_lifecycle_target',
+	q[SELECT string_agg(row_id || ':' || note, ',' ORDER BY row_id) FROM drop_rule_lifecycle_log;]);
+is($drop_rule_lifecycle_log, '1:before-drop-rule',
+	'branch reads only pre-drop rule side effects');
+my $drop_rule_lifecycle_missing = $node->safe_psql(
+	'dbbranch_drop_rule_lifecycle_target',
+	q[SELECT count(*) FROM pg_rewrite WHERE rulename = 'drop_rule_lifecycle_rows_ai';]);
+is($drop_rule_lifecycle_missing, '0',
+	'branch does not expose dropped rule');
+$node->safe_psql(
+	'dbbranch_drop_rule_lifecycle_target',
+	q[INSERT INTO drop_rule_lifecycle_rows VALUES (3, 'branch-rule');]);
+my $drop_rule_lifecycle_branch_log = $node->safe_psql(
+	'dbbranch_drop_rule_lifecycle_target',
+	q[SELECT count(*) FROM drop_rule_lifecycle_log WHERE row_id = 3;]);
+is($drop_rule_lifecycle_branch_log, '0',
+	'dropped rule does not fire on branch');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rule_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_rule_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
