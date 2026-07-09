@@ -7452,6 +7452,62 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_policy_lifecycle_target;])
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_policy_lifecycle_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_policy_lifecycle_reader;]);
 
+$node->safe_psql('postgres', 'CREATE ROLE dbbranch_alter_policy_lifecycle_reader;');
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_alter_policy_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_alter_policy_lifecycle_source',
+	q[
+CREATE TABLE alter_policy_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+ALTER TABLE alter_policy_lifecycle_rows ENABLE ROW LEVEL SECURITY;
+GRANT SELECT ON alter_policy_lifecycle_rows TO dbbranch_alter_policy_lifecycle_reader;
+CREATE POLICY alter_policy_lifecycle_rows_select
+	ON alter_policy_lifecycle_rows
+	FOR SELECT
+	TO dbbranch_alter_policy_lifecycle_reader
+	USING (id > 0);
+INSERT INTO alter_policy_lifecycle_rows VALUES (1, 'before-alter-policy');
+CHECKPOINT;
+ALTER POLICY alter_policy_lifecycle_rows_select
+	ON alter_policy_lifecycle_rows
+	USING (id > 1);
+INSERT INTO alter_policy_lifecycle_rows VALUES (2, 'after-alter-policy');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_policy_lifecycle_target FROM DATABASE dbbranch_alter_policy_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports altered policies');
+
+my $alter_policy_lifecycle_rows = $node->safe_psql(
+	'dbbranch_alter_policy_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM alter_policy_lifecycle_rows;]);
+is($alter_policy_lifecycle_rows,
+	'1:before-alter-policy,2:after-alter-policy',
+	'branch reads rows after policy alteration');
+my $alter_policy_lifecycle_expr = $node->safe_psql(
+	'dbbranch_alter_policy_lifecycle_target',
+	q[SELECT pg_get_expr(polqual, polrelid) FROM pg_policy WHERE polname = 'alter_policy_lifecycle_rows_select';]);
+like($alter_policy_lifecycle_expr, qr/id > 1/,
+	'branch exposes altered policy expression');
+my $alter_policy_lifecycle_filtered = $node->safe_psql(
+	'dbbranch_alter_policy_lifecycle_target',
+	q[
+SET ROLE dbbranch_alter_policy_lifecycle_reader;
+SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM alter_policy_lifecycle_rows;
+RESET ROLE;
+]);
+is($alter_policy_lifecycle_filtered, '2:after-alter-policy',
+	'altered policy filters branch reads for non-owner role');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_policy_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_policy_lifecycle_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_alter_policy_lifecycle_reader;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
