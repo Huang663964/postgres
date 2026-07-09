@@ -6920,6 +6920,48 @@ is($drop_index_missing, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_index_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_create_index_concurrently_source;');
+$node->safe_psql(
+	'dbbranch_create_index_concurrently_source',
+	q[
+CREATE TABLE concurrent_index_rows (
+	id int PRIMARY KEY,
+	name text NOT NULL
+);
+INSERT INTO concurrent_index_rows VALUES (1, 'before-concurrent'), (2, 'kept');
+CHECKPOINT;
+]);
+$node->safe_psql(
+	'dbbranch_create_index_concurrently_source',
+	q[CREATE INDEX CONCURRENTLY concurrent_index_rows_name_idx ON concurrent_index_rows (name);]);
+$node->safe_psql(
+	'dbbranch_create_index_concurrently_source',
+	q[INSERT INTO concurrent_index_rows VALUES (3, 'after-concurrent');]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_create_index_concurrently_target FROM DATABASE dbbranch_create_index_concurrently_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports concurrently-created indexes');
+
+my $create_index_concurrently_exists = $node->safe_psql(
+	'dbbranch_create_index_concurrently_target',
+	q[SELECT to_regclass('public.concurrent_index_rows_name_idx') IS NOT NULL;]);
+is($create_index_concurrently_exists, 't',
+	'branch exposes concurrently-created index');
+my $create_index_concurrently_lookup = $node->safe_psql(
+	'dbbranch_create_index_concurrently_target',
+	q[
+SET enable_seqscan = off;
+SELECT id FROM concurrent_index_rows WHERE name = 'after-concurrent';
+]);
+is($create_index_concurrently_lookup, '3',
+	'branch reads rows through concurrently-created index predicate');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_index_concurrently_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_create_index_concurrently_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
