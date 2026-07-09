@@ -3093,7 +3093,7 @@ note('DB Branch section: injection-point failure and cleanup paths');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 159
+	skip 'Injection points not supported by this build', 165
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -4526,6 +4526,63 @@ SELECT count(*) FROM clone_mid_fail_rows;
 
 	$node->safe_psql('postgres', q[SELECT injection_points_detach('db-branch-during-clone');]);
 	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_clone_mid_fail_source;]);
+
+	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_pending_unlink_source;]);
+	$node->safe_psql(
+		'dbbranch_pending_unlink_source',
+		q[
+CREATE TABLE pending_unlink_rows (id int PRIMARY KEY);
+INSERT INTO pending_unlink_rows VALUES (1);
+CHECKPOINT;
+]);
+	my $pending_unlink_source_oid = $node->safe_psql(
+		'postgres',
+		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_pending_unlink_source';]);
+	my $pending_unlink_probe_name = 'dbbranch_unlink_probe';
+	my $pending_unlink_probe_path =
+	  $node->data_dir . '/base/' . $pending_unlink_source_oid . '/' .
+	  $pending_unlink_probe_name;
+	open my $pending_unlink_probe_fh, '>', $pending_unlink_probe_path
+	  or die "could not create $pending_unlink_probe_path: $!";
+	print {$pending_unlink_probe_fh} "stale\n";
+	close $pending_unlink_probe_fh;
+	ok(-f $pending_unlink_probe_path,
+		'pending unlink test source probe exists before clone');
+
+	$node->safe_psql('postgres',
+		qq[SELECT injection_points_attach('db-branch-before-file-clone-$pending_unlink_probe_name', 'unlink');]);
+	$node->safe_psql(
+		'postgres',
+		q[CREATE BRANCH dbbranch_pending_unlink_target FROM DATABASE dbbranch_pending_unlink_source]);
+	ok(!-e $pending_unlink_probe_path,
+		'pending unlink injection removed source probe during clone');
+
+	my $pending_unlink_clone_result = $node->safe_psql(
+		'postgres',
+		q[SELECT clone_result FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_pending_unlink_target');]);
+	is($pending_unlink_clone_result, 'done_skipped_enoent',
+		'db branch records skipped ENOENT clone result');
+	my $pending_unlink_branch_rows = $node->safe_psql(
+		'dbbranch_pending_unlink_target',
+		q[SELECT count(*) FROM pending_unlink_rows;]);
+	is($pending_unlink_branch_rows, '1',
+		'branch remains readable after skipped ENOENT clone file');
+	my $pending_unlink_target_oid = $node->safe_psql(
+		'postgres',
+		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_pending_unlink_target';]);
+	ok(!-e $node->data_dir . '/base/' . $pending_unlink_target_oid . '/' .
+		$pending_unlink_probe_name,
+		'branch does not copy skipped ENOENT source file');
+	my $pending_unlink_slot_count = $node->safe_psql(
+		'postgres',
+		q[SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'dbbranch_%';]);
+	is($pending_unlink_slot_count, '0',
+		'pending unlink ENOENT branch releases DB Branch WAL pin');
+
+	$node->safe_psql('postgres',
+		qq[SELECT injection_points_detach('db-branch-before-file-clone-$pending_unlink_probe_name');]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_pending_unlink_target;]);
+	$node->safe_psql('postgres', q[DROP DATABASE dbbranch_pending_unlink_source;]);
 
 	$node->safe_psql('postgres', q[CREATE DATABASE dbbranch_replay_gate_source;]);
 	$node->safe_psql(

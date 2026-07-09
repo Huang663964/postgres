@@ -214,12 +214,19 @@ static void InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const ch
 								   char *src_ctype, char *src_locale,
 								   char *src_icurules, char src_locprovider,
 								   char *src_collversion);
-static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
-								   char *failure, Size failure_len);
 static bool CloneDBBranchFile(const char *fromfile, const char *tofile,
+							  bool source_file_is_active,
+							  bool *skipped_enoent,
 							  char *failure, Size failure_len);
+static bool CloneDBBranchDirectory(const char *fromdir, const char *todir,
+								   Oid tablespace_oid,
+								   const List *source_relations,
+								   bool *skipped_enoent,
+								   char *failure, Size failure_len);
+static bool DBBranchCloneFileIsActive(const char *name, Oid tablespace_oid,
+									  const List *source_relations);
+static RelFileNumber DBBranchParseRelFileNumber(const char *filename);
 static bool ShouldSkipDBBranchCloneEntry(const char *name);
-static void RemoveDBBranchSkippedCloneFiles(const char *dbpath);
 static void MakeDBBranchWalPinName(Oid source_dboid, uint32 branch_hash,
 								   char *slot_name, Size slot_name_len);
 static XLogRecPtr PinDBBranchWal(const char *slot_name);
@@ -243,6 +250,7 @@ static bool ScanDBBranchSourceRelations(Oid source_dboid,
 										Oid source_deftablespace,
 										char *srcpath,
 										List **tablespace_oids,
+										List **source_relations,
 										bool *has_sequence,
 										bool *has_temp_relation);
 
@@ -3790,8 +3798,25 @@ InstallDBBranchDatabase(Oid source_dboid, Oid branch_dboid, const char *branch_n
 }
 
 
+#ifdef USE_INJECTION_POINTS
+static void
+DBBranchRunBeforeCloneFileInjection(const char *fromfile)
+{
+	const char *filename = strrchr(fromfile, '/');
+	char		injection_name[64];
+	int			len;
+
+	filename = filename ? filename + 1 : fromfile;
+	len = snprintf(injection_name, sizeof(injection_name),
+				   "db-branch-before-file-clone-%s", filename);
+	if (len > 0 && len < (int) sizeof(injection_name))
+		INJECTION_POINT(injection_name, (void *) fromfile);
+}
+#endif
+
 static bool
 CloneDBBranchFile(const char *fromfile, const char *tofile,
+				  bool source_file_is_active, bool *skipped_enoent,
 				  char *failure, Size failure_len)
 {
 #if defined(__linux__) && defined(FICLONE)
@@ -3799,9 +3824,17 @@ CloneDBBranchFile(const char *fromfile, const char *tofile,
 	int			dstfd;
 	int			save_errno;
 
+#ifdef USE_INJECTION_POINTS
+	DBBranchRunBeforeCloneFileInjection(fromfile);
+#endif
 	srcfd = OpenTransientFile(fromfile, O_RDONLY | PG_BINARY);
 	if (srcfd < 0)
 	{
+		if (errno == ENOENT && !source_file_is_active)
+		{
+			*skipped_enoent = true;
+			return true;
+		}
 		snprintf(failure, failure_len, "could not open file \"%s\": %s",
 				 fromfile, strerror(errno));
 		return false;
@@ -3859,6 +3892,8 @@ CloneDBBranchFile(const char *fromfile, const char *tofile,
 
 static bool
 CloneDBBranchDirectory(const char *fromdir, const char *todir,
+					   Oid tablespace_oid, const List *source_relations,
+					   bool *skipped_enoent,
 					   char *failure, Size failure_len)
 {
 	DIR		   *xldir;
@@ -3901,10 +3936,30 @@ CloneDBBranchDirectory(const char *fromdir, const char *todir,
 		snprintf(fromfile, sizeof(fromfile), "%s/%s", fromdir, xlde->d_name);
 		snprintf(tofile, sizeof(tofile), "%s/%s", todir, xlde->d_name);
 
-		xlde_type = get_dirent_type(fromfile, xlde, false, ERROR);
+		errno = 0;
+		xlde_type = get_dirent_type(fromfile, xlde, false, DEBUG1);
+		if (xlde_type == PGFILETYPE_ERROR)
+		{
+			int			save_errno = errno;
+
+			if (save_errno == ENOENT &&
+				!DBBranchCloneFileIsActive(xlde->d_name, tablespace_oid,
+										   source_relations))
+			{
+				*skipped_enoent = true;
+				continue;
+			}
+
+			snprintf(failure, failure_len, "could not stat file \"%s\": %s",
+					 fromfile, strerror(save_errno));
+			FreeDir(xldir);
+			return false;
+		}
 		if (xlde_type == PGFILETYPE_DIR)
 		{
-			if (!CloneDBBranchDirectory(fromfile, tofile, failure, failure_len))
+			if (!CloneDBBranchDirectory(fromfile, tofile, tablespace_oid,
+										source_relations, skipped_enoent,
+										failure, failure_len))
 			{
 				FreeDir(xldir);
 				return false;
@@ -3912,7 +3967,11 @@ CloneDBBranchDirectory(const char *fromdir, const char *todir,
 		}
 		else if (xlde_type == PGFILETYPE_REG)
 		{
-			if (!CloneDBBranchFile(fromfile, tofile, failure, failure_len))
+			if (!CloneDBBranchFile(fromfile, tofile,
+								   DBBranchCloneFileIsActive(xlde->d_name,
+															tablespace_oid,
+															source_relations),
+								   skipped_enoent, failure, failure_len))
 			{
 				FreeDir(xldir);
 				return false;
@@ -3928,6 +3987,45 @@ CloneDBBranchDirectory(const char *fromdir, const char *todir,
 }
 
 static bool
+DBBranchCloneFileIsActive(const char *name, Oid tablespace_oid,
+						  const List *source_relations)
+{
+	RelFileNumber relfilenumber = DBBranchParseRelFileNumber(name);
+	const ListCell *cell;
+
+	if (!RelFileNumberIsValid(relfilenumber))
+		return false;
+
+	foreach(cell, source_relations)
+	{
+		const CreateDBRelInfo *relinfo = lfirst(cell);
+
+		if (relinfo->rlocator.spcOid == tablespace_oid &&
+			relinfo->rlocator.relNumber == relfilenumber)
+			return true;
+	}
+
+	return false;
+}
+
+static RelFileNumber
+DBBranchParseRelFileNumber(const char *filename)
+{
+	char	   *endp;
+	unsigned long n;
+
+	if (filename[0] < '1' || filename[0] > '9')
+		return InvalidRelFileNumber;
+
+	errno = 0;
+	n = strtoul(filename, &endp, 10);
+	if (errno != 0 || filename == endp || n == 0 || n > PG_UINT32_MAX)
+		return InvalidRelFileNumber;
+
+	return (RelFileNumber) n;
+}
+
+static bool
 ShouldSkipDBBranchCloneEntry(const char *name)
 {
 	if (strcmp(name, RELCACHE_INIT_FILENAME) == 0)
@@ -3936,38 +4034,6 @@ ShouldSkipDBBranchCloneEntry(const char *name)
 	return strncmp(name, PG_TEMP_FILE_PREFIX,
 				   strlen(PG_TEMP_FILE_PREFIX)) == 0 ||
 		looks_like_temp_rel_name(name);
-}
-
-static void
-RemoveDBBranchSkippedCloneFiles(const char *dbpath)
-{
-	DIR		   *xldir;
-	struct dirent *xlde;
-	char		path[MAXPGPATH * 2];
-
-	xldir = AllocateDir(dbpath);
-
-	while ((xlde = ReadDir(xldir, dbpath)) != NULL)
-	{
-		PGFileType	xlde_type;
-
-		CHECK_FOR_INTERRUPTS();
-
-		if (!ShouldSkipDBBranchCloneEntry(xlde->d_name))
-			continue;
-
-		snprintf(path, sizeof(path), "%s/%s", dbpath, xlde->d_name);
-		xlde_type = get_dirent_type(path, xlde, false, ERROR);
-		if (xlde_type == PGFILETYPE_REG && unlink(path) != 0)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not remove skipped clone file \"%s\": %m",
-							path)));
-	}
-	FreeDir(xldir);
-
-	if (enableFsync)
-		fsync_fname(dbpath, true);
 }
 
 static void
@@ -4190,6 +4256,7 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 static bool
 ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
 								char *srcpath, List **tablespace_oids,
+								List **source_relations,
 								bool *has_sequence, bool *has_temp_relation)
 {
 	List	   *rlocatorlist;
@@ -4202,6 +4269,7 @@ ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
 	rlocatorlist = ScanSourceDatabasePgClass(source_deftablespace,
 										 source_dboid, srcpath,
 										 has_temp_relation);
+	*source_relations = rlocatorlist;
 	foreach(cell, rlocatorlist)
 	{
 		CreateDBRelInfo *relinfo = (CreateDBRelInfo *) lfirst(cell);
@@ -4215,7 +4283,6 @@ ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
 		if (relinfo->sequence)
 			*has_sequence = true;
 	}
-	list_free_deep(rlocatorlist);
 
 	return has_unlogged;
 }
@@ -4242,10 +4309,12 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 	Oid		branch_dboid;
 	const char *volatile clone_result = "done";
 	List	   *tablespace_oids = NIL;
+	List	   *source_relations = NIL;
 	ListCell   *cell;
 	bool		source_has_unlogged;
 	bool		source_has_sequence;
 	bool		source_has_temp_relation;
+	bool		clone_skipped_enoent = false;
 	volatile bool clone_paths_created = false;
 	volatile bool clone_finished = false;
 	int		npreparedxacts;
@@ -4455,7 +4524,8 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 	source_has_unlogged = ScanDBBranchSourceRelations(source_dboid,
 										   source_deftablespace, srcpath,
-										   &tablespace_oids, &source_has_sequence,
+										   &tablespace_oids, &source_relations,
+										   &source_has_sequence,
 										   &source_has_temp_relation);
 	if (source_has_temp_relation)
 	{
@@ -4566,7 +4636,9 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 
 			clone_paths_created = true;
 			INJECTION_POINT("db-branch-during-clone", NULL);
-			if (!CloneDBBranchDirectory(frompath, topath, failure, sizeof(failure)))
+			if (!CloneDBBranchDirectory(frompath, topath, tablespace_oid,
+										source_relations, &clone_skipped_enoent,
+										failure, sizeof(failure)))
 			{
 				bool		cleanup_ok = CleanupDBBranchClonePath(topath);
 				ListCell   *cleanup_cell;
@@ -4607,7 +4679,11 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 			pfree(frompath);
 			pfree(topath);
 		}
+		if (clone_skipped_enoent)
+			clone_result = "done_skipped_enoent";
 		clone_finished = true;
+		list_free_deep(source_relations);
+		source_relations = NIL;
 
 		INSTR_TIME_SET_CURRENT(elapsed);
 		INSTR_TIME_SUBTRACT(elapsed, clone_start);
