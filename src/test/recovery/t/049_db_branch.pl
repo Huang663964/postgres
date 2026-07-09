@@ -7561,6 +7561,56 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_policy_lifecycle_targ
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_policy_lifecycle_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_drop_policy_lifecycle_reader;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_function_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_function_lifecycle_source',
+	q[
+CREATE TABLE function_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO function_lifecycle_rows VALUES (1, 'before-function');
+CHECKPOINT;
+CREATE FUNCTION function_lifecycle_note(prefix text) RETURNS text LANGUAGE SQL
+	RETURN prefix || ':' ||
+		(SELECT string_agg(id || ':' || note, ',' ORDER BY id)
+		 FROM function_lifecycle_rows);
+INSERT INTO function_lifecycle_rows VALUES (2, 'after-function');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_function_lifecycle_target FROM DATABASE dbbranch_function_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports created functions');
+
+my $function_lifecycle_rows = $node->safe_psql(
+	'dbbranch_function_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM function_lifecycle_rows;]);
+is($function_lifecycle_rows,
+	'1:before-function,2:after-function',
+	'branch reads rows after function creation');
+my $function_lifecycle_catalog = $node->safe_psql(
+	'dbbranch_function_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname = 'function_lifecycle_note';
+]);
+is($function_lifecycle_catalog, '1', 'branch exposes created function');
+my $function_lifecycle_call = $node->safe_psql(
+	'dbbranch_function_lifecycle_target',
+	q[SELECT function_lifecycle_note('branch');]);
+is($function_lifecycle_call,
+	'branch:1:before-function,2:after-function',
+	'branch can call created function');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_function_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
