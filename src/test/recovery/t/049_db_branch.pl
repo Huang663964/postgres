@@ -7912,6 +7912,61 @@ is($schema_lifecycle_schema_rows, '2:after-schema',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_schema_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_schema_lifecycle_source;]);
 
+$node->safe_psql('postgres', q[CREATE ROLE dbbranch_alter_schema_lifecycle_owner;]);
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_alter_schema_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_alter_schema_lifecycle_source',
+	q[
+CREATE TABLE alter_schema_lifecycle_public_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE SCHEMA alter_schema_lifecycle_changed;
+CREATE TABLE alter_schema_lifecycle_changed.alter_schema_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO alter_schema_lifecycle_public_rows VALUES (1, 'before-alter-schema');
+INSERT INTO alter_schema_lifecycle_changed.alter_schema_lifecycle_rows VALUES (1, 'before-alter-schema');
+CHECKPOINT;
+ALTER SCHEMA alter_schema_lifecycle_changed OWNER TO dbbranch_alter_schema_lifecycle_owner;
+INSERT INTO alter_schema_lifecycle_public_rows VALUES (2, 'after-alter-schema');
+INSERT INTO alter_schema_lifecycle_changed.alter_schema_lifecycle_rows VALUES (2, 'after-alter-schema');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_schema_lifecycle_target FROM DATABASE dbbranch_alter_schema_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports altered schemas');
+
+my $alter_schema_lifecycle_public_rows = $node->safe_psql(
+	'dbbranch_alter_schema_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM alter_schema_lifecycle_public_rows;]);
+is($alter_schema_lifecycle_public_rows,
+	'1:before-alter-schema,2:after-alter-schema',
+	'branch reads public rows after schema alteration');
+my $alter_schema_lifecycle_owner = $node->safe_psql(
+	'dbbranch_alter_schema_lifecycle_target',
+	q[
+SELECT nspowner = 'dbbranch_alter_schema_lifecycle_owner'::regrole
+FROM pg_namespace
+WHERE nspname = 'alter_schema_lifecycle_changed';
+]);
+is($alter_schema_lifecycle_owner, 't',
+	'branch exposes altered schema owner');
+my $alter_schema_lifecycle_schema_rows = $node->safe_psql(
+	'dbbranch_alter_schema_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM alter_schema_lifecycle_changed.alter_schema_lifecycle_rows;]);
+is($alter_schema_lifecycle_schema_rows,
+	'1:before-alter-schema,2:after-alter-schema',
+	'branch reads rows in altered schema');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_schema_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_schema_lifecycle_source;]);
+$node->safe_psql('postgres', q[DROP ROLE dbbranch_alter_schema_lifecycle_owner;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
