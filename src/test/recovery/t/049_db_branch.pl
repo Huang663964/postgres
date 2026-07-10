@@ -8216,6 +8216,62 @@ is($alter_composite_lifecycle_attributes, 'item_id,note',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_composite_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_composite_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_composite_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_composite_lifecycle_source',
+	q[
+CREATE TYPE drop_composite_lifecycle_payload AS (item_id int, detail text);
+CREATE TABLE drop_composite_lifecycle_rows (
+	id int PRIMARY KEY,
+	payload drop_composite_lifecycle_payload,
+	note text NOT NULL
+);
+INSERT INTO drop_composite_lifecycle_rows
+VALUES (1, ROW(10, 'before')::drop_composite_lifecycle_payload, 'before-drop');
+CHECKPOINT;
+DROP TYPE drop_composite_lifecycle_payload CASCADE;
+INSERT INTO drop_composite_lifecycle_rows (id, note)
+VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_composite_lifecycle_target FROM DATABASE dbbranch_drop_composite_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped composite types');
+
+my $drop_composite_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_composite_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_composite_lifecycle_rows;]);
+is($drop_composite_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after composite type drop');
+my $drop_composite_lifecycle_columns = $node->safe_psql(
+	'dbbranch_drop_composite_lifecycle_target',
+	q[
+SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'drop_composite_lifecycle_rows';
+]);
+is($drop_composite_lifecycle_columns, 'id,note',
+	'branch does not expose column from dropped composite type');
+my $drop_composite_lifecycle_type = $node->safe_psql(
+	'dbbranch_drop_composite_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'public'
+  AND t.typname = 'drop_composite_lifecycle_payload';
+]);
+is($drop_composite_lifecycle_type, '0',
+	'branch does not expose dropped composite type');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_composite_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_composite_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
