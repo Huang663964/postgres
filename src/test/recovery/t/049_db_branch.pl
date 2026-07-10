@@ -8108,6 +8108,61 @@ is($drop_domain_lifecycle_constraint, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_domain_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_domain_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_enum_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_enum_lifecycle_source',
+	q[
+CREATE TYPE drop_enum_lifecycle_state AS ENUM ('ready', 'failed');
+CREATE TABLE drop_enum_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_enum_lifecycle_rows VALUES (1, 'before-drop-enum');
+SELECT 'ready'::drop_enum_lifecycle_state;
+CHECKPOINT;
+DROP TYPE drop_enum_lifecycle_state;
+INSERT INTO drop_enum_lifecycle_rows VALUES (2, 'after-drop-enum');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_enum_lifecycle_target FROM DATABASE dbbranch_drop_enum_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped enums');
+
+my $drop_enum_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_enum_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_enum_lifecycle_rows;]);
+is($drop_enum_lifecycle_rows,
+	'1:before-drop-enum,2:after-drop-enum',
+	'branch reads rows after enum drop');
+my $drop_enum_lifecycle_type = $node->safe_psql(
+	'dbbranch_drop_enum_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'public'
+  AND t.typname = 'drop_enum_lifecycle_state'
+  AND t.typtype = 'e';
+]);
+is($drop_enum_lifecycle_type, '0',
+	'branch does not expose dropped enum');
+my $drop_enum_lifecycle_labels = $node->safe_psql(
+	'dbbranch_drop_enum_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_enum e
+JOIN pg_type t ON t.oid = e.enumtypid
+WHERE t.typname = 'drop_enum_lifecycle_state';
+]);
+is($drop_enum_lifecycle_labels, '0',
+	'branch does not expose labels from dropped enum');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_enum_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_enum_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
