@@ -7869,6 +7869,49 @@ is($drop_procedure_lifecycle_missing, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_procedure_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_procedure_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_schema_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_schema_lifecycle_source',
+	q[
+CREATE TABLE schema_lifecycle_public_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO schema_lifecycle_public_rows VALUES (1, 'before-schema');
+CHECKPOINT;
+CREATE SCHEMA schema_lifecycle_created;
+CREATE TABLE schema_lifecycle_created.schema_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO schema_lifecycle_created.schema_lifecycle_rows VALUES (2, 'after-schema');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_schema_lifecycle_target FROM DATABASE dbbranch_schema_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports created schemas');
+
+my $schema_lifecycle_public_rows = $node->safe_psql(
+	'dbbranch_schema_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM schema_lifecycle_public_rows;]);
+is($schema_lifecycle_public_rows, '1:before-schema',
+	'branch reads rows before schema creation');
+my $schema_lifecycle_namespace = $node->safe_psql(
+	'dbbranch_schema_lifecycle_target',
+	q[SELECT count(*) FROM pg_namespace WHERE nspname = 'schema_lifecycle_created';]);
+is($schema_lifecycle_namespace, '1', 'branch exposes created schema');
+my $schema_lifecycle_schema_rows = $node->safe_psql(
+	'dbbranch_schema_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM schema_lifecycle_created.schema_lifecycle_rows;]);
+is($schema_lifecycle_schema_rows, '2:after-schema',
+	'branch reads rows in created schema');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_schema_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_schema_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
