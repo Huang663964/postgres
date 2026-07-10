@@ -8564,6 +8564,65 @@ is($drop_cast_lifecycle_function, '7',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_cast_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_cast_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_opclass_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_opclass_lifecycle_source',
+	q[
+CREATE OPERATOR CLASS drop_opclass_lifecycle_ops
+FOR TYPE int USING btree AS STORAGE int;
+CREATE TABLE drop_opclass_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_opclass_lifecycle_rows VALUES (1, 'before-drop');
+CHECKPOINT;
+DROP OPERATOR CLASS drop_opclass_lifecycle_ops USING btree;
+INSERT INTO drop_opclass_lifecycle_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_opclass_lifecycle_target FROM DATABASE dbbranch_drop_opclass_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped operator classes');
+
+my $drop_opclass_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_opclass_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_opclass_lifecycle_rows;]);
+is($drop_opclass_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after operator class drop');
+my $drop_opclass_lifecycle_class = $node->safe_psql(
+	'dbbranch_drop_opclass_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_opclass c
+JOIN pg_namespace n ON n.oid = c.opcnamespace
+JOIN pg_am am ON am.oid = c.opcmethod
+WHERE n.nspname = 'public'
+  AND c.opcname = 'drop_opclass_lifecycle_ops'
+  AND am.amname = 'btree';
+]);
+is($drop_opclass_lifecycle_class, '0',
+	'branch does not expose dropped operator class');
+my $drop_opclass_lifecycle_family = $node->safe_psql(
+	'dbbranch_drop_opclass_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_opfamily f
+JOIN pg_namespace n ON n.oid = f.opfnamespace
+JOIN pg_am am ON am.oid = f.opfmethod
+WHERE n.nspname = 'public'
+  AND f.opfname = 'drop_opclass_lifecycle_ops'
+  AND am.amname = 'btree';
+]);
+is($drop_opclass_lifecycle_family, '1',
+	'branch retains implicit operator family after class drop');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_opclass_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_opclass_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
