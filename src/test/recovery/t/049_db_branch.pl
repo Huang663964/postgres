@@ -8623,6 +8623,64 @@ is($drop_opclass_lifecycle_family, '1',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_opclass_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_opclass_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_operator_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_operator_lifecycle_source',
+	q[
+CREATE FUNCTION drop_operator_lifecycle_eq(boolean, boolean)
+RETURNS boolean LANGUAGE SQL IMMUTABLE
+AS $$ SELECT $1 IS NOT DISTINCT FROM $2 $$;
+CREATE OPERATOR === (
+	LEFTARG = boolean,
+	RIGHTARG = boolean,
+	PROCEDURE = drop_operator_lifecycle_eq
+);
+CREATE TABLE drop_operator_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_operator_lifecycle_rows VALUES (1, 'before-drop');
+SELECT true === true;
+CHECKPOINT;
+DROP OPERATOR === (boolean, boolean);
+INSERT INTO drop_operator_lifecycle_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_operator_lifecycle_target FROM DATABASE dbbranch_drop_operator_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped operators');
+
+my $drop_operator_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_operator_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_operator_lifecycle_rows;]);
+is($drop_operator_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after operator drop');
+my $drop_operator_lifecycle_operator = $node->safe_psql(
+	'dbbranch_drop_operator_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_operator o
+JOIN pg_namespace n ON n.oid = o.oprnamespace
+WHERE n.nspname = 'public'
+  AND o.oprname = '==='
+  AND o.oprleft = 'boolean'::regtype
+  AND o.oprright = 'boolean'::regtype;
+]);
+is($drop_operator_lifecycle_operator, '0',
+	'branch does not expose dropped operator');
+my $drop_operator_lifecycle_function = $node->safe_psql(
+	'dbbranch_drop_operator_lifecycle_target',
+	q[SELECT drop_operator_lifecycle_eq(true, true);]);
+is($drop_operator_lifecycle_function, 't',
+	'branch retains function from dropped operator');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_operator_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_operator_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
