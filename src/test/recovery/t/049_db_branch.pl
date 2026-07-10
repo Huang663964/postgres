@@ -8333,6 +8333,85 @@ is($drop_range_lifecycle_types, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_range_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_range_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_base_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_base_lifecycle_source',
+	q[
+CREATE TYPE drop_base_lifecycle_type;
+CREATE FUNCTION drop_base_lifecycle_in(cstring, oid, integer)
+RETURNS drop_base_lifecycle_type
+LANGUAGE internal IMMUTABLE PARALLEL SAFE STRICT AS 'varcharin';
+CREATE FUNCTION drop_base_lifecycle_out(drop_base_lifecycle_type)
+RETURNS cstring
+LANGUAGE internal IMMUTABLE PARALLEL SAFE STRICT AS 'varcharout';
+CREATE TYPE drop_base_lifecycle_type (
+	input = drop_base_lifecycle_in,
+	output = drop_base_lifecycle_out,
+	alignment = integer,
+	storage = extended
+);
+CREATE TABLE drop_base_lifecycle_rows (
+	id int PRIMARY KEY,
+	payload drop_base_lifecycle_type,
+	note text NOT NULL
+);
+INSERT INTO drop_base_lifecycle_rows
+VALUES (1, 'before'::drop_base_lifecycle_type, 'before-drop');
+CHECKPOINT;
+DROP TYPE drop_base_lifecycle_type CASCADE;
+INSERT INTO drop_base_lifecycle_rows (id, note)
+VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_base_lifecycle_target FROM DATABASE dbbranch_drop_base_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped base types');
+
+my $drop_base_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_base_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_base_lifecycle_rows;]);
+is($drop_base_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after base type drop');
+my $drop_base_lifecycle_columns = $node->safe_psql(
+	'dbbranch_drop_base_lifecycle_target',
+	q[
+SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'drop_base_lifecycle_rows';
+]);
+is($drop_base_lifecycle_columns, 'id,note',
+	'branch does not expose column from dropped base type');
+my $drop_base_lifecycle_type = $node->safe_psql(
+	'dbbranch_drop_base_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'public'
+  AND t.typname = 'drop_base_lifecycle_type';
+]);
+is($drop_base_lifecycle_type, '0',
+	'branch does not expose dropped base type');
+my $drop_base_lifecycle_functions = $node->safe_psql(
+	'dbbranch_drop_base_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public'
+  AND p.proname IN ('drop_base_lifecycle_in', 'drop_base_lifecycle_out');
+]);
+is($drop_base_lifecycle_functions, '0',
+	'branch does not expose functions from dropped base type');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_base_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_base_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
