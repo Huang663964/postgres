@@ -8412,6 +8412,62 @@ is($drop_base_lifecycle_functions, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_base_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_base_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_collation_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_collation_lifecycle_source',
+	q[
+CREATE COLLATION drop_collation_lifecycle FROM "C";
+CREATE TABLE drop_collation_lifecycle_rows (
+	id int PRIMARY KEY,
+	sorted_text text COLLATE drop_collation_lifecycle,
+	note text NOT NULL
+);
+INSERT INTO drop_collation_lifecycle_rows
+VALUES (1, 'before', 'before-drop');
+CHECKPOINT;
+DROP COLLATION drop_collation_lifecycle CASCADE;
+INSERT INTO drop_collation_lifecycle_rows (id, note)
+VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_collation_lifecycle_target FROM DATABASE dbbranch_drop_collation_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped collations');
+
+my $drop_collation_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_collation_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_collation_lifecycle_rows;]);
+is($drop_collation_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after collation drop');
+my $drop_collation_lifecycle_columns = $node->safe_psql(
+	'dbbranch_drop_collation_lifecycle_target',
+	q[
+SELECT string_agg(column_name, ',' ORDER BY ordinal_position)
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'drop_collation_lifecycle_rows';
+]);
+is($drop_collation_lifecycle_columns, 'id,note',
+	'branch does not expose column from dropped collation');
+my $drop_collation_lifecycle_collation = $node->safe_psql(
+	'dbbranch_drop_collation_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_collation c
+JOIN pg_namespace n ON n.oid = c.collnamespace
+WHERE n.nspname = 'public'
+  AND c.collname = 'drop_collation_lifecycle';
+]);
+is($drop_collation_lifecycle_collation, '0',
+	'branch does not expose dropped collation');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_collation_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_collation_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
