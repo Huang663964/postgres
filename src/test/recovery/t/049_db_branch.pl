@@ -7967,6 +7967,53 @@ $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_schema_lifecycle_tar
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_schema_lifecycle_source;]);
 $node->safe_psql('postgres', q[DROP ROLE dbbranch_alter_schema_lifecycle_owner;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_schema_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_schema_lifecycle_source',
+	q[
+CREATE TABLE drop_schema_lifecycle_public_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+CREATE SCHEMA drop_schema_lifecycle_removed;
+CREATE TABLE drop_schema_lifecycle_removed.drop_schema_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_schema_lifecycle_public_rows VALUES (1, 'before-drop-schema');
+INSERT INTO drop_schema_lifecycle_removed.drop_schema_lifecycle_rows VALUES (1, 'before-drop-schema');
+CHECKPOINT;
+DROP SCHEMA drop_schema_lifecycle_removed CASCADE;
+INSERT INTO drop_schema_lifecycle_public_rows VALUES (2, 'after-drop-schema');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_schema_lifecycle_target FROM DATABASE dbbranch_drop_schema_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped schemas');
+
+my $drop_schema_lifecycle_public_rows = $node->safe_psql(
+	'dbbranch_drop_schema_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_schema_lifecycle_public_rows;]);
+is($drop_schema_lifecycle_public_rows,
+	'1:before-drop-schema,2:after-drop-schema',
+	'branch reads public rows after schema drop');
+my $drop_schema_lifecycle_namespace = $node->safe_psql(
+	'dbbranch_drop_schema_lifecycle_target',
+	q[SELECT count(*) FROM pg_namespace WHERE nspname = 'drop_schema_lifecycle_removed';]);
+is($drop_schema_lifecycle_namespace, '0',
+	'branch does not expose dropped schema');
+my $drop_schema_lifecycle_relation = $node->safe_psql(
+	'dbbranch_drop_schema_lifecycle_target',
+	q[SELECT to_regclass('drop_schema_lifecycle_removed.drop_schema_lifecycle_rows') IS NULL;]);
+is($drop_schema_lifecycle_relation, 't',
+	'branch does not expose relations from dropped schema');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_schema_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_schema_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
