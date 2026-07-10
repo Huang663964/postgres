@@ -8468,6 +8468,50 @@ is($drop_collation_lifecycle_collation, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_collation_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_collation_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_conversion_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_conversion_lifecycle_source',
+	q[
+CREATE CONVERSION drop_conversion_lifecycle
+FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;
+CREATE TABLE drop_conversion_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_conversion_lifecycle_rows VALUES (1, 'before-drop');
+CHECKPOINT;
+DROP CONVERSION drop_conversion_lifecycle;
+INSERT INTO drop_conversion_lifecycle_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_conversion_lifecycle_target FROM DATABASE dbbranch_drop_conversion_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped conversions');
+
+my $drop_conversion_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_conversion_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_conversion_lifecycle_rows;]);
+is($drop_conversion_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after conversion drop');
+my $drop_conversion_lifecycle_conversion = $node->safe_psql(
+	'dbbranch_drop_conversion_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_conversion c
+JOIN pg_namespace n ON n.oid = c.connamespace
+WHERE n.nspname = 'public'
+  AND c.conname = 'drop_conversion_lifecycle';
+]);
+is($drop_conversion_lifecycle_conversion, '0',
+	'branch does not expose dropped conversion');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_conversion_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_conversion_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
