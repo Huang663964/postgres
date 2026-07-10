@@ -8014,6 +8014,49 @@ is($drop_schema_lifecycle_relation, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_schema_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_schema_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_extension_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_extension_lifecycle_source',
+	q[
+CREATE EXTENSION amcheck;
+CREATE TABLE drop_extension_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_extension_lifecycle_rows VALUES (1, 'before-drop-extension');
+SELECT bt_index_check('drop_extension_lifecycle_rows_pkey'::regclass);
+CHECKPOINT;
+DROP EXTENSION amcheck;
+INSERT INTO drop_extension_lifecycle_rows VALUES (2, 'after-drop-extension');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_extension_lifecycle_target FROM DATABASE dbbranch_drop_extension_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped extensions');
+
+my $drop_extension_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_extension_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_extension_lifecycle_rows;]);
+is($drop_extension_lifecycle_rows,
+	'1:before-drop-extension,2:after-drop-extension',
+	'branch reads rows after extension drop');
+my $drop_extension_lifecycle_catalog = $node->safe_psql(
+	'dbbranch_drop_extension_lifecycle_target',
+	q[SELECT count(*) FROM pg_extension WHERE extname = 'amcheck';]);
+is($drop_extension_lifecycle_catalog, '0',
+	'branch does not expose dropped extension');
+my $drop_extension_lifecycle_function = $node->safe_psql(
+	'dbbranch_drop_extension_lifecycle_target',
+	q[SELECT to_regprocedure('bt_index_check(regclass)') IS NULL;]);
+is($drop_extension_lifecycle_function, 't',
+	'branch does not expose functions from dropped extension');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_extension_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_extension_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
