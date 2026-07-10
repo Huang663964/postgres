@@ -8057,6 +8057,57 @@ is($drop_extension_lifecycle_function, 't',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_extension_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_extension_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_domain_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_domain_lifecycle_source',
+	q[
+CREATE DOMAIN drop_domain_lifecycle_positive_int AS int
+	CONSTRAINT drop_domain_lifecycle_positive CHECK (VALUE > 0);
+CREATE TABLE drop_domain_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_domain_lifecycle_rows VALUES (1, 'before-drop-domain');
+SELECT 1::drop_domain_lifecycle_positive_int;
+CHECKPOINT;
+DROP DOMAIN drop_domain_lifecycle_positive_int;
+INSERT INTO drop_domain_lifecycle_rows VALUES (2, 'after-drop-domain');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_domain_lifecycle_target FROM DATABASE dbbranch_drop_domain_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped domains');
+
+my $drop_domain_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_domain_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_domain_lifecycle_rows;]);
+is($drop_domain_lifecycle_rows,
+	'1:before-drop-domain,2:after-drop-domain',
+	'branch reads rows after domain drop');
+my $drop_domain_lifecycle_type = $node->safe_psql(
+	'dbbranch_drop_domain_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+WHERE n.nspname = 'public'
+  AND t.typname = 'drop_domain_lifecycle_positive_int'
+  AND t.typtype = 'd';
+]);
+is($drop_domain_lifecycle_type, '0',
+	'branch does not expose dropped domain');
+my $drop_domain_lifecycle_constraint = $node->safe_psql(
+	'dbbranch_drop_domain_lifecycle_target',
+	q[SELECT count(*) FROM pg_constraint WHERE conname = 'drop_domain_lifecycle_positive';]);
+is($drop_domain_lifecycle_constraint, '0',
+	'branch does not expose constraints from dropped domain');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_domain_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_domain_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
