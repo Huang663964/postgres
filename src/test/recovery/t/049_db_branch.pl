@@ -8163,6 +8163,59 @@ is($drop_enum_lifecycle_labels, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_enum_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_enum_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_alter_composite_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_alter_composite_lifecycle_source',
+	q[
+CREATE TYPE alter_composite_lifecycle_payload AS (item_id int);
+CREATE TABLE alter_composite_lifecycle_rows (
+	id int PRIMARY KEY,
+	payload alter_composite_lifecycle_payload NOT NULL
+);
+INSERT INTO alter_composite_lifecycle_rows
+VALUES (1, ROW(10)::alter_composite_lifecycle_payload);
+CHECKPOINT;
+ALTER TYPE alter_composite_lifecycle_payload ADD ATTRIBUTE note text;
+INSERT INTO alter_composite_lifecycle_rows
+VALUES (2, ROW(20, 'after-alter')::alter_composite_lifecycle_payload);
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_alter_composite_lifecycle_target FROM DATABASE dbbranch_alter_composite_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports altered composite types');
+
+my $alter_composite_lifecycle_rows = $node->safe_psql(
+	'dbbranch_alter_composite_lifecycle_target',
+	q[
+SELECT string_agg(
+	id || ':' || (payload).item_id || ':' || coalesce((payload).note, '<null>'),
+	',' ORDER BY id)
+FROM alter_composite_lifecycle_rows;
+]);
+is($alter_composite_lifecycle_rows,
+	'1:10:<null>,2:20:after-alter',
+	'branch reads rows across composite type alteration');
+my $alter_composite_lifecycle_attributes = $node->safe_psql(
+	'dbbranch_alter_composite_lifecycle_target',
+	q[
+SELECT string_agg(a.attname, ',' ORDER BY a.attnum)
+FROM pg_type t
+JOIN pg_namespace n ON n.oid = t.typnamespace
+JOIN pg_attribute a ON a.attrelid = t.typrelid
+WHERE n.nspname = 'public'
+  AND t.typname = 'alter_composite_lifecycle_payload'
+  AND a.attnum > 0
+  AND NOT a.attisdropped;
+]);
+is($alter_composite_lifecycle_attributes, 'item_id,note',
+	'branch exposes altered composite type attributes');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_composite_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_alter_composite_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
