@@ -8512,6 +8512,58 @@ is($drop_conversion_lifecycle_conversion, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_conversion_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_conversion_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_cast_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_cast_lifecycle_source',
+	q[
+CREATE TYPE drop_cast_lifecycle_type AS (id int);
+CREATE FUNCTION drop_cast_lifecycle_to_text(drop_cast_lifecycle_type)
+RETURNS text LANGUAGE SQL IMMUTABLE AS $$ SELECT ($1).id::text $$;
+CREATE CAST (drop_cast_lifecycle_type AS text)
+WITH FUNCTION drop_cast_lifecycle_to_text(drop_cast_lifecycle_type);
+CREATE TABLE drop_cast_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_cast_lifecycle_rows VALUES (1, 'before-drop');
+SELECT (ROW(7)::drop_cast_lifecycle_type)::text;
+CHECKPOINT;
+DROP CAST (drop_cast_lifecycle_type AS text);
+INSERT INTO drop_cast_lifecycle_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_cast_lifecycle_target FROM DATABASE dbbranch_drop_cast_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped casts');
+
+my $drop_cast_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_cast_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_cast_lifecycle_rows;]);
+is($drop_cast_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after cast drop');
+my $drop_cast_lifecycle_cast = $node->safe_psql(
+	'dbbranch_drop_cast_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_cast
+WHERE castsource = 'drop_cast_lifecycle_type'::regtype
+  AND casttarget = 'text'::regtype;
+]);
+is($drop_cast_lifecycle_cast, '0',
+	'branch does not expose dropped cast');
+my $drop_cast_lifecycle_function = $node->safe_psql(
+	'dbbranch_drop_cast_lifecycle_target',
+	q[SELECT drop_cast_lifecycle_to_text(ROW(7)::drop_cast_lifecycle_type);]);
+is($drop_cast_lifecycle_function, '7',
+	'branch retains function and type from dropped cast');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_cast_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_cast_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
