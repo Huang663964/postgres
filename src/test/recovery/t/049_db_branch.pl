@@ -8741,6 +8741,50 @@ is($drop_opfamily_lifecycle_class, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_opfamily_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_opfamily_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_tsdict_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_tsdict_lifecycle_source',
+	q[
+CREATE TEXT SEARCH DICTIONARY drop_tsdict_lifecycle (template = simple);
+CREATE TABLE drop_tsdict_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_tsdict_lifecycle_rows VALUES (1, 'before-drop');
+SELECT ts_lexize('drop_tsdict_lifecycle', 'hello');
+CHECKPOINT;
+DROP TEXT SEARCH DICTIONARY drop_tsdict_lifecycle;
+INSERT INTO drop_tsdict_lifecycle_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_tsdict_lifecycle_target FROM DATABASE dbbranch_drop_tsdict_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped text search dictionaries');
+
+my $drop_tsdict_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_tsdict_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_tsdict_lifecycle_rows;]);
+is($drop_tsdict_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after text search dictionary drop');
+my $drop_tsdict_lifecycle_dictionary = $node->safe_psql(
+	'dbbranch_drop_tsdict_lifecycle_target',
+	q[
+SELECT count(*)
+FROM pg_ts_dict d
+JOIN pg_namespace n ON n.oid = d.dictnamespace
+WHERE n.nspname = 'public'
+  AND d.dictname = 'drop_tsdict_lifecycle';
+]);
+is($drop_tsdict_lifecycle_dictionary, '0',
+	'branch does not expose dropped text search dictionary');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_tsdict_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_tsdict_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
