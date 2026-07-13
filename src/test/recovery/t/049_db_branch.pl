@@ -8785,6 +8785,70 @@ is($drop_tsdict_lifecycle_dictionary, '0',
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_tsdict_lifecycle_target;]);
 $node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_tsdict_lifecycle_source;]);
 
+$node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_tsconfig_lifecycle_source;');
+$node->safe_psql(
+	'dbbranch_drop_tsconfig_lifecycle_source',
+	q[
+CREATE TEXT SEARCH DICTIONARY drop_tsconfig_lifecycle_dict (template = simple);
+CREATE TEXT SEARCH CONFIGURATION drop_tsconfig_lifecycle (parser = default);
+ALTER TEXT SEARCH CONFIGURATION drop_tsconfig_lifecycle
+ALTER MAPPING FOR asciiword WITH drop_tsconfig_lifecycle_dict;
+CREATE TABLE drop_tsconfig_lifecycle_rows (
+	id int PRIMARY KEY,
+	note text NOT NULL
+);
+INSERT INTO drop_tsconfig_lifecycle_rows VALUES (1, 'before-drop');
+SELECT to_tsvector('drop_tsconfig_lifecycle', 'hello');
+CHECKPOINT;
+DROP TEXT SEARCH CONFIGURATION drop_tsconfig_lifecycle;
+INSERT INTO drop_tsconfig_lifecycle_rows VALUES (2, 'after-drop');
+]);
+
+$stderr = '';
+$result = $node->psql(
+	'postgres',
+	q[CREATE BRANCH dbbranch_drop_tsconfig_lifecycle_target FROM DATABASE dbbranch_drop_tsconfig_lifecycle_source],
+	stderr => \$stderr);
+is($result, 0, 'db branch supports dropped text search configurations');
+
+my $drop_tsconfig_lifecycle_rows = $node->safe_psql(
+	'dbbranch_drop_tsconfig_lifecycle_target',
+	q[SELECT string_agg(id || ':' || note, ',' ORDER BY id) FROM drop_tsconfig_lifecycle_rows;]);
+is($drop_tsconfig_lifecycle_rows,
+	'1:before-drop,2:after-drop',
+	'branch reads rows after text search configuration drop');
+my $drop_tsconfig_lifecycle_catalog = $node->safe_psql(
+	'dbbranch_drop_tsconfig_lifecycle_target',
+	q[
+SELECT
+  (SELECT count(*)
+   FROM pg_ts_config c
+   JOIN pg_namespace n ON n.oid = c.cfgnamespace
+   WHERE n.nspname = 'public'
+     AND c.cfgname = 'drop_tsconfig_lifecycle') || ':' ||
+  (SELECT count(*)
+   FROM pg_ts_config_map m
+   JOIN pg_ts_dict d ON d.oid = m.mapdict
+   JOIN pg_namespace n ON n.oid = d.dictnamespace
+   WHERE n.nspname = 'public'
+     AND d.dictname = 'drop_tsconfig_lifecycle_dict') || ':' ||
+  (SELECT count(*)
+   FROM pg_ts_dict d
+   JOIN pg_namespace n ON n.oid = d.dictnamespace
+   WHERE n.nspname = 'public'
+     AND d.dictname = 'drop_tsconfig_lifecycle_dict');
+]);
+is($drop_tsconfig_lifecycle_catalog, '0:0:1',
+	'branch removes text search configuration and mapping but retains dictionary');
+my $drop_tsconfig_lifecycle_dictionary = $node->safe_psql(
+	'dbbranch_drop_tsconfig_lifecycle_target',
+	q[SELECT ts_lexize('drop_tsconfig_lifecycle_dict', 'hello');]);
+is($drop_tsconfig_lifecycle_dictionary, '{hello}',
+	'branch can use dictionary from dropped text search configuration');
+
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_tsconfig_lifecycle_target;]);
+$node->safe_psql('postgres', q[DROP DATABASE dbbranch_drop_tsconfig_lifecycle_source;]);
+
 $node->safe_psql('postgres', 'CREATE DATABASE dbbranch_drop_sequence_source;');
 $node->safe_psql(
 	'dbbranch_drop_sequence_source',
