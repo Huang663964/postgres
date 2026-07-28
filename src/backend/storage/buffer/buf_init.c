@@ -22,6 +22,8 @@ BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
 pg_atomic_uint32 *BufferFrameIds;
 pg_atomic_uint32 *BufferNonIdentityFrameCount;
+pg_atomic_uint32 *BufferFrameAttachmentCounts;
+pg_atomic_uint32 *BufferFrameGenerations;
 pg_atomic_uint32 *BufferWriteIntentOwners;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
@@ -77,6 +79,7 @@ BufferManagerShmemInit(void)
 				foundIOCV,
 				foundBufCkpt;
 	pg_atomic_uint32 *frameMap;
+	Size		frameMapEntries;
 
 	/* Align descriptors to a cacheline boundary. */
 	BufferDescriptors = (BufferDescPadded *)
@@ -88,13 +91,23 @@ BufferManagerShmemInit(void)
 	 * ponytail: keep NFrames == NBuffers; add an allocator only when
 	 * descriptors must outnumber physical frames.
 	 */
+
+	/*
+	 * Keep the test-only frame metadata in one allocation:
+	 *
+	 * non-identity count, descriptor mappings, frame attachment counts,
+	 * descriptor mapping generations.
+	 */
+	frameMapEntries = add_size(mul_size((Size) NBuffers, 3), 1);
 	frameMap = (pg_atomic_uint32 *)
 		ShmemInitStruct("Buffer Frame IDs",
-						mul_size((Size) NBuffers + 1,
+						mul_size(frameMapEntries,
 								 sizeof(pg_atomic_uint32)),
 						&foundFrameIds);
 	BufferNonIdentityFrameCount = &frameMap[0];
 	BufferFrameIds = &frameMap[1];
+	BufferFrameAttachmentCounts = &frameMap[1 + NBuffers];
+	BufferFrameGenerations = &frameMap[1 + (2 * NBuffers)];
 
 	BufferWriteIntentOwners = (pg_atomic_uint32 *)
 		ShmemInitStruct("Buffer Write Intent Owners",
@@ -150,6 +163,8 @@ BufferManagerShmemInit(void)
 
 			pg_atomic_init_u32(&buf->state, 0);
 			pg_atomic_init_u32(&BufferFrameIds[i], i);
+			pg_atomic_init_u32(&BufferFrameAttachmentCounts[i], 1);
+			pg_atomic_init_u32(&BufferFrameGenerations[i], 0);
 			pg_atomic_init_u32(&BufferWriteIntentOwners[i],
 							   INVALID_PROC_NUMBER);
 			buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
@@ -188,6 +203,8 @@ BufferManagerShmemInit(void)
 		for (i = 0; i < NBuffers; i++)
 		{
 			Assert(pg_atomic_read_u32(&BufferFrameIds[i]) == (uint32) i);
+			Assert(pg_atomic_read_u32(&BufferFrameAttachmentCounts[i]) == 1);
+			Assert(pg_atomic_read_u32(&BufferFrameGenerations[i]) == 0);
 			Assert(pg_atomic_read_u32(&BufferWriteIntentOwners[i]) ==
 				   INVALID_PROC_NUMBER);
 		}
@@ -218,9 +235,13 @@ BufferManagerShmemSize(void)
 	/* to allow aligning buffer descriptors */
 	size = add_size(size, PG_CACHE_LINE_SIZE);
 
-	/* size of descriptor-to-frame identifiers */
-	size = add_size(size, mul_size((Size) NBuffers + 1,
-								   sizeof(pg_atomic_uint32)));
+	/*
+	 * Descriptor-to-frame identifiers plus test-only attachment counts and
+	 * mapping generations.
+	 */
+	size = add_size(size,
+					mul_size(add_size(mul_size((Size) NBuffers, 3), 1),
+							 sizeof(pg_atomic_uint32)));
 
 	/* write-intent owner for each shared buffer */
 	size = add_size(size, mul_size(NBuffers, sizeof(pg_atomic_uint32)));

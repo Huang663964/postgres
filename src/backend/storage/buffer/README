@@ -11,15 +11,19 @@ an atomic side array indexed by buffer ID.  BufferGetBlock() is the single
 address contract for callers with a Buffer, and internal callers with a
 BufferDesc route through the same contract.
 
-For now every mapping is permanently one-to-one: frame ID equals buffer ID.
-A shared non-identity count lets this common case compute the identity address
-without loading a random FrameId entry.  If a later test helper establishes
-any non-identity mapping, the same accessor reads the per-buffer atomic ID.
-Keeping this state outside BufferDesc preserves its cache-line-sized layout.
-Local buffers retain their existing pointer array.  This indirection alone
-does not provide shared frames, copy-on-write, a smaller physical frame pool,
-or any cache-capacity benefit.  Non-identity mappings may only be introduced
-by a later test-only helper with an explicit pin-drain protocol.
+Mappings are identity unless the test_buffer_frame module explicitly
+establishes one controlled non-identity mapping.  A shared non-identity count
+lets the normal case compute the identity address without loading a random
+FrameId entry.  When that count is nonzero, the same accessor reads the
+per-buffer atomic ID.  Atomic side arrays also hold each physical frame's
+logical attachment count and each descriptor's mapping generation.  Keeping
+this state outside BufferDesc preserves its cache-line-sized layout.  Local
+buffers retain their existing pointer array.
+
+There are still exactly NBuffers descriptors and NBuffers physical frames.
+Descriptor N's home frame is frame N and is never lent to another descriptor
+or placed on a free list.  Consequently this experiment provides neither a
+smaller physical frame pool nor cache-capacity or RSS benefit.
 
 Test-only Write-intent Pin Gate
 ------------------------------
@@ -76,11 +80,70 @@ publishes and when the shared pin count reaches one, failing closed if that
 state did not converge.  The normal AIO ownership path itself does not use
 this gate.
 
-This phase never allocates, copies, or switches a frame mapping.  In current
-tests BufferFrameIds remains identity.  A later test-only detach helper may
-call Begin after a descriptor has been mapped to a shared source frame; Begin
-therefore does not require an identity mapping.  Production write paths must
-not rely on this API.
+Begin accepts a non-identity target so the controlled detach helper can use
+the same pin-drain protocol.  It rejects an identity descriptor whose home
+frame has another attachment; the source descriptor is not a detach target.
+Production write paths must not rely on this API.
+
+Test-only Shared Frame and Detach
+---------------------------------
+
+TestOnlyAttachBufferFrame() is an internal test API, reachable only through
+test_buffer_frame.  Its caller pins only the target, establishes target write
+intent, and passes the expected tag of an unpinned source descriptor.  Attach
+first rejects recovery, before publishing any frame metadata.  It then locks
+the two buffer headers in descriptor-ID order and rechecks all of the
+following:
+
+* source and target are distinct shared buffers with identity mappings;
+* both pages are valid, clean, idle, permanent MAIN-fork pages;
+* the target writer is its sole pin and owns the published gate;
+* the source has no pin, waiter, or write intent and its tag did not change;
+* both home frames have one attachment; and
+* all BLCKSZ bytes are equal.
+
+The full-page comparison is deliberately done while the two header locks
+exclude a first source pin.  This is acceptable only for the explicit test
+operation; it is not a production Buffer Manager locking pattern.  Attach
+then changes the source count from one to two, makes the global non-identity
+fast-path count nonzero, publishes target-to-source, changes the reserved
+target-home count from one to zero, and increments the target generation.
+Only this function writes a non-identity FrameId.
+
+While attached, both the non-identity target and the identity source fail
+MarkBufferDirty() and MarkBufferDirtyHint().  Free-list, clock-sweep, and
+strategy-ring candidate selection skip both descriptors and count them as
+unavailable in the bounded victim scan.  Late victim invalidation still
+returns false, and direct DROP/truncate invalidation errors until explicit
+detach.  These checks keep the controlled tests from dirtying or reusing a
+shared frame.  They cannot undo bytes that an arbitrary caller changed before
+invoking a dirty-marking API, and hint-bit callers can modify bytes while
+holding only a shared content lock.  Therefore ordinary SQL, access methods,
+vacuum, recovery, and replay must not touch a test-shared page.  Closing those
+mutation paths requires a production write API migration and is intentionally
+outside this experiment.
+
+TestOnlyDetachBufferFrame() requires write intent on the non-identity target.
+Thus every old target pin and raw page pointer has drained, while new target
+first pins remain gated.  The source frame cannot be invalidated because its
+attachment count is two.  Detach takes the source content lock in shared
+mode, allowing immutable source readers to remain pinned, validates the
+pair, copies the source bytes to the reserved target home, and validates the
+pair again.  Publication then proceeds in this order:
+
+1. expose the copied target-home attachment;
+2. publish target-to-home identity mapping;
+3. reduce the source attachment from two to one;
+4. reduce the global non-identity count; and
+5. increment the target generation.
+
+End clears the target first-pin gate only after publication.  Calling detach
+again on the resulting private target is an idempotent no-op.  ERROR after
+attach leaves a valid shared mapping for explicit cleanup; cancel before
+detach publication leaves the shared mapping unchanged; ERROR after detach
+leaves a valid private mapping.  No allocator, frame free list, family hash,
+GUC, automatic promotion, ordinary SQL entry point, or production COW
+closure exists.
 
 There are two separate access control mechanisms for shared disk buffers:
 reference counts (a/k/a pin counts) and buffer content locks.  (Actually,

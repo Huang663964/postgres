@@ -57,6 +57,36 @@ get_test_buffer_desc(int32 buffer)
 	return GetBufferDescriptor(buffer - 1);
 }
 
+static void
+lock_test_page_pair(Buffer target, Buffer source)
+{
+	if (target < source)
+	{
+		LockBuffer(target, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(source, BUFFER_LOCK_SHARE);
+	}
+	else
+	{
+		LockBuffer(source, BUFFER_LOCK_SHARE);
+		LockBuffer(target, BUFFER_LOCK_EXCLUSIVE);
+	}
+}
+
+static void
+unlock_test_page_pair(Buffer target, Buffer source)
+{
+	if (target < source)
+	{
+		LockBuffer(source, BUFFER_LOCK_UNLOCK);
+		LockBuffer(target, BUFFER_LOCK_UNLOCK);
+	}
+	else
+	{
+		LockBuffer(target, BUFFER_LOCK_UNLOCK);
+		LockBuffer(source, BUFFER_LOCK_UNLOCK);
+	}
+}
+
 PG_FUNCTION_INFO_V1(test_buffer_frame_buffer_id);
 Datum
 test_buffer_frame_buffer_id(PG_FUNCTION_ARGS)
@@ -329,4 +359,301 @@ test_buffer_frame_broadcast(PG_FUNCTION_ARGS)
 
 	ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
 	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_copy_page);
+Datum
+test_buffer_frame_copy_page(PG_FUNCTION_ARGS)
+{
+	Relation	target_rel;
+	Relation	source_rel;
+	Buffer		target;
+	Buffer		source;
+
+	target = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1),
+							  &target_rel);
+	source = read_test_buffer(PG_GETARG_OID(2), PG_GETARG_INT32(3),
+							  &source_rel);
+	if (BufferIsLocal(target) || BufferIsLocal(source))
+		elog(ERROR, "test page copy requires shared buffers");
+	if (target == source)
+		elog(ERROR, "test page copy requires distinct buffers");
+
+	lock_test_page_pair(target, source);
+	memcpy(BufferGetPage(target), BufferGetPage(source), BLCKSZ);
+	MarkBufferDirty(target);
+	unlock_test_page_pair(target, source);
+
+	ReleaseBuffer(source);
+	ReleaseBuffer(target);
+	table_close(source_rel, AccessShareLock);
+	table_close(target_rel, AccessShareLock);
+
+	PG_RETURN_BOOL(true);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_attach);
+Datum
+test_buffer_frame_attach(PG_FUNCTION_ARGS)
+{
+	Relation	target_rel;
+	Relation	source_rel;
+	Buffer		target;
+	Buffer		source;
+	BufferTag	source_tag;
+	char	   *action = text_to_cstring(PG_GETARG_TEXT_PP(5));
+
+	if (strcmp(action, "normal") != 0 && strcmp(action, "error") != 0)
+		elog(ERROR, "unknown attach action: %s", action);
+
+	target = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1),
+							  &target_rel);
+	source = read_test_buffer(PG_GETARG_OID(2), PG_GETARG_INT32(3),
+							  &source_rel);
+	if (target == source)
+		elog(ERROR, "test-only frame attach requires distinct buffers");
+
+	if (BufferIsLocal(source))
+		ClearBufferTag(&source_tag);
+	else
+		source_tag = GetBufferDescriptor(source - 1)->tag;
+	ReleaseBuffer(source);
+
+	TestOnlyBeginBufferWriteIntent(target);
+	TestOnlyAttachBufferFrame(target, source, &source_tag);
+	run_test_injection_point(PG_GETARG_TEXT_PP(4));
+	if (strcmp(action, "error") == 0)
+		elog(ERROR, "deliberate error after test-only frame attach");
+	TestOnlyEndBufferWriteIntent(target);
+
+	ReleaseBuffer(target);
+	table_close(source_rel, AccessShareLock);
+	table_close(target_rel, AccessShareLock);
+
+	PG_RETURN_BOOL(true);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_detach);
+Datum
+test_buffer_frame_detach(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	Buffer		buffer;
+	char	   *action = text_to_cstring(PG_GETARG_TEXT_PP(4));
+
+	if (strcmp(action, "normal") != 0 && strcmp(action, "error") != 0)
+		elog(ERROR, "unknown detach action: %s", action);
+
+	buffer = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1), &rel);
+	run_test_injection_point(PG_GETARG_TEXT_PP(2));
+	TestOnlyBeginBufferWriteIntent(buffer);
+	TestOnlyDetachBufferFrame(buffer);
+	run_test_injection_point(PG_GETARG_TEXT_PP(3));
+	if (strcmp(action, "error") == 0)
+		elog(ERROR, "deliberate error after test-only frame detach");
+	TestOnlyEndBufferWriteIntent(buffer);
+
+	ReleaseBuffer(buffer);
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_BOOL(true);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_mapping_state);
+Datum
+test_buffer_frame_mapping_state(PG_FUNCTION_ARGS)
+{
+	int32		buffer = PG_GETARG_INT32(0);
+	BufferDesc *buf = get_test_buffer_desc(buffer);
+	BufferFrameId frame_id;
+	uint32		attachments;
+	uint32		home_attachments;
+	uint32		generation;
+	uint32		nonidentity;
+	uint32		buf_state;
+
+	buf_state = LockBufHdr(buf);
+	frame_id = pg_atomic_read_u32(&BufferFrameIds[buf->buf_id]);
+	attachments =
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[frame_id]);
+	home_attachments =
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[buf->buf_id]);
+	generation = pg_atomic_read_u32(&BufferFrameGenerations[buf->buf_id]);
+	nonidentity = pg_atomic_read_u32(BufferNonIdentityFrameCount);
+	UnlockBufHdr(buf, buf_state);
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("%u:%u:%u:%u:%u",
+											  frame_id,
+											  attachments,
+											  home_attachments,
+											  generation,
+											  nonidentity)));
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_evict);
+Datum
+test_buffer_frame_evict(PG_FUNCTION_ARGS)
+{
+	Buffer		buffer = PG_GETARG_INT32(0);
+	bool		flushed;
+
+	if (buffer <= 0 || buffer > NBuffers)
+		elog(ERROR, "invalid shared buffer ID: %d", buffer);
+
+	PG_RETURN_BOOL(EvictUnpinnedBuffer(buffer, &flushed));
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_pressure);
+Datum
+test_buffer_frame_pressure(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	Buffer	   *buffers;
+	BlockNumber block;
+	BlockNumber nblocks;
+	int			npins = NBuffers - 1;
+
+	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
+	nblocks = RelationGetNumberOfBlocks(rel);
+	if (nblocks < (BlockNumber) npins)
+		elog(ERROR,
+			 "test relation has %u blocks, expected at least %d",
+			 nblocks, npins);
+	buffers = palloc(sizeof(Buffer) * npins);
+
+	/*
+	 * Keep NBuffers - 1 pages pinned.  With a test-shared pair consuming two
+	 * protected descriptors, clock sweep must fail after one bounded pass.
+	 * Once the pair is detached, the same request must fit and return
+	 * normally.
+	 */
+	for (block = 0; block < (BlockNumber) npins; block++)
+		buffers[block] = ReadBuffer(rel, block);
+
+	while (block > 0)
+		ReleaseBuffer(buffers[--block]);
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_BOOL(true);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_drop_buffers);
+Datum
+test_buffer_frame_drop_buffers(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	SMgrRelation smgr;
+	ForkNumber	fork = MAIN_FORKNUM;
+	BlockNumber first = 0;
+
+	rel = table_open(PG_GETARG_OID(0), AccessExclusiveLock);
+	smgr = RelationGetSmgr(rel);
+	DropRelationBuffers(smgr, &fork, 1, &first);
+	table_close(rel, AccessExclusiveLock);
+
+	PG_RETURN_BOOL(true);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_private_mutation);
+Datum
+test_buffer_frame_private_mutation(PG_FUNCTION_ARGS)
+{
+	Relation	target_rel;
+	Relation	source_rel;
+	Buffer		target;
+	Buffer		source;
+	unsigned char *target_page;
+	unsigned char *source_page;
+	unsigned char target_byte;
+	unsigned char source_byte;
+	bool		isolated;
+
+	target = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1),
+							  &target_rel);
+	source = read_test_buffer(PG_GETARG_OID(2), PG_GETARG_INT32(3),
+							  &source_rel);
+	if (BufferIsLocal(target) || BufferIsLocal(source))
+		elog(ERROR, "private mutation check requires shared buffers");
+	if (target == source)
+		elog(ERROR, "private mutation check requires distinct buffers");
+
+	lock_test_page_pair(target, source);
+	target_page = (unsigned char *) BufferGetPage(target);
+	source_page = (unsigned char *) BufferGetPage(source);
+	if (target_page == source_page)
+		elog(ERROR, "target still points to source frame");
+
+	target_byte = target_page[BLCKSZ - 1];
+	source_byte = source_page[BLCKSZ - 1];
+	if (target_byte != source_byte)
+		elog(ERROR, "detached target bytes differ from source");
+
+	target_page[BLCKSZ - 1] ^= 0x5a;
+	isolated = source_page[BLCKSZ - 1] == source_byte &&
+		target_page[BLCKSZ - 1] != source_page[BLCKSZ - 1];
+	target_page[BLCKSZ - 1] = target_byte;
+	unlock_test_page_pair(target, source);
+
+	ReleaseBuffer(source);
+	ReleaseBuffer(target);
+	table_close(source_rel, AccessShareLock);
+	table_close(target_rel, AccessShareLock);
+
+	PG_RETURN_BOOL(isolated);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_pages_alias);
+Datum
+test_buffer_frame_pages_alias(PG_FUNCTION_ARGS)
+{
+	Relation	target_rel;
+	Relation	source_rel;
+	Buffer		target;
+	Buffer		source;
+	Page		target_page;
+	Page		source_page;
+	bool		aliased;
+
+	target = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1),
+							  &target_rel);
+	source = read_test_buffer(PG_GETARG_OID(2), PG_GETARG_INT32(3),
+							  &source_rel);
+	if (BufferIsLocal(target) || BufferIsLocal(source))
+		elog(ERROR, "page alias check requires shared buffers");
+	if (target == source)
+		elog(ERROR, "page alias check requires distinct buffers");
+
+	if (target < source)
+	{
+		LockBuffer(target, BUFFER_LOCK_SHARE);
+		LockBuffer(source, BUFFER_LOCK_SHARE);
+	}
+	else
+	{
+		LockBuffer(source, BUFFER_LOCK_SHARE);
+		LockBuffer(target, BUFFER_LOCK_SHARE);
+	}
+
+	target_page = BufferGetPage(target);
+	source_page = BufferGetPage(source);
+	aliased = target_page == source_page &&
+		memcmp(target_page, source_page, BLCKSZ) == 0;
+
+	if (target < source)
+	{
+		LockBuffer(source, BUFFER_LOCK_UNLOCK);
+		LockBuffer(target, BUFFER_LOCK_UNLOCK);
+	}
+	else
+	{
+		LockBuffer(target, BUFFER_LOCK_UNLOCK);
+		LockBuffer(source, BUFFER_LOCK_UNLOCK);
+	}
+
+	ReleaseBuffer(source);
+	ReleaseBuffer(target);
+	table_close(source_rel, AccessShareLock);
+	table_close(target_rel, AccessShareLock);
+
+	PG_RETURN_BOOL(aliased);
 }

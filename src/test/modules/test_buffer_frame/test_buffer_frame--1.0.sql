@@ -56,3 +56,48 @@ CREATE FUNCTION test_buffer_frame_broadcast(int4)
 RETURNS void
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_copy_page(regclass, int4, regclass, int4)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_attach(regclass, int4, regclass, int4, text, text)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_detach(regclass, int4, text, text, text)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_mapping_state(int4)
+RETURNS text
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_evict(int4)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_pressure(regclass)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_drop_buffers(regclass)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_private_mutation(regclass, int4, regclass, int4)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_pages_alias(regclass, int4, regclass, int4)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;

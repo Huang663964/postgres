@@ -575,6 +575,10 @@ static PinBufferResult PinBuffer(BufferDesc *buf,
 static bool PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
+static void LockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
+									 uint32 *a_state, uint32 *b_state);
+static void UnlockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
+									   uint32 a_state, uint32 b_state);
 static ProcNumber BufferWriteIntentOwner(BufferDesc *buf);
 static void ClearBufferWriteIntent(BufferDesc *buf, ProcNumber owner);
 static void WaitBufferWriteIntent(BufferDesc *buf,
@@ -2269,6 +2273,13 @@ InvalidateBuffer(BufferDesc *buf)
 
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
+	if (!BufferHasPrivateFrame(buf))
+	{
+		UnlockBufHdr(buf, buf_state);
+		elog(ERROR,
+			 "cannot invalidate buffer %d while its test-only frame is shared",
+			 BufferDescriptorGetBuffer(buf));
+	}
 	UnlockBufHdr(buf, buf_state);
 
 	/*
@@ -2384,10 +2395,11 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	Assert(BufferTagsEqual(&buf_hdr->tag, &tag));
 
 	/*
-	 * If somebody else pinned the buffer since, or even worse, dirtied it,
-	 * give up on this buffer: It's clearly in use.
+	 * A descriptor using a non-home frame, or a home frame attached to
+	 * another descriptor, must not be reused by clock sweep.
 	 */
-	if (BUF_STATE_GET_REFCOUNT(buf_state) != 1 || (buf_state & BM_DIRTY))
+	if (!BufferHasPrivateFrame(buf_hdr) ||
+		BUF_STATE_GET_REFCOUNT(buf_state) != 1 || (buf_state & BM_DIRTY))
 	{
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 
@@ -3056,6 +3068,10 @@ MarkBufferDirty(Buffer buffer)
 	Assert(BufferIsPinned(buffer));
 	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
 								LW_EXCLUSIVE));
+	if (!BufferHasPrivateFrame(bufHdr))
+		elog(ERROR,
+			 "cannot dirty buffer %d while its test-only frame is shared",
+			 buffer);
 
 	old_buf_state = pg_atomic_read_u32(&bufHdr->state);
 	for (;;)
@@ -3137,6 +3153,46 @@ BufferWriteIntentOwner(BufferDesc *buf)
 {
 	return (ProcNumber)
 		pg_atomic_read_u32(&BufferWriteIntentOwners[buf->buf_id]);
+}
+
+/*
+ * Test-only frame publication takes two buffer header locks.  Keep a single
+ * descriptor-id order so two independent helpers cannot deadlock.
+ */
+static void
+LockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
+						 uint32 *a_state, uint32 *b_state)
+{
+	Assert(a != b);
+
+	if (a->buf_id < b->buf_id)
+	{
+		*a_state = LockBufHdr(a);
+		*b_state = LockBufHdr(b);
+	}
+	else
+	{
+		*b_state = LockBufHdr(b);
+		*a_state = LockBufHdr(a);
+	}
+}
+
+static void
+UnlockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
+						   uint32 a_state, uint32 b_state)
+{
+	Assert(a != b);
+
+	if (a->buf_id < b->buf_id)
+	{
+		UnlockBufHdr(b, b_state);
+		UnlockBufHdr(a, a_state);
+	}
+	else
+	{
+		UnlockBufHdr(a, a_state);
+		UnlockBufHdr(b, b_state);
+	}
 }
 
 /*
@@ -3237,6 +3293,7 @@ void
 TestOnlyBeginBufferWriteIntent(Buffer buffer)
 {
 	BufferDesc *buf;
+	BufferFrameId frame_id;
 	Buffer		other_buffer;
 	ConditionVariable *cv;
 	ProcNumber	owner;
@@ -3285,6 +3342,15 @@ TestOnlyBeginBufferWriteIntent(Buffer buffer)
 	{
 		UnlockBufHdr(buf, buf_state);
 		elog(ERROR, "buffer %d write intent requires a valid, clean, idle buffer",
+			 buffer);
+	}
+	frame_id = pg_atomic_read_u32(&BufferFrameIds[buf->buf_id]);
+	if (frame_id == (BufferFrameId) buf->buf_id &&
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[frame_id]) != 1)
+	{
+		UnlockBufHdr(buf, buf_state);
+		elog(ERROR,
+			 "buffer %d owns a test-shared frame; detach its target descriptor instead",
 			 buffer);
 	}
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
@@ -3368,6 +3434,267 @@ TestOnlyEndBufferWriteIntent(Buffer buffer)
 	ResourceOwnerForget(CurrentResourceOwner, Int32GetDatum(buffer),
 						&buffer_write_intent_resowner_desc);
 	ClearBufferWriteIntent(buf, MyProcNumber);
+}
+
+static const char *
+TestOnlyAttachInvalidReason(BufferDesc *target, BufferDesc *source,
+							uint32 target_state, uint32 source_state,
+							const BufferTag *expected_source_tag)
+{
+	BufferFrameId target_frame;
+	BufferFrameId source_frame;
+
+	if (BUF_STATE_GET_REFCOUNT(target_state) != 1)
+		return "target writer is not the sole pin";
+	if ((target_state & BM_PIN_COUNT_WAITER) == 0 ||
+		BufferWriteIntentOwner(target) != MyProcNumber)
+		return "target write intent is not owned by this backend";
+	if (BUF_STATE_GET_REFCOUNT(source_state) != 0)
+		return "source is pinned";
+	if ((source_state & BM_PIN_COUNT_WAITER) != 0 ||
+		BufferWriteIntentOwner(source) != INVALID_PROC_NUMBER)
+		return "source has a pin waiter or write intent";
+	if ((target_state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT)) !=
+		(BM_VALID | BM_TAG_VALID | BM_PERMANENT) ||
+		(target_state & (BM_DIRTY | BM_JUST_DIRTIED |
+						 BM_IO_IN_PROGRESS)) != 0)
+		return "target is not a valid, clean, idle permanent page";
+	if ((source_state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT)) !=
+		(BM_VALID | BM_TAG_VALID | BM_PERMANENT) ||
+		(source_state & (BM_DIRTY | BM_JUST_DIRTIED |
+						 BM_IO_IN_PROGRESS)) != 0)
+		return "source is not a valid, clean, idle permanent page";
+	if (BufTagGetForkNum(&target->tag) != MAIN_FORKNUM ||
+		BufTagGetForkNum(&source->tag) != MAIN_FORKNUM)
+		return "source and target must use the main fork";
+	if (target->tag.blockNum != source->tag.blockNum)
+		return "source and target must use the same block number";
+	if (!BufferTagsEqual(&source->tag, expected_source_tag))
+		return "source descriptor tag changed";
+
+	target_frame = pg_atomic_read_u32(&BufferFrameIds[target->buf_id]);
+	source_frame = pg_atomic_read_u32(&BufferFrameIds[source->buf_id]);
+	if (target_frame != (BufferFrameId) target->buf_id ||
+		source_frame != (BufferFrameId) source->buf_id)
+		return "source and target mappings must be identity";
+	if (pg_atomic_read_u32(&BufferFrameAttachmentCounts[target->buf_id]) != 1 ||
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[source->buf_id]) != 1)
+		return "source and target frames must be private";
+	if (memcmp(BufferBlocks + ((Size) target->buf_id * BLCKSZ),
+			   BufferBlocks + ((Size) source->buf_id * BLCKSZ),
+			   BLCKSZ) != 0)
+		return "source and target page bytes differ";
+
+	return NULL;
+}
+
+/*
+ * Establish one explicit test-only shared mapping.  The target's home frame is
+ * reserved, not placed on a free list.  The 8kB comparison runs while both
+ * header locks are held because the source is intentionally unpinned and no
+ * extra reservation state exists in this minimal proof.
+ */
+void
+TestOnlyAttachBufferFrame(Buffer target_buffer, Buffer source_buffer,
+						  const BufferTag *expected_source_tag)
+{
+	BufferDesc *target;
+	BufferDesc *source;
+	const char *reason;
+	uint32		target_state;
+	uint32		source_state;
+	uint32		old_nonidentity;
+
+	if (!BufferIsValid(target_buffer) || !BufferIsValid(source_buffer))
+		elog(ERROR, "invalid buffer IDs for test-only frame attach");
+	if (BufferIsLocal(target_buffer) || BufferIsLocal(source_buffer))
+		elog(ERROR, "test-only frame attach requires shared buffers");
+	if (target_buffer == source_buffer)
+		elog(ERROR, "test-only frame attach requires distinct buffers");
+	if (expected_source_tag == NULL)
+		elog(ERROR, "test-only frame attach requires an expected source tag");
+	if (RecoveryInProgress())
+		elog(ERROR, "test-only frame attach is not allowed during recovery");
+
+	CheckBufferIsPinnedOnce(target_buffer);
+	if (ActiveBufferWriteIntent != target_buffer)
+		elog(ERROR, "target buffer %d has no active write intent",
+			 target_buffer);
+	if (GetPrivateRefCount(source_buffer) != 0)
+		elog(ERROR, "source buffer %d must not be pinned by this backend",
+			 source_buffer);
+
+	target = GetBufferDescriptor(target_buffer - 1);
+	source = GetBufferDescriptor(source_buffer - 1);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(target)) ||
+		LWLockHeldByMe(BufferDescriptorGetContentLock(source)))
+		elog(ERROR, "test-only frame attach requires no content lock");
+
+	LockBufferDescriptorPair(target, source, &target_state, &source_state);
+	reason = TestOnlyAttachInvalidReason(target, source,
+										 target_state, source_state,
+										 expected_source_tag);
+	if (reason != NULL)
+	{
+		UnlockBufferDescriptorPair(target, source,
+								   target_state, source_state);
+		elog(ERROR, "cannot attach test-only shared frame: %s", reason);
+	}
+
+	/*
+	 * Publish source sharing before the non-identity mapping.  Once the
+	 * global count becomes nonzero, BufferGetBlock() starts consulting every
+	 * mapping.
+	 */
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[source->buf_id], 2);
+	old_nonidentity =
+		pg_atomic_fetch_add_u32(BufferNonIdentityFrameCount, 1);
+	Assert(old_nonidentity < (uint32) NBuffers);
+	pg_write_barrier();
+	pg_atomic_write_u32(&BufferFrameIds[target->buf_id], source->buf_id);
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[target->buf_id], 0);
+	pg_atomic_fetch_add_u32(&BufferFrameGenerations[target->buf_id], 1);
+
+	UnlockBufferDescriptorPair(target, source, target_state, source_state);
+}
+
+static const char *
+TestOnlyDetachInvalidReason(BufferDesc *target, BufferDesc *source,
+							uint32 target_state, uint32 source_state)
+{
+	BufferFrameId target_frame;
+	BufferFrameId source_frame;
+
+	if (BUF_STATE_GET_REFCOUNT(target_state) != 1)
+		return "target writer is not the sole pin";
+	if ((target_state & BM_PIN_COUNT_WAITER) == 0 ||
+		BufferWriteIntentOwner(target) != MyProcNumber)
+		return "target write intent is not owned by this backend";
+	if ((source_state & BM_PIN_COUNT_WAITER) != 0 ||
+		BufferWriteIntentOwner(source) != INVALID_PROC_NUMBER)
+		return "source has a pin waiter or write intent";
+	if ((target_state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT)) !=
+		(BM_VALID | BM_TAG_VALID | BM_PERMANENT) ||
+		(target_state & (BM_DIRTY | BM_JUST_DIRTIED |
+						 BM_IO_IN_PROGRESS)) != 0)
+		return "target is not a valid, clean, idle permanent page";
+	if ((source_state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT)) !=
+		(BM_VALID | BM_TAG_VALID | BM_PERMANENT) ||
+		(source_state & (BM_DIRTY | BM_JUST_DIRTIED |
+						 BM_IO_IN_PROGRESS)) != 0)
+		return "source is not a valid, clean, idle permanent page";
+	if (BufTagGetForkNum(&target->tag) != MAIN_FORKNUM ||
+		BufTagGetForkNum(&source->tag) != MAIN_FORKNUM)
+		return "source and target must use the main fork";
+	if (target->tag.blockNum != source->tag.blockNum)
+		return "source and target must use the same block number";
+
+	target_frame = pg_atomic_read_u32(&BufferFrameIds[target->buf_id]);
+	source_frame = pg_atomic_read_u32(&BufferFrameIds[source->buf_id]);
+	if (target_frame != (BufferFrameId) source->buf_id ||
+		source_frame != (BufferFrameId) source->buf_id)
+		return "shared mapping changed";
+	if (pg_atomic_read_u32(&BufferFrameAttachmentCounts[target->buf_id]) != 0 ||
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[source->buf_id]) != 2)
+		return "shared frame attachment accounting changed";
+
+	return NULL;
+}
+
+/*
+ * Copy a test-shared target back to its reserved home frame.  The target gate
+ * has already drained old target pins.  A shared source content lock keeps the
+ * immutable source bytes stable while readers may remain pinned.
+ */
+void
+TestOnlyDetachBufferFrame(Buffer target_buffer)
+{
+	BufferDesc *target;
+	BufferDesc *source;
+	BufferFrameId source_frame;
+	const char *reason;
+	uint32		target_state;
+	uint32		source_state;
+	uint32		old_nonidentity;
+
+	if (!BufferIsValid(target_buffer))
+		elog(ERROR, "bad buffer ID: %d", target_buffer);
+	if (BufferIsLocal(target_buffer))
+		elog(ERROR, "test-only frame detach requires a shared buffer");
+
+	CheckBufferIsPinnedOnce(target_buffer);
+	if (ActiveBufferWriteIntent != target_buffer)
+		elog(ERROR, "target buffer %d has no active write intent",
+			 target_buffer);
+
+	target = GetBufferDescriptor(target_buffer - 1);
+	source_frame = pg_atomic_read_u32(&BufferFrameIds[target->buf_id]);
+	Assert(source_frame < (BufferFrameId) NBuffers);
+
+	if (source_frame == (BufferFrameId) target->buf_id)
+	{
+		target_state = LockBufHdr(target);
+		if (pg_atomic_read_u32(&BufferFrameIds[target->buf_id]) ==
+			(BufferFrameId) target->buf_id &&
+			pg_atomic_read_u32(&BufferFrameAttachmentCounts[target->buf_id]) == 1)
+		{
+			UnlockBufHdr(target, target_state);
+			return;
+		}
+		UnlockBufHdr(target, target_state);
+		elog(ERROR,
+			 "buffer %d owns a test-shared frame; detach its target descriptor instead",
+			 target_buffer);
+	}
+
+	source = GetBufferDescriptor(source_frame);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(source)))
+		elog(ERROR, "test-only frame detach source content lock is already held");
+
+	LWLockAcquire(BufferDescriptorGetContentLock(source), LW_SHARED);
+
+	LockBufferDescriptorPair(target, source, &target_state, &source_state);
+	reason = TestOnlyDetachInvalidReason(target, source,
+										 target_state, source_state);
+	UnlockBufferDescriptorPair(target, source, target_state, source_state);
+	if (reason != NULL)
+	{
+		LWLockRelease(BufferDescriptorGetContentLock(source));
+		elog(ERROR, "cannot detach test-only shared frame: %s", reason);
+	}
+
+	memcpy(BufferBlocks + ((Size) target->buf_id * BLCKSZ),
+		   BufferBlocks + ((Size) source->buf_id * BLCKSZ),
+		   BLCKSZ);
+
+	LockBufferDescriptorPair(target, source, &target_state, &source_state);
+	reason = TestOnlyDetachInvalidReason(target, source,
+										 target_state, source_state);
+	if (reason != NULL)
+	{
+		UnlockBufferDescriptorPair(target, source,
+								   target_state, source_state);
+		LWLockRelease(BufferDescriptorGetContentLock(source));
+		elog(ERROR,
+			 "cannot publish test-only detached frame after copy: %s", reason);
+	}
+
+	/*
+	 * Make copied bytes and the target home attachment visible before mapping
+	 * publication.  Keep source count at two until the target no longer maps
+	 * it.
+	 */
+	pg_write_barrier();
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[target->buf_id], 1);
+	pg_atomic_write_u32(&BufferFrameIds[target->buf_id], target->buf_id);
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[source->buf_id], 1);
+	old_nonidentity =
+		pg_atomic_fetch_sub_u32(BufferNonIdentityFrameCount, 1);
+	Assert(old_nonidentity > 0);
+	pg_atomic_fetch_add_u32(&BufferFrameGenerations[target->buf_id], 1);
+
+	UnlockBufferDescriptorPair(target, source, target_state, source_state);
+	LWLockRelease(BufferDescriptorGetContentLock(source));
 }
 
 static inline uint32
@@ -3705,13 +4032,16 @@ UnpinBufferNoOwner(BufferDesc *buf)
 		uint32		old_buf_state;
 
 		/*
-		 * Mark buffer non-accessible to Valgrind.
+		 * Mark a private buffer non-accessible to Valgrind.  Frame sharing is
+		 * tracked per descriptor, so marking one shared alias inaccessible
+		 * could invalidate another local alias that is still pinned.
 		 *
 		 * Note that the buffer may have already been marked non-accessible
 		 * within access method code that enforces that buffers are only
 		 * accessed while a buffer lock is held.
 		 */
-		VALGRIND_MAKE_MEM_NOACCESS(BufHdrGetBlock(buf), BLCKSZ);
+		if (BufferHasPrivateFrame(buf))
+			VALGRIND_MAKE_MEM_NOACCESS(BufHdrGetBlock(buf), BLCKSZ);
 
 		/* I'd better not still hold the buffer content lock */
 		Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
@@ -5899,7 +6229,7 @@ void
 MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 {
 	BufferDesc *bufHdr;
-	Page		page = BufferGetPage(buffer);
+	Page		page;
 
 	if (!BufferIsValid(buffer))
 		elog(ERROR, "bad buffer ID: %d", buffer);
@@ -5915,6 +6245,11 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	Assert(GetPrivateRefCount(buffer) > 0);
 	/* here, either share or exclusive lock is OK */
 	Assert(LWLockHeldByMe(BufferDescriptorGetContentLock(bufHdr)));
+	if (!BufferHasPrivateFrame(bufHdr))
+		elog(ERROR,
+			 "cannot dirty buffer %d while its test-only frame is shared",
+			 buffer);
+	page = BufferGetPage(buffer);
 
 	/*
 	 * This routine might get called many times on the same page, if we are

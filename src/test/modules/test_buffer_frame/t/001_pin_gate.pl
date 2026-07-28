@@ -14,9 +14,9 @@ if ($ENV{enable_injection_points} ne 'yes')
 }
 
 my $node = PostgreSQL::Test::Cluster->new('main');
-$node->init;
+$node->init(allows_streaming => 'physical');
 $node->append_conf('postgresql.conf',
-	"shared_preload_libraries = 'injection_points'");
+	"shared_preload_libraries = 'injection_points'\nshared_buffers = '128MB'");
 $node->start;
 $node->safe_psql('postgres', 'CREATE EXTENSION injection_points');
 $node->safe_psql('postgres', 'CREATE EXTENSION test_buffer_frame');
@@ -156,6 +156,24 @@ sub buffer_is_dirty
 		q[SELECT test_buffer_frame_is_dirty('bf_data'::regclass, 0)]);
 }
 
+sub relation_is_dirty
+{
+	my ($relation) = @_;
+
+	return $node->safe_psql(
+		'postgres',
+		"SELECT test_buffer_frame_is_dirty('$relation'::regclass, 0)");
+}
+
+sub mapping_state_for
+{
+	my ($id) = @_;
+
+	return $node->safe_psql(
+		'postgres',
+		"SELECT test_buffer_frame_mapping_state($id)");
+}
+
 sub assert_clean_and_repin
 {
 	my ($label) = @_;
@@ -216,6 +234,18 @@ sub run_two_buffer_failure
 	$psql->quit;
 	assert_clean_and_repin($label);
 	assert_other_clean_and_repin($label);
+}
+
+sub run_sql_failure
+{
+	my ($sql, $error_re, $label) = @_;
+	my ($psql, $pid) = new_background_psql();
+	my ($output, $error) = $psql->query($sql);
+
+	ok($error, "$label: statement fails");
+	like($psql->{stderr}, $error_re, "$label: expected failure");
+	$psql->{stderr} = '';
+	$psql->quit;
 }
 
 assert_clean_and_repin('initial state');
@@ -945,6 +975,515 @@ subtest 'backend termination after Begin clears gate' => sub
 	$writer->{run}->finish;
 	detach_point($writer_point);
 	assert_clean_and_repin('backend termination');
+};
+
+my $target_generation = 0;
+
+sub assert_shared_pair
+{
+	my ($label) = @_;
+
+	is(
+		mapping_state_for($other_buffer_id),
+		"$frame_id:2:0:$target_generation:1",
+		"$label: target maps the source frame and reserves its home");
+	is(
+		mapping_state_for($buffer_id),
+		"$frame_id:2:2:0:1",
+		"$label: source frame has two logical attachments");
+	is(
+		buffer_state_for($other_buffer_id),
+		"-1:f:0:$frame_id",
+		"$label: target gate and pins are clear");
+}
+
+sub assert_private_pair
+{
+	my ($label) = @_;
+
+	is(
+		mapping_state_for($other_buffer_id),
+		"$other_frame_id:1:1:$target_generation:0",
+		"$label: target maps its private home frame");
+	is(
+		mapping_state_for($buffer_id),
+		"$frame_id:1:1:0:0",
+		"$label: source frame has one attachment");
+	is(
+		buffer_state_for($other_buffer_id),
+		"-1:f:0:$other_frame_id",
+		"$label: target gate and pins are clear");
+}
+
+subtest 'shared-frame attach rejects invalid candidates' => sub
+{
+	run_sql_failure(
+		q[SELECT test_buffer_frame_attach(
+			'bf_other'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')],
+		qr/source and target page bytes differ/,
+		'unequal candidate');
+	assert_private_pair('unequal candidate rejection');
+
+	run_sql_failure(
+		q[SELECT test_buffer_frame_attach(
+			'bf_data'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')],
+		qr/requires distinct buffers/,
+		'same descriptor candidate');
+	assert_private_pair('same descriptor rejection');
+
+	my ($temp_psql, $temp_pid) = new_background_psql();
+	$temp_psql->query_safe(
+		'CREATE TEMP TABLE bf_temp(id int); INSERT INTO bf_temp VALUES (1)');
+	my ($temp_output, $temp_error) = $temp_psql->query(
+		q[SELECT test_buffer_frame_attach(
+			'bf_temp'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')]);
+	ok($temp_error, 'local target candidate fails');
+	like(
+		$temp_psql->{stderr},
+		qr/buffer write intent does not support local buffer/,
+		'local target is rejected before publication');
+	$temp_psql->{stderr} = '';
+	$temp_psql->quit;
+	assert_private_pair('local candidate rejection');
+
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_copy_page(
+				'bf_other'::regclass, 0, 'bf_data'::regclass, 0)]),
+		't',
+		'test setup copies equal bytes into the private target');
+	is(relation_is_dirty('bf_other'), 't',
+		'copy setup leaves target dirty');
+	run_sql_failure(
+		q[SELECT test_buffer_frame_attach(
+			'bf_other'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')],
+		qr/write intent requires a valid, clean, idle buffer/,
+		'dirty target candidate');
+	assert_private_pair('dirty candidate rejection');
+
+	$node->safe_psql('postgres', 'CHECKPOINT');
+	is(relation_is_dirty('bf_other'), 'f',
+		'checkpoint makes the equal-byte target eligible');
+};
+
+subtest 'published shared frame is protected and explicitly recoverable' => sub
+{
+	run_sql_failure(
+		q[SELECT test_buffer_frame_attach(
+			'bf_other'::regclass, 0, 'bf_data'::regclass, 0, '', 'error')],
+		qr/deliberate error after test-only frame attach/,
+		'error after attach publication');
+	$target_generation++;
+	assert_shared_pair('error after attach publication');
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_pages_alias(
+				'bf_other'::regclass, 0, 'bf_data'::regclass, 0)]),
+		't',
+		'target and source BufferDescs resolve the same 8kB Page address');
+
+	run_sql_failure(
+		q[SELECT test_buffer_frame_dirty_reader(
+			'bf_other'::regclass, 0, '', '')],
+		qr/cannot dirty buffer \d+ while its test-only frame is shared/,
+		'shared target dirty');
+	run_sql_failure(
+		q[SELECT test_buffer_frame_dirty_reader(
+			'bf_data'::regclass, 0, '', '')],
+		qr/cannot dirty buffer \d+ while its test-only frame is shared/,
+		'shared source dirty');
+	assert_shared_pair('dirty rejection');
+
+	is(
+		$node->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_evict($other_buffer_id)"),
+		'f',
+		'clock sweep cannot evict the non-identity target');
+	is(
+		$node->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_evict($buffer_id)"),
+		'f',
+		'clock sweep cannot evict the attached source frame');
+	run_sql_failure(
+		q[SELECT test_buffer_frame_drop_buffers('bf_other'::regclass)],
+		qr/cannot invalidate buffer \d+ while its test-only frame is shared/,
+		'direct target invalidation');
+	run_sql_failure(
+		q[SELECT test_buffer_frame_drop_buffers('bf_data'::regclass)],
+		qr/cannot invalidate buffer \d+ while its test-only frame is shared/,
+		'direct source invalidation');
+	assert_shared_pair('victim rejection');
+
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_detach(
+				'bf_other'::regclass, 0, '', '', 'normal')]),
+		't',
+		'explicit cleanup detaches after attach-side error');
+	$target_generation++;
+	assert_private_pair('explicit detach cleanup');
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_private_mutation(
+				'bf_other'::regclass, 0, 'bf_data'::regclass, 0)]),
+		't',
+		'transient target-home mutation does not change sibling bytes');
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_private_mutation(
+				'bf_data'::regclass, 0, 'bf_other'::regclass, 0)]),
+		't',
+		'transient source-home mutation does not change detached target bytes');
+	is(relation_is_dirty('bf_other'), 'f',
+		'transient isolation check restores bytes without dirtying target');
+};
+
+subtest 'cancel during target drain preserves the shared mapping' => sub
+{
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_attach(
+				'bf_other'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')]),
+		't',
+		'attach succeeds before cancel test');
+	$target_generation++;
+	assert_shared_pair('cancel test attach');
+
+	my $reader_point = new_point('detach_cancel_reader');
+	attach_point($reader_point, 'wait');
+	my ($reader, $reader_pid) = new_background_psql();
+	my ($writer, $writer_pid) = new_background_psql();
+
+	start_background_query(
+		$reader,
+		'detach_cancel_reader',
+		"SELECT test_buffer_frame_reader('bf_other'::regclass, 0, '$reader_point', '', false)");
+	wait_for_pid_event($reader_pid, $reader_point,
+		'old target reader holds shared-frame pointer');
+	start_background_query(
+		$writer,
+		'detach_cancel_writer',
+		q[SELECT test_buffer_frame_detach(
+			'bf_other'::regclass, 0, '', '', 'normal')]);
+	wait_for_pid_event($writer_pid, 'BufferPin',
+		'detach writer waits for old target pin');
+	is(
+		$node->safe_psql('postgres',
+			"SELECT pg_cancel_backend($writer_pid)"),
+		't',
+		'detach writer cancel signal sent');
+	like(
+		finish_background_query($writer, 'detach_cancel_writer'),
+		qr/canceling statement due to user request/,
+		'detach writer reports cancellation');
+	is(
+		buffer_state_for($other_buffer_id),
+		"-1:f:1:$frame_id",
+		'cancel clears gate while old target reader remains pinned');
+	is(
+		mapping_state_for($other_buffer_id),
+		"$frame_id:2:0:$target_generation:1",
+		'cancel before copy leaves mapping and accounting shared');
+
+	wake_point($reader_point);
+	is(finish_background_query($reader, 'detach_cancel_reader'), '',
+		'old target pointer stays valid after canceled detach');
+	detach_point($reader_point);
+	$reader->quit;
+	$writer->quit;
+
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_detach(
+				'bf_other'::regclass, 0, '', '', 'normal')]),
+		't',
+		'retried detach succeeds');
+	$target_generation++;
+	assert_private_pair('detach retry after cancel');
+};
+
+subtest 'detach drains target readers, admits source readers, and gates new target pins' => sub
+{
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_attach(
+				'bf_other'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')]),
+		't',
+		'attach succeeds before concurrent detach');
+	$target_generation++;
+	assert_shared_pair('concurrent detach attach');
+
+	my $target_reader_point = new_point('detach_old_target');
+	my $source_reader_point = new_point('detach_source_reader');
+	my $writer_point = new_point('detach_after_publish');
+	my $new_reader_point = new_point('detach_new_target');
+	attach_point($target_reader_point, 'wait');
+	attach_point($source_reader_point, 'wait');
+	attach_point($writer_point, 'wait');
+	attach_point($new_reader_point, 'wait');
+
+	my ($target_reader, $target_reader_pid) = new_background_psql();
+	my ($source_reader, $source_reader_pid) = new_background_psql();
+	my ($writer, $writer_pid) = new_background_psql();
+	my ($new_reader, $new_reader_pid) = new_background_psql();
+
+	start_background_query(
+		$target_reader,
+		'detach_old_target',
+		"SELECT test_buffer_frame_reader('bf_other'::regclass, 0, '$target_reader_point', '', false)");
+	start_background_query(
+		$source_reader,
+		'detach_source_reader',
+		"SELECT test_buffer_frame_reader('bf_data'::regclass, 0, '$source_reader_point', '', false)");
+	wait_for_pid_event($target_reader_pid, $target_reader_point,
+		'old target reader holds the source-frame pointer');
+	wait_for_pid_event($source_reader_pid, $source_reader_point,
+		'source reader may remain pinned during detach');
+
+	start_background_query(
+		$writer,
+		'detach_publish_writer',
+		"SELECT test_buffer_frame_detach('bf_other'::regclass, 0, '', '$writer_point', 'normal')");
+	wait_for_pid_event($writer_pid, 'BufferPin',
+		'detach waits only for old target pins');
+	start_background_query(
+		$new_reader,
+		'detach_new_target',
+		"SELECT test_buffer_frame_reader('bf_other'::regclass, 0, '$new_reader_point', '', false)");
+	wait_for_pid_event($new_reader_pid, 'BufferPin',
+		'new target first pin remains gated');
+
+	wake_point($target_reader_point);
+	is(finish_background_query($target_reader, 'detach_old_target'), '',
+		'old target validates its pointer before publication');
+	wait_for_pid_event($writer_pid, $writer_point,
+		'writer copies to home and publishes identity mapping');
+	$target_generation++;
+	is(
+		mapping_state_for($other_buffer_id),
+		"$other_frame_id:1:1:$target_generation:0",
+		'target is private before its gate is cleared');
+	like(
+		buffer_state_for($other_buffer_id),
+		qr/^\d+:t:1:$other_frame_id$/,
+		'detach writer remains sole gated target pin after publication');
+	wait_for_pid_event($new_reader_pid, 'BufferPin',
+		'new target reader cannot cross publication before End');
+
+	wake_point($source_reader_point);
+	is(finish_background_query($source_reader, 'detach_source_reader'), '',
+		'source reader pointer remains valid across target detach');
+	wake_point($writer_point);
+	is(finish_background_query($writer, 'detach_publish_writer'), '',
+		'detach writer clears gate after identity publication');
+	wait_for_pid_event($new_reader_pid, $new_reader_point,
+		'new target reader enters only after End');
+	wake_point($new_reader_point);
+	is(finish_background_query($new_reader, 'detach_new_target'), '',
+		'new target reader observes the private home frame');
+
+	detach_point($target_reader_point);
+	detach_point($source_reader_point);
+	detach_point($writer_point);
+	detach_point($new_reader_point);
+	$target_reader->quit;
+	$source_reader->quit;
+	$writer->quit;
+	$new_reader->quit;
+	assert_private_pair('concurrent detach completion');
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_private_mutation(
+				'bf_other'::regclass, 0, 'bf_data'::regclass, 0)]),
+		't',
+		'detached target mutation remains isolated from source');
+};
+
+subtest 'detach publication survives ERROR and identity cleanup is idempotent' => sub
+{
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_attach(
+				'bf_other'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')]),
+		't',
+		'attach succeeds before detach-side error');
+	$target_generation++;
+	assert_shared_pair('detach-side error attach');
+
+	run_sql_failure(
+		q[SELECT test_buffer_frame_detach(
+			'bf_other'::regclass, 0, '', '', 'error')],
+		qr/deliberate error after test-only frame detach/,
+		'error after detach publication');
+	$target_generation++;
+	assert_private_pair('error after detach publication');
+
+	is(
+		$node->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_detach(
+				'bf_other'::regclass, 0, '', '', 'normal')]),
+		't',
+		'identity detach cleanup is a no-op');
+	assert_private_pair('idempotent identity cleanup');
+};
+
+subtest 'clock sweep skips protected descriptors with bounded progress' => sub
+{
+	my $pressure = PostgreSQL::Test::Cluster->new('buffer_frame_pressure');
+
+	$pressure->init;
+	$pressure->append_conf(
+		'postgresql.conf',
+		"shared_preload_libraries = 'injection_points'\nshared_buffers = '1MB'");
+	$pressure->start;
+	$pressure->safe_psql('postgres', 'CREATE EXTENSION injection_points');
+	$pressure->safe_psql('postgres', 'CREATE EXTENSION test_buffer_frame');
+	$pressure->safe_psql(
+		'postgres', q[
+	CREATE TABLE pressure_source(id int, payload text)
+		WITH (autovacuum_enabled = false);
+	INSERT INTO pressure_source VALUES (1, repeat('x', 200));
+	CREATE TABLE pressure_target(id int, payload text)
+		WITH (autovacuum_enabled = false);
+	INSERT INTO pressure_target VALUES (2, repeat('y', 200));
+	CREATE TABLE pressure_pages(id int, payload text)
+		WITH (autovacuum_enabled = false);
+	INSERT INTO pressure_pages
+	SELECT g, repeat(md5(g::text), 58) FROM generate_series(1, 800) AS g;
+	SELECT test_buffer_frame_copy_page(
+		'pressure_target'::regclass, 0, 'pressure_source'::regclass, 0);
+	CHECKPOINT;
+	]);
+
+	is(
+		$pressure->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_attach(
+				'pressure_target'::regclass, 0,
+				'pressure_source'::regclass, 0, '', 'normal')]),
+		't',
+		'pressure pair attaches');
+	my $pressure_source = $pressure->safe_psql(
+		'postgres',
+		q[SELECT test_buffer_frame_buffer_id('pressure_source'::regclass, 0)]);
+	my $pressure_target = $pressure->safe_psql(
+		'postgres',
+		q[SELECT test_buffer_frame_buffer_id('pressure_target'::regclass, 0)]);
+	my $pressure_source_frame = $pressure_source - 1;
+	like(
+		$pressure->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_mapping_state($pressure_target)"),
+		qr/^\Q$pressure_source_frame\E:2:0:1:1$/,
+		'pressure target is protected by a shared mapping');
+
+	my $pressure_psql = $pressure->background_psql(
+		'postgres',
+		on_error_stop => 0,
+		timeout => $bg_timeout);
+	my ($pressure_output, $pressure_error) = $pressure_psql->query(
+		q[SET statement_timeout = '10s';
+		  SELECT test_buffer_frame_pressure('pressure_pages'::regclass)]);
+	ok($pressure_error, 'protected pool pressure fails');
+	like(
+		$pressure_psql->{stderr},
+		qr/no unpinned buffers available/,
+		'clock sweep terminates instead of reselecting protected descriptors');
+	$pressure_psql->{stderr} = '';
+	$pressure_psql->quit;
+
+	is(
+		$pressure->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_detach(
+				'pressure_target'::regclass, 0, '', '', 'normal')]),
+		't',
+		'pressure target detaches');
+	is(
+		$pressure->safe_psql(
+			'postgres',
+			q[SELECT test_buffer_frame_pressure('pressure_pages'::regclass)]),
+		't',
+		'the same allocation pressure succeeds after detach');
+
+	$pressure->stop;
+};
+
+subtest 'hot standby rejects test-only frame attach' => sub
+{
+	my $backup_name = 'buffer_frame_recovery';
+	my $standby =
+	  PostgreSQL::Test::Cluster->new('buffer_frame_standby');
+
+	$node->backup($backup_name);
+	$standby->init_from_backup($node, $backup_name, has_streaming => 1);
+	$standby->start;
+
+	my $standby_source = $standby->safe_psql(
+		'postgres',
+		q[SELECT test_buffer_frame_buffer_id('bf_data'::regclass, 0)]);
+	my $standby_target = $standby->safe_psql(
+		'postgres',
+		q[SELECT test_buffer_frame_buffer_id('bf_other'::regclass, 0)]);
+	my $standby_source_frame = $standby_source - 1;
+	my $standby_target_frame = $standby_target - 1;
+	my $before_source = $standby->safe_psql(
+		'postgres',
+		"SELECT test_buffer_frame_mapping_state($standby_source)");
+	my $before_target = $standby->safe_psql(
+		'postgres',
+		"SELECT test_buffer_frame_mapping_state($standby_target)");
+	my $standby_psql = $standby->background_psql(
+		'postgres',
+		on_error_stop => 0,
+		timeout => $bg_timeout);
+	my ($output, $error) = $standby_psql->query(
+		q[SELECT test_buffer_frame_attach(
+			'bf_other'::regclass, 0, 'bf_data'::regclass, 0, '', 'normal')]);
+
+	ok($error, 'standby attach fails');
+	like(
+		$standby_psql->{stderr},
+		qr/test-only frame attach is not allowed during recovery/,
+		'standby attach is rejected before publication');
+	$standby_psql->{stderr} = '';
+	$standby_psql->quit;
+
+	is(
+		$before_source,
+		"$standby_source_frame:1:1:0:0",
+		'standby source starts private');
+	is(
+		$before_target,
+		"$standby_target_frame:1:1:0:0",
+		'standby target starts private');
+	is(
+		$standby->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_mapping_state($standby_source)"),
+		$before_source,
+		'standby source mapping is unchanged');
+	is(
+		$standby->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_mapping_state($standby_target)"),
+		$before_target,
+		'standby target mapping and generation are unchanged');
+
+	$standby->stop;
 };
 
 $node->stop;

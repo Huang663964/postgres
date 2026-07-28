@@ -326,6 +326,8 @@ typedef struct WritebackContext
 /* in buf_init.c */
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
+extern PGDLLIMPORT pg_atomic_uint32 *BufferFrameAttachmentCounts;
+extern PGDLLIMPORT pg_atomic_uint32 *BufferFrameGenerations;
 extern PGDLLIMPORT pg_atomic_uint32 *BufferWriteIntentOwners;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 
@@ -349,6 +351,25 @@ static inline Buffer
 BufferDescriptorGetBuffer(const BufferDesc *bdesc)
 {
 	return (Buffer) (bdesc->buf_id + 1);
+}
+
+/*
+ * True when a descriptor points to its reserved home frame and no other
+ * descriptor is attached to that frame.
+ */
+static inline bool
+BufferHasPrivateFrame(const BufferDesc *buf)
+{
+	BufferFrameId frame_id;
+
+	if (pg_atomic_read_u32(BufferNonIdentityFrameCount) == 0)
+		return true;
+
+	frame_id = pg_atomic_read_u32(&BufferFrameIds[buf->buf_id]);
+	Assert(frame_id < (BufferFrameId) NBuffers);
+
+	return frame_id == (BufferFrameId) buf->buf_id &&
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[frame_id]) == 1;
 }
 
 static inline ConditionVariable *
@@ -441,6 +462,9 @@ extern void ScheduleBufferTagForWriteback(WritebackContext *wb_context,
 extern bool StartBufferIO(BufferDesc *buf, bool forInput, bool nowait);
 extern void TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag_bits,
 							  bool forget_owner, bool release_aio);
+extern void TestOnlyAttachBufferFrame(Buffer target, Buffer source,
+									  const BufferTag *expected_source_tag);
+extern void TestOnlyDetachBufferFrame(Buffer target);
 
 
 /* freelist.c */
