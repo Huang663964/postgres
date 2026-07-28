@@ -22,6 +22,7 @@ BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
 pg_atomic_uint32 *BufferFrameIds;
 pg_atomic_uint32 *BufferNonIdentityFrameCount;
+pg_atomic_uint32 *BufferWriteIntentOwners;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
@@ -72,6 +73,7 @@ BufferManagerShmemInit(void)
 	bool		foundBufs,
 				foundDescs,
 				foundFrameIds,
+				foundWriteIntentOwners,
 				foundIOCV,
 				foundBufCkpt;
 	pg_atomic_uint32 *frameMap;
@@ -93,6 +95,11 @@ BufferManagerShmemInit(void)
 						&foundFrameIds);
 	BufferNonIdentityFrameCount = &frameMap[0];
 	BufferFrameIds = &frameMap[1];
+
+	BufferWriteIntentOwners = (pg_atomic_uint32 *)
+		ShmemInitStruct("Buffer Write Intent Owners",
+						mul_size(NBuffers, sizeof(pg_atomic_uint32)),
+						&foundWriteIntentOwners);
 
 	/* Align buffer pool on IO page size boundary. */
 	BufferBlocks = (char *)
@@ -118,11 +125,12 @@ BufferManagerShmemInit(void)
 		ShmemInitStruct("Checkpoint BufferIds",
 						NBuffers * sizeof(CkptSortItem), &foundBufCkpt);
 
-	if (foundDescs || foundFrameIds || foundBufs || foundIOCV || foundBufCkpt)
+	if (foundDescs || foundFrameIds || foundWriteIntentOwners ||
+		foundBufs || foundIOCV || foundBufCkpt)
 	{
 		/* should find all of these, or none of them */
-		Assert(foundDescs && foundFrameIds && foundBufs &&
-			   foundIOCV && foundBufCkpt);
+		Assert(foundDescs && foundFrameIds && foundWriteIntentOwners &&
+			   foundBufs && foundIOCV && foundBufCkpt);
 		/* note: this path is only taken in EXEC_BACKEND case */
 	}
 	else
@@ -142,6 +150,8 @@ BufferManagerShmemInit(void)
 
 			pg_atomic_init_u32(&buf->state, 0);
 			pg_atomic_init_u32(&BufferFrameIds[i], i);
+			pg_atomic_init_u32(&BufferWriteIntentOwners[i],
+							   INVALID_PROC_NUMBER);
 			buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
 
 			buf->buf_id = i;
@@ -165,12 +175,22 @@ BufferManagerShmemInit(void)
 	}
 
 #ifdef USE_ASSERT_CHECKING
+	if (!foundDescs)
 	{
 		int			i;
 
+		/*
+		 * These are initialization invariants, not EXEC_BACKEND attach
+		 * invariants: another backend may have an active write intent (and a
+		 * later test helper may publish a non-identity frame).
+		 */
 		Assert(pg_atomic_read_u32(BufferNonIdentityFrameCount) == 0);
 		for (i = 0; i < NBuffers; i++)
+		{
 			Assert(pg_atomic_read_u32(&BufferFrameIds[i]) == (uint32) i);
+			Assert(pg_atomic_read_u32(&BufferWriteIntentOwners[i]) ==
+				   INVALID_PROC_NUMBER);
+		}
 	}
 #endif
 
@@ -201,6 +221,10 @@ BufferManagerShmemSize(void)
 	/* size of descriptor-to-frame identifiers */
 	size = add_size(size, mul_size((Size) NBuffers + 1,
 								   sizeof(pg_atomic_uint32)));
+
+	/* write-intent owner for each shared buffer */
+	size = add_size(size, mul_size(NBuffers, sizeof(pg_atomic_uint32)));
+	size = add_size(size, PG_CACHE_LINE_SIZE);
 
 	/* size of data pages, plus alignment padding */
 	size = add_size(size, PG_IO_ALIGN_SIZE);

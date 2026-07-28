@@ -72,7 +72,7 @@ StaticAssertDecl(BUF_REFCOUNT_BITS + BUF_USAGECOUNT_BITS + BUF_FLAG_BITS == 32,
 #define BM_IO_IN_PROGRESS		(1U << 26)	/* read or write in progress */
 #define BM_IO_ERROR				(1U << 27)	/* previous I/O failed */
 #define BM_JUST_DIRTIED			(1U << 28)	/* dirtied since write started */
-#define BM_PIN_COUNT_WAITER		(1U << 29)	/* have waiter for sole pin */
+#define BM_PIN_COUNT_WAITER		(1U << 29)	/* pin waiter or write gate */
 #define BM_CHECKPOINT_NEEDED	(1U << 30)	/* must write for checkpoint */
 #define BM_PERMANENT			(1U << 31)	/* permanent buffer (not unlogged,
 											 * or init fork) */
@@ -238,8 +238,10 @@ BufMappingPartitionLockByIndex(uint32 index)
  * We can't physically remove items from a disk page if another backend has
  * the buffer pinned.  Hence, a backend may need to wait for all other pins
  * to go away.  This is signaled by storing its own pgprocno into
- * wait_backend_pgprocno and setting flag bit BM_PIN_COUNT_WAITER.  At present,
- * there can be only one such waiter per buffer.
+ * wait_backend_pgprocno and setting flag bit BM_PIN_COUNT_WAITER.  A test-only
+ * write-intent gate persistently reuses the bit and records its owner in the
+ * BufferWriteIntentOwners side array instead.  At present, there can be only
+ * one waiter or gate per buffer.
  *
  * We use this same struct for local buffer headers, but the locks are not
  * used and not all of the flag bits are useful either. To avoid unnecessary
@@ -324,6 +326,7 @@ typedef struct WritebackContext
 /* in buf_init.c */
 extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
+extern PGDLLIMPORT pg_atomic_uint32 *BufferWriteIntentOwners;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 
 /* in localbuf.c */

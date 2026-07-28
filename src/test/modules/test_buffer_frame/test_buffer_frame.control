@@ -1,0 +1,4 @@
+comment = 'Test shared buffer frame pin gates'
+default_version = '1.0'
+module_pathname = '$libdir/test_buffer_frame'
+relocatable = true

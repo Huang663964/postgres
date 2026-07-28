@@ -61,6 +61,7 @@
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
+#include "utils/injection_point.h"
 #include "utils/memdebug.h"
 #include "utils/ps_status.h"
 #include "utils/rel.h"
@@ -96,6 +97,13 @@ typedef struct PrivateRefCountEntry
 	Buffer		buffer;
 	int32		refcount;
 } PrivateRefCountEntry;
+
+typedef enum PinBufferResult
+{
+	PINBUFFER_INVALID,
+	PINBUFFER_VALID,
+	PINBUFFER_WRITE_GATED
+}			PinBufferResult;
 
 /* 64 bytes, about the size of a cache line on common systems */
 #define REFCOUNT_ARRAY_ENTRIES 8
@@ -218,6 +226,7 @@ static HTAB *PrivateRefCountHash = NULL;
 static int32 PrivateRefCountOverflowed = 0;
 static uint32 PrivateRefCountClock = 0;
 static PrivateRefCountEntry *ReservedRefCountEntry = NULL;
+static Buffer ActiveBufferWriteIntent = InvalidBuffer;
 
 static uint32 MaxProportionalPins;
 
@@ -226,10 +235,13 @@ static PrivateRefCountEntry *NewPrivateRefCountEntry(Buffer buffer);
 static PrivateRefCountEntry *GetPrivateRefCountEntry(Buffer buffer, bool do_move);
 static inline int32 GetPrivateRefCount(Buffer buffer);
 static void ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref);
+static Buffer GetOtherPinnedSharedBuffer(Buffer target);
 
-/* ResourceOwner callbacks to hold in-progress I/Os and buffer pins */
+/* ResourceOwner callbacks to hold in-progress I/Os, write intents and pins */
 static void ResOwnerReleaseBufferIO(Datum res);
 static char *ResOwnerPrintBufferIO(Datum res);
+static void ResOwnerReleaseBufferWriteIntent(Datum res);
+static char *ResOwnerPrintBufferWriteIntent(Datum res);
 static void ResOwnerReleaseBufferPin(Datum res);
 static char *ResOwnerPrintBufferPin(Datum res);
 
@@ -249,6 +261,15 @@ const ResourceOwnerDesc buffer_pin_resowner_desc =
 	.release_priority = RELEASE_PRIO_BUFFER_PINS,
 	.ReleaseResource = ResOwnerReleaseBufferPin,
 	.DebugPrint = ResOwnerPrintBufferPin
+};
+
+static const ResourceOwnerDesc buffer_write_intent_resowner_desc =
+{
+	.name = "buffer write intent",
+	.release_phase = RESOURCE_RELEASE_BEFORE_LOCKS,
+	.release_priority = RELEASE_PRIO_BUFFER_PINS - 1,
+	.ReleaseResource = ResOwnerReleaseBufferWriteIntent,
+	.DebugPrint = ResOwnerPrintBufferWriteIntent
 };
 
 /*
@@ -475,6 +496,42 @@ ForgetPrivateRefCountEntry(PrivateRefCountEntry *ref)
 }
 
 /*
+ * Return a shared buffer other than target that this backend has pinned.
+ */
+static Buffer
+GetOtherPinnedSharedBuffer(Buffer target)
+{
+	PrivateRefCountEntry *ref;
+	int			i;
+
+	for (i = 0; i < REFCOUNT_ARRAY_ENTRIES; i++)
+	{
+		ref = &PrivateRefCountArray[i];
+		if (ref->buffer != InvalidBuffer &&
+			ref->buffer != target &&
+			ref->refcount > 0)
+			return ref->buffer;
+	}
+
+	if (PrivateRefCountOverflowed > 0)
+	{
+		HASH_SEQ_STATUS hstat;
+
+		hash_seq_init(&hstat, PrivateRefCountHash);
+		while ((ref = (PrivateRefCountEntry *) hash_seq_search(&hstat)) != NULL)
+		{
+			if (ref->buffer != target && ref->refcount > 0)
+			{
+				hash_seq_term(&hstat);
+				return ref->buffer;
+			}
+		}
+	}
+
+	return InvalidBuffer;
+}
+
+/*
  * BufferIsPinned
  *		True iff the buffer is pinned (also checks for valid buffer number).
  *
@@ -513,10 +570,15 @@ static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
 										   BlockNumber extend_upto,
 										   Buffer *buffers,
 										   uint32 *extended_by);
-static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
-static void PinBuffer_Locked(BufferDesc *buf);
+static PinBufferResult PinBuffer(BufferDesc *buf,
+								 BufferAccessStrategy strategy);
+static bool PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
 static void UnpinBufferNoOwner(BufferDesc *buf);
+static ProcNumber BufferWriteIntentOwner(BufferDesc *buf);
+static void ClearBufferWriteIntent(BufferDesc *buf, ProcNumber owner);
+static void WaitBufferWriteIntent(BufferDesc *buf,
+								  const BufferTag *expected_tag);
 static void BufferSync(int flags);
 static uint32 WaitBufHdrUnlocked(BufferDesc *buf);
 static int	SyncOneBuffer(int buf_id, bool skip_recently_used,
@@ -734,9 +796,14 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 			 * InvalidateBuffer() if we pinned a random non-matching buffer.
 			 */
 			if (have_private_ref)
-				PinBuffer(bufHdr, NULL);	/* bump pin count */
-			else
-				PinBuffer_Locked(bufHdr);	/* pin for first time */
+			{
+				if (PinBuffer(bufHdr, NULL) == PINBUFFER_WRITE_GATED)
+					elog(ERROR,
+						 "locally pinned buffer %d was unexpectedly write-gated",
+						 recent_buffer);
+			}
+			else if (!PinBuffer_Locked(bufHdr)) /* pin for first time */
+				return false;
 
 			pgBufferUsage.shared_blks_hit++;
 
@@ -2023,12 +2090,13 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	newPartitionLock = BufMappingPartitionLock(newHash);
 
 	/* see if the block is in the buffer pool already */
+retry_lookup:
 	LWLockAcquire(newPartitionLock, LW_SHARED);
 	existing_buf_id = BufTableLookup(&newTag, newHash);
 	if (existing_buf_id >= 0)
 	{
 		BufferDesc *buf;
-		bool		valid;
+		PinBufferResult pin_result;
 
 		/*
 		 * Found it.  Now, pin the buffer so no one can steal it from the
@@ -2037,14 +2105,20 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 */
 		buf = GetBufferDescriptor(existing_buf_id);
 
-		valid = PinBuffer(buf, strategy);
+		pin_result = PinBuffer(buf, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 
+		if (pin_result == PINBUFFER_WRITE_GATED)
+		{
+			WaitBufferWriteIntent(buf, &newTag);
+			goto retry_lookup;
+		}
+
 		*foundPtr = true;
 
-		if (!valid)
+		if (pin_result == PINBUFFER_INVALID)
 		{
 			/*
 			 * We can only get here if (a) someone else is still reading in
@@ -2081,7 +2155,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	if (existing_buf_id >= 0)
 	{
 		BufferDesc *existing_buf_hdr;
-		bool		valid;
+		PinBufferResult pin_result;
 
 		/*
 		 * Got a collision. Someone has already done what we were about to do.
@@ -2105,14 +2179,20 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		existing_buf_hdr = GetBufferDescriptor(existing_buf_id);
 
-		valid = PinBuffer(existing_buf_hdr, strategy);
+		pin_result = PinBuffer(existing_buf_hdr, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
 
+		if (pin_result == PINBUFFER_WRITE_GATED)
+		{
+			WaitBufferWriteIntent(existing_buf_hdr, &newTag);
+			goto retry_lookup;
+		}
+
 		*foundPtr = true;
 
-		if (!valid)
+		if (pin_result == PINBUFFER_INVALID)
 		{
 			/*
 			 * We can only get here if (a) someone else is still reading in
@@ -2370,7 +2450,8 @@ again:
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
 
 	/* Pin the buffer and then release the buffer spinlock */
-	PinBuffer_Locked(buf_hdr);
+	if (!PinBuffer_Locked(buf_hdr))
+		goto again;
 
 	/*
 	 * We shouldn't have any other pins for this buffer.
@@ -2728,6 +2809,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		hash = BufTableHashCode(&tag);
 		partition_lock = BufMappingPartitionLock(hash);
 
+retry_insert:
 		LWLockAcquire(partition_lock, LW_EXCLUSIVE);
 
 		existing_id = BufTableInsert(&tag, hash, victim_buf_hdr->buf_id);
@@ -2751,14 +2833,23 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			BufferDesc *existing_hdr = GetBufferDescriptor(existing_id);
 			Block		buf_block;
 			bool		valid;
+			PinBufferResult pin_result;
 
 			/*
 			 * Pin the existing buffer before releasing the partition lock,
 			 * preventing it from being evicted.
 			 */
-			valid = PinBuffer(existing_hdr, strategy);
+			pin_result = PinBuffer(existing_hdr, strategy);
 
 			LWLockRelease(partition_lock);
+
+			if (pin_result == PINBUFFER_WRITE_GATED)
+			{
+				WaitBufferWriteIntent(existing_hdr, &tag);
+				goto retry_insert;
+			}
+
+			valid = pin_result == PINBUFFER_VALID;
 
 			/*
 			 * The victim buffer we acquired previously is clean and unused,
@@ -3041,6 +3132,269 @@ ReleaseAndReadBuffer(Buffer buffer,
 	return ReadBuffer(relation, blockNum);
 }
 
+static ProcNumber
+BufferWriteIntentOwner(BufferDesc *buf)
+{
+	return (ProcNumber)
+		pg_atomic_read_u32(&BufferWriteIntentOwners[buf->buf_id]);
+}
+
+/*
+ * Wait until buf no longer has a test-only write-intent gate.  Callers have
+ * no pin, so they must revalidate the buffer mapping or tag after return.
+ */
+static void
+WaitBufferWriteIntent(BufferDesc *buf, const BufferTag *expected_tag)
+{
+	Buffer		buffer = BufferDescriptorGetBuffer(buf);
+	ConditionVariable *cv = BufferDescriptorGetIOCV(buf);
+	Buffer		other_buffer;
+	ProcNumber	owner;
+	uint32		buf_state;
+
+#ifdef USE_ASSERT_CHECKING
+	for (uint32 i = 0; i < NUM_BUFFER_PARTITIONS; i++)
+		Assert(!LWLockHeldByMe(BufMappingPartitionLockByIndex(i)));
+#endif
+
+	/*
+	 * Sleep at most once.  Every wake, including a spurious one, returns to
+	 * the caller so it revalidates the mapping or descriptor tag before
+	 * deciding whether to wait again.  This also prevents an old waiter from
+	 * following a descriptor into a later incarnation and gate.
+	 */
+	ConditionVariablePrepareToSleep(cv);
+	buf_state = LockBufHdr(buf);
+	owner = BufferWriteIntentOwner(buf);
+	if (BufferTagsEqual(&buf->tag, expected_tag) &&
+		(buf_state & BM_PIN_COUNT_WAITER) != 0 &&
+		owner != INVALID_PROC_NUMBER)
+	{
+		Assert(owner != MyProcNumber);
+		UnlockBufHdr(buf, buf_state);
+
+		/*
+		 * A backend holding X must not wait for a gate on Y: two such readers
+		 * and two writers can otherwise form a CV wait cycle that
+		 * PostgreSQL's heavyweight-lock deadlock detector cannot see.
+		 */
+		other_buffer = GetOtherPinnedSharedBuffer(buffer);
+		if (other_buffer != InvalidBuffer)
+		{
+			ConditionVariableCancelSleep();
+			elog(ERROR,
+				 "cannot wait for write intent on buffer %d while buffer %d is pinned",
+				 buffer, other_buffer);
+		}
+
+		ConditionVariableSleep(cv, WAIT_EVENT_BUFFER_PIN);
+		INJECTION_POINT("buffer-write-intent-after-foreign-cv-wake", NULL);
+	}
+	else
+		UnlockBufHdr(buf, buf_state);
+	ConditionVariableCancelSleep();
+}
+
+/*
+ * Clear a write intent owned by owner.  ResourceOwner cleanup calls this, so
+ * it must not fail if the intent was already cleared.
+ */
+static void
+ClearBufferWriteIntent(BufferDesc *buf, ProcNumber owner)
+{
+	uint32		buf_state;
+	bool		cleared = false;
+
+	buf_state = LockBufHdr(buf);
+	if (BufferWriteIntentOwner(buf) == owner)
+	{
+		pg_atomic_write_u32(&BufferWriteIntentOwners[buf->buf_id],
+							INVALID_PROC_NUMBER);
+		buf_state &= ~BM_PIN_COUNT_WAITER;
+		cleared = true;
+	}
+	UnlockBufHdr(buf, buf_state);
+
+	if (owner == MyProcNumber &&
+		ActiveBufferWriteIntent == BufferDescriptorGetBuffer(buf))
+		ActiveBufferWriteIntent = InvalidBuffer;
+
+	if (cleared)
+		ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
+}
+
+/*
+ * TestOnlyBeginBufferWriteIntent
+ *
+ * Publish a first-pin gate and wait until this backend owns the only shared
+ * pin.  Callers must invoke this before obtaining a Page or tuple pointer.
+ * That ordering is a caller contract; this test-only API cannot enforce it.
+ *
+ * ponytail: this is only the pin gate.  Add frame allocation and detach to a
+ * test helper that needs them, not to PostgreSQL's production write paths.
+ */
+void
+TestOnlyBeginBufferWriteIntent(Buffer buffer)
+{
+	BufferDesc *buf;
+	Buffer		other_buffer;
+	ConditionVariable *cv;
+	ProcNumber	owner;
+	uint32		buf_state;
+
+	if (!BufferIsValid(buffer))
+		elog(ERROR, "bad buffer ID: %d", buffer);
+	if (BufferIsLocal(buffer))
+		elog(ERROR, "buffer write intent does not support local buffer %d",
+			 buffer);
+
+	CheckBufferIsPinnedOnce(buffer);
+	if (ActiveBufferWriteIntent != InvalidBuffer)
+		elog(ERROR, "backend already has a write intent on buffer %d",
+			 ActiveBufferWriteIntent);
+	other_buffer = GetOtherPinnedSharedBuffer(buffer);
+	if (other_buffer != InvalidBuffer)
+		elog(ERROR,
+			 "buffer write intent on buffer %d requires no other shared pin; buffer %d is pinned",
+			 buffer, other_buffer);
+
+	buf = GetBufferDescriptor(buffer - 1);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		elog(ERROR, "buffer write intent requires no content lock on buffer %d",
+			 buffer);
+
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+
+	buf_state = LockBufHdr(buf);
+	owner = BufferWriteIntentOwner(buf);
+
+	if ((buf_state & BM_PIN_COUNT_WAITER) != 0)
+	{
+		UnlockBufHdr(buf, buf_state);
+		if (owner != INVALID_PROC_NUMBER)
+			elog(ERROR, "buffer %d already has a write intent", buffer);
+		elog(ERROR, "buffer %d already has a pin-count waiter", buffer);
+	}
+	if (owner != INVALID_PROC_NUMBER)
+	{
+		UnlockBufHdr(buf, buf_state);
+		elog(ERROR, "buffer %d has an inconsistent write-intent owner",
+			 buffer);
+	}
+	if ((buf_state & (BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)) != BM_VALID)
+	{
+		UnlockBufHdr(buf, buf_state);
+		elog(ERROR, "buffer %d write intent requires a valid, clean, idle buffer",
+			 buffer);
+	}
+	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
+
+	pg_atomic_write_u32(&BufferWriteIntentOwners[buf->buf_id], MyProcNumber);
+	buf_state |= BM_PIN_COUNT_WAITER;
+	UnlockBufHdr(buf, buf_state);
+
+	ActiveBufferWriteIntent = buffer;
+	ResourceOwnerRemember(CurrentResourceOwner, Int32GetDatum(buffer),
+						  &buffer_write_intent_resowner_desc);
+
+	cv = BufferDescriptorGetIOCV(buf);
+	ConditionVariablePrepareToSleep(cv);
+	for (;;)
+	{
+		buf_state = LockBufHdr(buf);
+		owner = BufferWriteIntentOwner(buf);
+
+		if ((buf_state & BM_PIN_COUNT_WAITER) == 0 ||
+			owner != MyProcNumber)
+		{
+			UnlockBufHdr(buf, buf_state);
+			ConditionVariableCancelSleep();
+			elog(ERROR, "lost write intent on buffer %d", buffer);
+		}
+
+		if (BUF_STATE_GET_REFCOUNT(buf_state) == 1)
+		{
+			if ((buf_state & (BM_VALID | BM_DIRTY | BM_IO_IN_PROGRESS)) !=
+				BM_VALID)
+			{
+				UnlockBufHdr(buf, buf_state);
+				ConditionVariableCancelSleep();
+				elog(ERROR, "buffer %d changed state while draining pins",
+					 buffer);
+			}
+
+			UnlockBufHdr(buf, buf_state);
+			ConditionVariableCancelSleep();
+			return;
+		}
+
+		UnlockBufHdr(buf, buf_state);
+		ConditionVariableSleep(cv, WAIT_EVENT_BUFFER_PIN);
+		INJECTION_POINT("buffer-write-intent-after-cv-wake", NULL);
+	}
+}
+
+/*
+ * End a test-only write intent.  The owner pin must remain held until here.
+ */
+void
+TestOnlyEndBufferWriteIntent(Buffer buffer)
+{
+	BufferDesc *buf;
+	uint32		buf_state;
+
+	if (!BufferIsValid(buffer))
+		elog(ERROR, "bad buffer ID: %d", buffer);
+	if (BufferIsLocal(buffer))
+		elog(ERROR, "buffer write intent does not support local buffer %d",
+			 buffer);
+
+	CheckBufferIsPinnedOnce(buffer);
+	if (ActiveBufferWriteIntent != buffer)
+		elog(ERROR, "buffer %d write intent is not active in this backend",
+			 buffer);
+
+	buf = GetBufferDescriptor(buffer - 1);
+	buf_state = LockBufHdr(buf);
+	if ((buf_state & BM_PIN_COUNT_WAITER) == 0 ||
+		BufferWriteIntentOwner(buf) != MyProcNumber)
+	{
+		UnlockBufHdr(buf, buf_state);
+		elog(ERROR, "buffer %d write intent is not owned by this backend",
+			 buffer);
+	}
+	UnlockBufHdr(buf, buf_state);
+
+	ResourceOwnerForget(CurrentResourceOwner, Int32GetDatum(buffer),
+						&buffer_write_intent_resowner_desc);
+	ClearBufferWriteIntent(buf, MyProcNumber);
+}
+
+static inline uint32
+PinBufferState(uint32 buf_state, BufferAccessStrategy strategy)
+{
+	/* increase refcount */
+	buf_state += BUF_REFCOUNT_ONE;
+
+	if (strategy == NULL)
+	{
+		/* Default case: increase usagecount unless already max. */
+		if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
+			buf_state += BUF_USAGECOUNT_ONE;
+	}
+	else
+	{
+		/*
+		 * Ring buffers shouldn't evict others from pool.  Thus we don't make
+		 * usagecount more than 1.
+		 */
+		if (BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+			buf_state += BUF_USAGECOUNT_ONE;
+	}
+
+	return buf_state;
+}
+
 /*
  * PinBuffer -- make buffer unavailable for replacement.
  *
@@ -3061,27 +3415,35 @@ ReleaseAndReadBuffer(Buffer buffer,
  * Note that ResourceOwnerEnlarge() and ReservePrivateRefCountEntry()
  * must have been done already.
  *
- * Returns true if buffer is BM_VALID, else false.  This provision allows
- * some callers to avoid an extra spinlock cycle.
+ * Returns PINBUFFER_VALID or PINBUFFER_INVALID after pinning.  Returns
+ * PINBUFFER_WRITE_GATED without pinning when a test-only write intent blocks
+ * a first pin; callers must drop any mapping lock, wait, and revalidate.
  */
-static bool
+static PinBufferResult
 PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 {
 	Buffer		b = BufferDescriptorGetBuffer(buf);
-	bool		result;
+	PinBufferResult result;
 	PrivateRefCountEntry *ref;
 
 	Assert(!BufferIsLocal(b));
 	Assert(ReservedRefCountEntry != NULL);
 
 	ref = GetPrivateRefCountEntry(b, true);
+	if (ActiveBufferWriteIntent != InvalidBuffer)
+	{
+		if (ActiveBufferWriteIntent == b)
+			elog(ERROR,
+				 "write-intent owner cannot pin buffer %d again", b);
+		elog(ERROR,
+			 "cannot pin shared buffer %d while write intent is active on buffer %d",
+			 b, ActiveBufferWriteIntent);
+	}
 
 	if (ref == NULL)
 	{
 		uint32		buf_state;
 		uint32		old_buf_state;
-
-		ref = NewPrivateRefCountEntry(b);
 
 		old_buf_state = pg_atomic_read_u32(&buf->state);
 		for (;;)
@@ -3089,31 +3451,48 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 			if (old_buf_state & BM_LOCKED)
 				old_buf_state = WaitBufHdrUnlocked(buf);
 
-			buf_state = old_buf_state;
-
-			/* increase refcount */
-			buf_state += BUF_REFCOUNT_ONE;
-
-			if (strategy == NULL)
+			if ((old_buf_state & BM_PIN_COUNT_WAITER) != 0)
 			{
-				/* Default case: increase usagecount unless already max. */
-				if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
-					buf_state += BUF_USAGECOUNT_ONE;
+				ProcNumber	owner = BufferWriteIntentOwner(buf);
+
+				if (owner == INVALID_PROC_NUMBER)
+				{
+					/*
+					 * A cleanup waiter does not gate new pins.  Pin under the
+					 * header lock so a cleanup-bit-clear followed by write
+					 * gate publication cannot reuse the same state value and
+					 * let this pin cross the new gate via CAS.
+					 */
+					buf_state = LockBufHdr(buf);
+					owner = BufferWriteIntentOwner(buf);
+					if (owner == INVALID_PROC_NUMBER)
+					{
+						buf_state = PinBufferState(buf_state, strategy);
+						result = (buf_state & BM_VALID) != 0 ?
+							PINBUFFER_VALID : PINBUFFER_INVALID;
+						UnlockBufHdr(buf, buf_state);
+
+						VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+						ref = NewPrivateRefCountEntry(b);
+						break;
+					}
+					UnlockBufHdr(buf, buf_state);
+				}
+
+				if (owner == MyProcNumber)
+					elog(ERROR,
+						 "write-intent owner cannot pin buffer %d again", b);
+
+				return PINBUFFER_WRITE_GATED;
 			}
-			else
-			{
-				/*
-				 * Ring buffers shouldn't evict others from pool.  Thus we
-				 * don't make usagecount more than 1.
-				 */
-				if (BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
-					buf_state += BUF_USAGECOUNT_ONE;
-			}
+
+			buf_state = PinBufferState(old_buf_state, strategy);
 
 			if (pg_atomic_compare_exchange_u32(&buf->state, &old_buf_state,
 											   buf_state))
 			{
-				result = (buf_state & BM_VALID) != 0;
+				result = (buf_state & BM_VALID) != 0 ?
+					PINBUFFER_VALID : PINBUFFER_INVALID;
 
 				/*
 				 * Assume that we acquired a buffer pin for the purposes of
@@ -3123,12 +3502,15 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 				 * non-accessible in any case.
 				 */
 				VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+				ref = NewPrivateRefCountEntry(b);
 				break;
 			}
 		}
 	}
 	else
 	{
+		uint32		buf_state;
+
 		/*
 		 * If we previously pinned the buffer, it is likely to be valid, but
 		 * it may not be if StartReadBuffers() was called and
@@ -3144,7 +3526,9 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 		 * that the buffer page is legitimately non-accessible here.  We
 		 * cannot meddle with that.
 		 */
-		result = (pg_atomic_read_u32(&buf->state) & BM_VALID) != 0;
+		buf_state = pg_atomic_read_u32(&buf->state);
+		result = (buf_state & BM_VALID) != 0 ?
+			PINBUFFER_VALID : PINBUFFER_INVALID;
 	}
 
 	ref->refcount++;
@@ -3155,7 +3539,8 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
 
 /*
  * PinBuffer_Locked -- as above, but caller already locked the buffer header.
- * The spinlock is released before return.
+ * The spinlock is released before return.  Returns false without pinning if a
+ * test-only write intent blocks first-time pins.
  *
  * As this function is called with the spinlock held, the caller has to
  * previously call ReservePrivateRefCountEntry() and
@@ -3175,18 +3560,40 @@ PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy)
  * to save a spin lock/unlock cycle, because we need to pin a buffer before
  * its state can change under us.
  */
-static void
+static bool
 PinBuffer_Locked(BufferDesc *buf)
 {
 	Buffer		b;
 	PrivateRefCountEntry *ref;
 	uint32		buf_state;
 
+	b = BufferDescriptorGetBuffer(buf);
+
 	/*
 	 * As explained, We don't expect any preexisting pins. That allows us to
 	 * manipulate the PrivateRefCount after releasing the spinlock
 	 */
-	Assert(GetPrivateRefCountEntry(BufferDescriptorGetBuffer(buf), false) == NULL);
+	Assert(GetPrivateRefCountEntry(b, false) == NULL);
+
+	/*
+	 * Since we hold the buffer spinlock, we can update the buffer state and
+	 * release the lock in one operation.
+	 */
+	buf_state = pg_atomic_read_u32(&buf->state);
+	Assert(buf_state & BM_LOCKED);
+	if (ActiveBufferWriteIntent != InvalidBuffer)
+	{
+		UnlockBufHdr(buf, buf_state);
+		elog(ERROR,
+			 "cannot pin shared buffer %d while write intent is active on buffer %d",
+			 b, ActiveBufferWriteIntent);
+	}
+	if ((buf_state & BM_PIN_COUNT_WAITER) != 0 &&
+		BufferWriteIntentOwner(buf) != INVALID_PROC_NUMBER)
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
 
 	/*
 	 * Buffer can't have a preexisting pin, so mark its page as defined to
@@ -3195,21 +3602,14 @@ PinBuffer_Locked(BufferDesc *buf)
 	 */
 	VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
 
-	/*
-	 * Since we hold the buffer spinlock, we can update the buffer state and
-	 * release the lock in one operation.
-	 */
-	buf_state = pg_atomic_read_u32(&buf->state);
-	Assert(buf_state & BM_LOCKED);
 	buf_state += BUF_REFCOUNT_ONE;
 	UnlockBufHdr(buf, buf_state);
-
-	b = BufferDescriptorGetBuffer(buf);
 
 	ref = NewPrivateRefCountEntry(b);
 	ref->refcount++;
 
 	ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
+	return true;
 }
 
 /*
@@ -3224,6 +3624,9 @@ PinBuffer_Locked(BufferDesc *buf)
 static void
 WakePinCountWaiter(BufferDesc *buf)
 {
+	ProcNumber	write_intent_owner;
+	uint32		buf_state;
+
 	/*
 	 * Acquire the buffer header lock, re-check that there's a waiter. Another
 	 * backend could have unpinned this buffer, and already woken up the
@@ -3234,17 +3637,30 @@ WakePinCountWaiter(BufferDesc *buf)
 	 * BM_PIN_COUNT_WAITER if it stops waiting for a reason other than this
 	 * backend waking it up.
 	 */
-	uint32		buf_state = LockBufHdr(buf);
+	buf_state = LockBufHdr(buf);
+	write_intent_owner = BufferWriteIntentOwner(buf);
 
 	if ((buf_state & BM_PIN_COUNT_WAITER) &&
 		BUF_STATE_GET_REFCOUNT(buf_state) == 1)
 	{
-		/* we just released the last pin other than the waiter's */
-		int			wait_backend_pgprocno = buf->wait_backend_pgprocno;
+		if (write_intent_owner != INVALID_PROC_NUMBER)
+		{
+			/*
+			 * A write-intent gate remains published until End/cleanup. Wake
+			 * its CV waiter without admitting new first-time pins.
+			 */
+			UnlockBufHdr(buf, buf_state);
+			ConditionVariableBroadcast(BufferDescriptorGetIOCV(buf));
+		}
+		else
+		{
+			/* we just released the last pin other than the cleanup waiter's */
+			int			wait_backend_pgprocno = buf->wait_backend_pgprocno;
 
-		buf_state &= ~BM_PIN_COUNT_WAITER;
-		UnlockBufHdr(buf, buf_state);
-		ProcSendSignal(wait_backend_pgprocno);
+			buf_state &= ~BM_PIN_COUNT_WAITER;
+			UnlockBufHdr(buf, buf_state);
+			ProcSendSignal(wait_backend_pgprocno);
+		}
 	}
 	else
 		UnlockBufHdr(buf, buf_state);
@@ -3260,6 +3676,11 @@ static void
 UnpinBuffer(BufferDesc *buf)
 {
 	Buffer		b = BufferDescriptorGetBuffer(buf);
+
+	if (ActiveBufferWriteIntent == b)
+		elog(ERROR,
+			 "write-intent owner must end intent before releasing buffer %d",
+			 b);
 
 	ResourceOwnerForgetBuffer(CurrentResourceOwner, b);
 	UnpinBufferNoOwner(buf);
@@ -3919,7 +4340,7 @@ static int
 SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 {
 	BufferDesc *bufHdr = GetBufferDescriptor(buf_id);
-	int			result = 0;
+	int			result;
 	uint32		buf_state;
 	BufferTag	tag;
 
@@ -3936,6 +4357,8 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 * don't worry because our checkpoint.redo points before log record for
 	 * upcoming changes and so we are not required to write such dirty buffer.
 	 */
+retry_buffer:
+	result = 0;
 	buf_state = LockBufHdr(bufHdr);
 
 	if (BUF_STATE_GET_REFCOUNT(buf_state) == 0 &&
@@ -3961,7 +4384,19 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 * Pin it, share-lock it, write it.  (FlushBuffer will do nothing if the
 	 * buffer is clean by the time we've locked it.)
 	 */
-	PinBuffer_Locked(bufHdr);
+	tag = bufHdr->tag;
+	if (!PinBuffer_Locked(bufHdr))
+	{
+		/*
+		 * A checkpointer must not complete while a buffer selected at the
+		 * checkpoint start remains gated and dirty.  The bgwriter took the
+		 * skip_recently_used return above because a gate always has an owner
+		 * pin, so it remains opportunistic.
+		 */
+		Assert(!skip_recently_used);
+		WaitBufferWriteIntent(bufHdr, &tag);
+		goto retry_buffer;
+	}
 	LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 
 	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
@@ -3996,6 +4431,7 @@ AtEOXact_Buffers(bool isCommit)
 	AtEOXact_LocalBuffers(isCommit);
 
 	Assert(PrivateRefCountOverflowed == 0);
+	Assert(ActiveBufferWriteIntent == InvalidBuffer);
 }
 
 /*
@@ -4020,6 +4456,7 @@ InitBufferManagerAccess(void)
 	MaxProportionalPins = NBuffers / (MaxBackends + NUM_AUXILIARY_PROCS);
 
 	memset(&PrivateRefCountArray, 0, sizeof(PrivateRefCountArray));
+	ActiveBufferWriteIntent = InvalidBuffer;
 
 	hash_ctl.keysize = sizeof(int32);
 	hash_ctl.entrysize = sizeof(PrivateRefCountEntry);
@@ -4984,6 +5421,7 @@ FlushRelationBuffers(Relation rel)
 
 	for (i = 0; i < NBuffers; i++)
 	{
+		BufferTag	wait_tag;
 		uint32		buf_state;
 
 		bufHdr = GetBufferDescriptor(i);
@@ -4999,11 +5437,17 @@ FlushRelationBuffers(Relation rel)
 		ReservePrivateRefCountEntry();
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
+retry_buffer:
 		buf_state = LockBufHdr(bufHdr);
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rel->rd_locator) &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
-			PinBuffer_Locked(bufHdr);
+			wait_tag = bufHdr->tag;
+			if (!PinBuffer_Locked(bufHdr))
+			{
+				WaitBufferWriteIntent(bufHdr, &wait_tag);
+				goto retry_buffer;
+			}
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 			FlushBuffer(bufHdr, srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
@@ -5056,9 +5500,13 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 
 	for (i = 0; i < NBuffers; i++)
 	{
-		SMgrSortArray *srelent = NULL;
+		SMgrSortArray *srelent;
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
+		BufferTag	wait_tag;
 		uint32		buf_state;
+
+retry_buffer:
+		srelent = NULL;
 
 		/*
 		 * As in DropRelationBuffers, an unlocked precheck should be safe and
@@ -5100,7 +5548,12 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srelent->rlocator) &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
-			PinBuffer_Locked(bufHdr);
+			wait_tag = bufHdr->tag;
+			if (!PinBuffer_Locked(bufHdr))
+			{
+				WaitBufferWriteIntent(bufHdr, &wait_tag);
+				goto retry_buffer;
+			}
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 			FlushBuffer(bufHdr, srelent->srel, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
@@ -5309,6 +5762,7 @@ FlushDatabaseBuffers(Oid dbid)
 
 	for (i = 0; i < NBuffers; i++)
 	{
+		BufferTag	wait_tag;
 		uint32		buf_state;
 
 		bufHdr = GetBufferDescriptor(i);
@@ -5324,11 +5778,17 @@ FlushDatabaseBuffers(Oid dbid)
 		ReservePrivateRefCountEntry();
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
+retry_buffer:
 		buf_state = LockBufHdr(bufHdr);
 		if (bufHdr->tag.dbOid == dbid &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
-			PinBuffer_Locked(bufHdr);
+			wait_tag = bufHdr->tag;
+			if (!PinBuffer_Locked(bufHdr))
+			{
+				WaitBufferWriteIntent(bufHdr, &wait_tag);
+				goto retry_buffer;
+			}
 			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_SHARED);
 			FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 			LWLockRelease(BufferDescriptorGetContentLock(bufHdr));
@@ -5405,6 +5865,14 @@ IncrBufferRefCount(Buffer buffer)
 	else
 	{
 		PrivateRefCountEntry *ref;
+
+		if (ActiveBufferWriteIntent == buffer)
+			elog(ERROR,
+				 "write-intent owner cannot pin buffer %d again", buffer);
+		if (ActiveBufferWriteIntent != InvalidBuffer)
+			elog(ERROR,
+				 "cannot pin shared buffer %d while write intent is active on buffer %d",
+				 buffer, ActiveBufferWriteIntent);
 
 		ref = GetPrivateRefCountEntry(buffer, true);
 		Assert(ref != NULL);
@@ -5585,6 +6053,7 @@ UnlockBuffers(void)
 		 * got a cancel/die interrupt before getting the signal.
 		 */
 		if ((buf_state & BM_PIN_COUNT_WAITER) != 0 &&
+			BufferWriteIntentOwner(buf) == INVALID_PROC_NUMBER &&
 			buf->wait_backend_pgprocno == MyProcNumber)
 			buf_state &= ~BM_PIN_COUNT_WAITER;
 
@@ -5705,6 +6174,7 @@ LockBufferForCleanup(Buffer buffer)
 
 	for (;;)
 	{
+		ProcNumber	write_intent_owner;
 		uint32		buf_state;
 
 		/* Try to acquire lock */
@@ -5736,10 +6206,14 @@ LockBufferForCleanup(Buffer buffer)
 			return;
 		}
 		/* Failed, so mark myself as waiting for pincount 1 */
-		if (buf_state & BM_PIN_COUNT_WAITER)
+		write_intent_owner = BufferWriteIntentOwner(bufHdr);
+		if ((buf_state & BM_PIN_COUNT_WAITER) != 0 ||
+			write_intent_owner != INVALID_PROC_NUMBER)
 		{
 			UnlockBufHdr(bufHdr, buf_state);
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			if (write_intent_owner != INVALID_PROC_NUMBER)
+				elog(ERROR, "buffer %d has a pending write intent", buffer);
 			elog(ERROR, "multiple backends attempting to wait for pincount 1");
 		}
 		bufHdr->wait_backend_pgprocno = MyProcNumber;
@@ -5806,6 +6280,7 @@ LockBufferForCleanup(Buffer buffer)
 		 */
 		buf_state = LockBufHdr(bufHdr);
 		if ((buf_state & BM_PIN_COUNT_WAITER) != 0 &&
+			BufferWriteIntentOwner(bufHdr) == INVALID_PROC_NUMBER &&
 			bufHdr->wait_backend_pgprocno == MyProcNumber)
 			buf_state &= ~BM_PIN_COUNT_WAITER;
 		UnlockBufHdr(bufHdr, buf_state);
@@ -6553,6 +7028,21 @@ ResOwnerPrintBufferIO(Datum res)
 }
 
 static void
+ResOwnerReleaseBufferWriteIntent(Datum res)
+{
+	Buffer		buffer = DatumGetInt32(res);
+
+	ClearBufferWriteIntent(GetBufferDescriptor(buffer - 1), MyProcNumber);
+}
+
+static char *
+ResOwnerPrintBufferWriteIntent(Datum res)
+{
+	return psprintf("lost track of buffer write intent on buffer %d",
+					DatumGetInt32(res));
+}
+
+static void
 ResOwnerReleaseBufferPin(Datum res)
 {
 	Buffer		buffer = DatumGetInt32(res);
@@ -6601,7 +7091,8 @@ EvictUnpinnedBufferInternal(BufferDesc *desc, bool *buffer_flushed)
 		return false;
 	}
 
-	PinBuffer_Locked(desc);		/* releases spinlock */
+	if (!PinBuffer_Locked(desc))	/* releases spinlock */
+		return false;
 
 	/* If it was dirty, try to clean it once. */
 	if (buf_state & BM_DIRTY)

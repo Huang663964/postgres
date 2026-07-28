@@ -21,6 +21,67 @@ does not provide shared frames, copy-on-write, a smaller physical frame pool,
 or any cache-capacity benefit.  Non-identity mappings may only be introduced
 by a later test-only helper with an explicit pin-drain protocol.
 
+Test-only Write-intent Pin Gate
+------------------------------
+
+TestOnlyBeginBufferWriteIntent() and TestOnlyEndBufferWriteIntent() provide
+the pin-drain part of that protocol for shared buffers.  They are test-only
+APIs and are not called by normal SQL or PostgreSQL write paths.  Begin
+requires the current backend to hold exactly one local pin on the target, no
+other shared-buffer pin, no content lock, and to observe a valid, clean
+buffer with no I/O in progress.  Local-buffer pins do not conflict.  A
+backend may own only one write intent.  While it is active, the backend may
+not first-pin another shared buffer.  The caller must call Begin before
+obtaining any Page or tuple pointer; the API documents but cannot enforce
+that ordering.
+
+Begin publishes the caller's ProcNumber in an atomic side array while holding
+the buffer header lock, sets BM_PIN_COUNT_WAITER as a persistent first-pin
+gate, registers ResourceOwner cleanup, and waits on the existing per-buffer
+condition variable until the shared pin count is one.  A foreign backend's
+first pin is rejected by the low-level PinBuffer operation.  Mapping-table
+callers release the relevant BufferMapping partition lock, wait on the
+existing condition variable, and restart lookup or insertion before using
+the descriptor.  This avoids sleeping while holding a partition lock and
+avoids trusting the tag or page of an unpinned descriptor.  A foreign backend
+that already has a local pin may take another local reference, since that
+does not increase the shared pin count.  The write-intent owner may not take
+a nested pin or release its sole pin; it must call End first.  A second
+write-intent owner and a cleanup-lock waiter fail immediately instead of both
+waiting with pins.
+
+Strict buffer scans used by FlushRelationBuffers(),
+FlushRelationsAllBuffers(), FlushDatabaseBuffers(), and the checkpointer wait
+for a gated dirty buffer and retry the same descriptor, rechecking its tag and
+state.  Eviction and background-writer paths remain opportunistic and may skip
+a gated buffer.  A backend that already pins another shared buffer fails
+instead of waiting for a foreign gate, preventing cross-buffer CV wait cycles.
+Every condition-variable wake returns to the outer lookup or descriptor scan
+for revalidation, including after spurious broadcasts.
+
+End first removes the ResourceOwner entry, then clears the owner and gate
+under the header lock and broadcasts the condition variable.  Error,
+cancel, abort, and backend-exit cleanup clears and broadcasts the gate before
+the owner's ordinary buffer pin is released.  The existing cleanup-lock
+waiter continues to use wait_backend_pgprocno and process signals; an invalid
+write-intent owner distinguishes that transient use of BM_PIN_COUNT_WAITER.
+
+The direct AIO pin is derived from a backend that already holds a pin and has
+started input on an invalid buffer or output on a dirty buffer; it is not a
+new first-time backend pin.  It increments the shared pin count and its
+release uses the same wake path, so Begin cannot return while that AIO pin
+remains.  A foreign old-pin backend can still dirty or start output while
+Begin drains.  Begin therefore checks valid, clean, no-I/O both when it
+publishes and when the shared pin count reaches one, failing closed if that
+state did not converge.  The normal AIO ownership path itself does not use
+this gate.
+
+This phase never allocates, copies, or switches a frame mapping.  In current
+tests BufferFrameIds remains identity.  A later test-only detach helper may
+call Begin after a descriptor has been mapped to a shared source frame; Begin
+therefore does not require an identity mapping.  Production write paths must
+not rely on this API.
+
 There are two separate access control mechanisms for shared disk buffers:
 reference counts (a/k/a pin counts) and buffer content locks.  (Actually,
 there's a third level of access control: one must hold the appropriate kind
