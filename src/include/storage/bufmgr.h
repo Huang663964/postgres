@@ -345,6 +345,14 @@ extern void FreeAccessStrategy(BufferAccessStrategy strategy);
 
 #ifndef FRONTEND
 
+#include "port/atomics.h"
+
+typedef uint32 BufferFrameId;
+
+/* in buf_init.c */
+extern PGDLLIMPORT pg_atomic_uint32 *BufferFrameIds;
+extern PGDLLIMPORT pg_atomic_uint32 *BufferNonIdentityFrameCount;
+
 /*
  * BufferIsValid
  *		True iff the given buffer number is valid (either as a shared
@@ -383,12 +391,20 @@ BufferIsValid(Buffer bufnum)
 static inline Block
 BufferGetBlock(Buffer buffer)
 {
+	BufferFrameId frame_id;
+
 	Assert(BufferIsValid(buffer));
 
 	if (BufferIsLocal(buffer))
 		return LocalBufferBlockPointers[-buffer - 1];
+
+	if (pg_atomic_read_u32(BufferNonIdentityFrameCount) == 0)
+		frame_id = buffer - 1;
 	else
-		return (Block) (BufferBlocks + ((Size) (buffer - 1)) * BLCKSZ);
+		frame_id = pg_atomic_read_u32(&BufferFrameIds[buffer - 1]);
+	Assert(frame_id < (BufferFrameId) NBuffers);
+
+	return (Block) (BufferBlocks + ((Size) frame_id) * BLCKSZ);
 }
 
 /*

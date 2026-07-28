@@ -3,6 +3,24 @@ src/backend/storage/buffer/README
 Notes About Shared Buffer Access Rules
 ======================================
 
+Buffer Frames and Addresses
+---------------------------
+
+Shared buffer descriptors resolve their page address through BufferFrameIds,
+an atomic side array indexed by buffer ID.  BufferGetBlock() is the single
+address contract for callers with a Buffer, and internal callers with a
+BufferDesc route through the same contract.
+
+For now every mapping is permanently one-to-one: frame ID equals buffer ID.
+A shared non-identity count lets this common case compute the identity address
+without loading a random FrameId entry.  If a later test helper establishes
+any non-identity mapping, the same accessor reads the per-buffer atomic ID.
+Keeping this state outside BufferDesc preserves its cache-line-sized layout.
+Local buffers retain their existing pointer array.  This indirection alone
+does not provide shared frames, copy-on-write, a smaller physical frame pool,
+or any cache-capacity benefit.  Non-identity mappings may only be introduced
+by a later test-only helper with an explicit pin-drain protocol.
+
 There are two separate access control mechanisms for shared disk buffers:
 reference counts (a/k/a pin counts) and buffer content locks.  (Actually,
 there's a third level of access control: one must hold the appropriate kind

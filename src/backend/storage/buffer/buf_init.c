@@ -20,6 +20,8 @@
 
 BufferDescPadded *BufferDescriptors;
 char	   *BufferBlocks;
+pg_atomic_uint32 *BufferFrameIds;
+pg_atomic_uint32 *BufferNonIdentityFrameCount;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
@@ -69,14 +71,28 @@ BufferManagerShmemInit(void)
 {
 	bool		foundBufs,
 				foundDescs,
+				foundFrameIds,
 				foundIOCV,
 				foundBufCkpt;
+	pg_atomic_uint32 *frameMap;
 
 	/* Align descriptors to a cacheline boundary. */
 	BufferDescriptors = (BufferDescPadded *)
 		ShmemInitStruct("Buffer Descriptors",
 						NBuffers * sizeof(BufferDescPadded),
 						&foundDescs);
+
+	/*
+	 * ponytail: keep NFrames == NBuffers; add an allocator only when
+	 * descriptors must outnumber physical frames.
+	 */
+	frameMap = (pg_atomic_uint32 *)
+		ShmemInitStruct("Buffer Frame IDs",
+						mul_size((Size) NBuffers + 1,
+								 sizeof(pg_atomic_uint32)),
+						&foundFrameIds);
+	BufferNonIdentityFrameCount = &frameMap[0];
+	BufferFrameIds = &frameMap[1];
 
 	/* Align buffer pool on IO page size boundary. */
 	BufferBlocks = (char *)
@@ -102,15 +118,18 @@ BufferManagerShmemInit(void)
 		ShmemInitStruct("Checkpoint BufferIds",
 						NBuffers * sizeof(CkptSortItem), &foundBufCkpt);
 
-	if (foundDescs || foundBufs || foundIOCV || foundBufCkpt)
+	if (foundDescs || foundFrameIds || foundBufs || foundIOCV || foundBufCkpt)
 	{
 		/* should find all of these, or none of them */
-		Assert(foundDescs && foundBufs && foundIOCV && foundBufCkpt);
+		Assert(foundDescs && foundFrameIds && foundBufs &&
+			   foundIOCV && foundBufCkpt);
 		/* note: this path is only taken in EXEC_BACKEND case */
 	}
 	else
 	{
 		int			i;
+
+		pg_atomic_init_u32(BufferNonIdentityFrameCount, 0);
 
 		/*
 		 * Initialize all the buffer headers.
@@ -122,6 +141,7 @@ BufferManagerShmemInit(void)
 			ClearBufferTag(&buf->tag);
 
 			pg_atomic_init_u32(&buf->state, 0);
+			pg_atomic_init_u32(&BufferFrameIds[i], i);
 			buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
 
 			buf->buf_id = i;
@@ -143,6 +163,16 @@ BufferManagerShmemInit(void)
 		/* Correct last entry of linked list */
 		GetBufferDescriptor(NBuffers - 1)->freeNext = FREENEXT_END_OF_LIST;
 	}
+
+#ifdef USE_ASSERT_CHECKING
+	{
+		int			i;
+
+		Assert(pg_atomic_read_u32(BufferNonIdentityFrameCount) == 0);
+		for (i = 0; i < NBuffers; i++)
+			Assert(pg_atomic_read_u32(&BufferFrameIds[i]) == (uint32) i);
+	}
+#endif
 
 	/* Init other shared buffer-management stuff */
 	StrategyInitialize(!foundDescs);
@@ -167,6 +197,10 @@ BufferManagerShmemSize(void)
 	size = add_size(size, mul_size(NBuffers, sizeof(BufferDescPadded)));
 	/* to allow aligning buffer descriptors */
 	size = add_size(size, PG_CACHE_LINE_SIZE);
+
+	/* size of descriptor-to-frame identifiers */
+	size = add_size(size, mul_size((Size) NBuffers + 1,
+								   sizeof(pg_atomic_uint32)));
 
 	/* size of data pages, plus alignment padding */
 	size = add_size(size, PG_IO_ALIGN_SIZE);
