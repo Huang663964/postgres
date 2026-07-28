@@ -3503,7 +3503,7 @@ TestOnlyAttachBufferFrame(Buffer target_buffer, Buffer source_buffer,
 	const char *reason;
 	uint32		target_state;
 	uint32		source_state;
-	uint32		old_nonidentity;
+	uint32		old_nonidentity PG_USED_FOR_ASSERTS_ONLY;
 
 	if (!BufferIsValid(target_buffer) || !BufferIsValid(source_buffer))
 		elog(ERROR, "invalid buffer IDs for test-only frame attach");
@@ -3615,7 +3615,7 @@ TestOnlyDetachBufferFrame(Buffer target_buffer)
 	const char *reason;
 	uint32		target_state;
 	uint32		source_state;
-	uint32		old_nonidentity;
+	uint32		old_nonidentity PG_USED_FOR_ASSERTS_ONLY;
 
 	if (!BufferIsValid(target_buffer))
 		elog(ERROR, "bad buffer ID: %d", target_buffer);
