@@ -64,10 +64,14 @@ ORDER BY 1, 2;
  pg_class                | relacl        | aclitem[]
  pg_class                | reloptions    | text[]
  pg_class                | relpartbound  | pg_node_tree
+ pg_dbbranch             | clone_result  | text
+ pg_dbbranch             | failure       | text
+ pg_dbbranch             | replay_method | text
+ pg_dbbranch             | status        | text
  pg_largeobject          | data          | bytea
  pg_largeobject_metadata | lomacl        | aclitem[]
  pg_replication_origin   | roname        | text
-(11 rows)
+(15 rows)
 
 -- system catalogs without primary keys
 --
