@@ -248,8 +248,104 @@ sub run_sql_failure
 	$psql->quit;
 }
 
+sub measurement_locator
+{
+	my ($relation) = @_;
+
+	return $node->safe_psql(
+		'postgres',
+		qq[
+SELECT database.oid || '::oid,' ||
+       CASE WHEN class.reltablespace = 0
+            THEN database.dattablespace
+            ELSE class.reltablespace
+       END || '::oid,' ||
+       pg_relation_filenode(class.oid) || '::oid,0::int2,0::int8'
+FROM pg_class class
+CROSS JOIN pg_database database
+WHERE class.oid = '$relation'::regclass
+  AND database.datname = current_database()
+]);
+}
+
 assert_clean_and_repin('initial state');
 assert_other_clean_and_repin('initial state');
+
+subtest 'measurement helper rechecks tags, clean state, and full page content' => sub
+{
+	$node->safe_psql(
+		'postgres', q[
+CREATE TABLE bf_measure_a(id int, payload text)
+	WITH (autovacuum_enabled = false);
+INSERT INTO bf_measure_a VALUES (1, repeat('m', 200));
+CREATE TABLE bf_measure_b(id int, payload text)
+	WITH (autovacuum_enabled = false);
+INSERT INTO bf_measure_b VALUES (2, repeat('n', 200));
+SELECT test_buffer_frame_copy_page(
+	'bf_measure_b'::regclass, 0, 'bf_measure_a'::regclass, 0);
+CHECKPOINT;
+]);
+	my $first_id = $node->safe_psql(
+		'postgres',
+		q[SELECT test_buffer_frame_buffer_id('bf_measure_a'::regclass, 0)]);
+	my $second_id = $node->safe_psql(
+		'postgres',
+		q[SELECT test_buffer_frame_buffer_id('bf_measure_b'::regclass, 0)]);
+	my $first = "$first_id," . measurement_locator('bf_measure_a');
+	my $second = "$second_id," . measurement_locator('bf_measure_b');
+	my $stale = measurement_locator('bf_measure_a');
+	$stale =~ s/,0::int8\z/,1::int8/;
+	my $first_digest = $node->safe_psql(
+		'postgres',
+		"SELECT test_buffer_frame_page_digest($first)");
+	my $second_digest = $node->safe_psql(
+		'postgres',
+		"SELECT test_buffer_frame_page_digest($second)");
+
+	is($first_digest, $second_digest,
+		'copied clean pages have the same digest');
+	is(
+		$node->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_pages_equal_by_tag($first, $second)"),
+		't',
+		'equal digest is confirmed by a full BLCKSZ comparison');
+	is(
+		$node->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_page_digest($first_id,$stale)"),
+		'',
+		'stale block tag returns NULL');
+
+	$node->safe_psql(
+		'postgres',
+		q[UPDATE bf_measure_b SET payload = repeat('z', 200); CHECKPOINT;]);
+	$second_id = $node->safe_psql(
+		'postgres',
+		q[SELECT test_buffer_frame_buffer_id('bf_measure_b'::regclass, 0)]);
+	$second = "$second_id," . measurement_locator('bf_measure_b');
+	$second_digest = $node->safe_psql(
+		'postgres',
+		"SELECT test_buffer_frame_page_digest($second)");
+	isnt($first_digest, $second_digest, 'diverged page digest changes');
+	is(
+		$node->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_pages_equal_by_tag($first, $second)"),
+		'f',
+		'full comparison rejects diverged content');
+
+	$node->safe_psql(
+		'postgres',
+		q[UPDATE bf_measure_b SET payload = repeat('q', 200);]);
+	is(
+		$node->safe_psql(
+			'postgres',
+			"SELECT test_buffer_frame_page_digest($second)"),
+		'',
+		'dirty page is excluded');
+	$node->safe_psql('postgres', 'CHECKPOINT');
+};
 
 subtest 'old reader drains while new first pin remains gated' => sub
 {

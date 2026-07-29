@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "common/hashfn.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/buf_internals.h"
@@ -57,6 +58,73 @@ get_test_buffer_desc(int32 buffer)
 	return GetBufferDescriptor(buffer - 1);
 }
 
+static bool
+pin_test_buffer_by_tag(FunctionCallInfo fcinfo, int first_arg, Buffer *buffer)
+{
+	int32		buffer_id = PG_GETARG_INT32(first_arg);
+	Oid			database = PG_GETARG_OID(first_arg + 1);
+	Oid			tablespace = PG_GETARG_OID(first_arg + 2);
+	Oid			relfilenumber = PG_GETARG_OID(first_arg + 3);
+	int16		fork = PG_GETARG_INT16(first_arg + 4);
+	int64		block = PG_GETARG_INT64(first_arg + 5);
+	RelFileLocator locator;
+
+	if (buffer_id <= 0 || buffer_id > NBuffers)
+		elog(ERROR, "invalid shared buffer ID: %d", buffer_id);
+	if (fork < 0 || fork > MAX_FORKNUM)
+		elog(ERROR, "invalid fork number: %d", fork);
+	if (block < 0 || block > MaxBlockNumber)
+		elog(ERROR, "invalid block number: " INT64_FORMAT, block);
+
+	locator.spcOid = tablespace;
+	locator.dbOid = database;
+	locator.relNumber = relfilenumber;
+	*buffer = (Buffer) buffer_id;
+
+	return ReadRecentBuffer(locator, (ForkNumber) fork, (BlockNumber) block,
+							*buffer);
+}
+
+static void
+lock_test_page_pair_shared(Buffer first, Buffer second)
+{
+	if (first < second)
+	{
+		LockBuffer(first, BUFFER_LOCK_SHARE);
+		LockBuffer(second, BUFFER_LOCK_SHARE);
+	}
+	else
+	{
+		LockBuffer(second, BUFFER_LOCK_SHARE);
+		LockBuffer(first, BUFFER_LOCK_SHARE);
+	}
+}
+
+static void
+unlock_test_page_pair_shared(Buffer first, Buffer second)
+{
+	if (first < second)
+	{
+		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+		LockBuffer(first, BUFFER_LOCK_UNLOCK);
+	}
+	else
+	{
+		LockBuffer(first, BUFFER_LOCK_UNLOCK);
+		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+	}
+}
+
+static bool
+test_buffer_is_dirty(Buffer buffer)
+{
+	BufferDesc *desc;
+
+	Assert(BufferIsValid(buffer) && !BufferIsLocal(buffer));
+	desc = GetBufferDescriptor(buffer - 1);
+	return (pg_atomic_read_u32(&desc->state) & BM_DIRTY) != 0;
+}
+
 static void
 lock_test_page_pair(Buffer target, Buffer source)
 {
@@ -99,6 +167,64 @@ test_buffer_frame_buffer_id(PG_FUNCTION_ARGS)
 	table_close(rel, AccessShareLock);
 
 	PG_RETURN_INT32(buffer);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_page_digest);
+Datum
+test_buffer_frame_page_digest(PG_FUNCTION_ARGS)
+{
+	Buffer		buffer;
+	uint64		digest;
+	bool		clean;
+
+	if (!pin_test_buffer_by_tag(fcinfo, 0, &buffer))
+		PG_RETURN_NULL();
+
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	clean = !test_buffer_is_dirty(buffer);
+	if (clean)
+		digest = hash_bytes_extended((unsigned char *) BufferGetPage(buffer),
+									 BLCKSZ, 0);
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buffer);
+
+	if (!clean)
+		PG_RETURN_NULL();
+	PG_RETURN_INT64((int64) digest);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_pages_equal_by_tag);
+Datum
+test_buffer_frame_pages_equal_by_tag(PG_FUNCTION_ARGS)
+{
+	Buffer		first;
+	Buffer		second;
+	bool		clean;
+	bool		equal = false;
+
+	if (PG_GETARG_INT32(0) == PG_GETARG_INT32(6))
+		elog(ERROR, "page comparison requires distinct buffers");
+	if (!pin_test_buffer_by_tag(fcinfo, 0, &first))
+		PG_RETURN_NULL();
+	if (!pin_test_buffer_by_tag(fcinfo, 6, &second))
+	{
+		ReleaseBuffer(first);
+		PG_RETURN_NULL();
+	}
+
+	lock_test_page_pair_shared(first, second);
+	clean = !test_buffer_is_dirty(first) && !test_buffer_is_dirty(second);
+	if (clean)
+		equal = memcmp(BufferGetPage(first), BufferGetPage(second),
+					   BLCKSZ) == 0;
+	unlock_test_page_pair_shared(first, second);
+
+	ReleaseBuffer(second);
+	ReleaseBuffer(first);
+
+	if (!clean)
+		PG_RETURN_NULL();
+	PG_RETURN_BOOL(equal);
 }
 
 PG_FUNCTION_INFO_V1(test_buffer_frame_reader);

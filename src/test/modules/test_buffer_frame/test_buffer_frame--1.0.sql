@@ -7,6 +7,19 @@ RETURNS int4
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
+CREATE FUNCTION test_buffer_frame_page_digest(
+	int4, oid, oid, oid, int2, int8)
+RETURNS int8
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_pages_equal_by_tag(
+	int4, oid, oid, oid, int2, int8,
+	int4, oid, oid, oid, int2, int8)
+RETURNS boolean
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
 CREATE FUNCTION test_buffer_frame_reader(regclass, int4, text, text, boolean)
 RETURNS boolean
 AS 'MODULE_PATHNAME'
