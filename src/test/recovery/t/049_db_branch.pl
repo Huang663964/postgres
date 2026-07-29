@@ -8,7 +8,14 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
-use Time::HiRes qw(usleep);
+
+sub psql_with_branch_lock_timeout
+{
+	my ($node, $dbname, $sql, %params) = @_;
+
+	return $node->psql(
+		$dbname, "SET lock_timeout = '1s';\n$sql", %params);
+}
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init(allows_streaming => 1);
@@ -358,12 +365,12 @@ WHERE datname = 'dbbranch_trigger_drain_source'
 ]), 'active source create trigger waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_trigger_drain_target FROM DATABASE dbbranch_trigger_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create trigger');
-like($stderr, qr/source database "dbbranch_trigger_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create trigger holds db branch writer gate');
 
 $trigger_locker->query_safe(q[COMMIT;]);
@@ -398,12 +405,12 @@ WHERE datname = 'dbbranch_language_drain_source'
 ]), 'active source create language waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_language_drain_target FROM DATABASE dbbranch_language_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create language');
-like($stderr, qr/source database "dbbranch_language_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create language holds db branch writer gate');
 
 $language_locker->query_safe(q[COMMIT;]);
@@ -443,12 +450,12 @@ WHERE datname = 'dbbranch_am_drain_source'
 ]), 'active source create access method waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_am_drain_target FROM DATABASE dbbranch_am_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create access method');
-like($stderr, qr/source database "dbbranch_am_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create access method holds db branch writer gate');
 
 $am_locker->query_safe(q[COMMIT;]);
@@ -490,12 +497,12 @@ WHERE datname = 'dbbranch_transform_drain_source'
 ]), 'active source create transform waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_transform_drain_target FROM DATABASE dbbranch_transform_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create transform');
-like($stderr, qr/source database "dbbranch_transform_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create transform holds db branch writer gate');
 
 $transform_locker->query_safe(q[COMMIT;]);
@@ -548,12 +555,12 @@ WHERE datname = 'dbbranch_rule_drain_source'
 ]), 'active source create rule waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_rule_drain_target FROM DATABASE dbbranch_rule_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create rule');
-like($stderr, qr/source database "dbbranch_rule_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create rule holds db branch writer gate');
 
 $rule_locker->query_safe(q[COMMIT;]);
@@ -594,12 +601,12 @@ WHERE datname = 'dbbranch_view_drain_source'
 ]), 'active source create view waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_view_drain_target FROM DATABASE dbbranch_view_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create view');
-like($stderr, qr/source database "dbbranch_view_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create view holds db branch writer gate');
 
 $view_locker->query_safe(q[COMMIT;]);
@@ -645,12 +652,12 @@ WHERE datname = 'dbbranch_function_drain_source'
 ]), 'active source create function waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_function_drain_target FROM DATABASE dbbranch_function_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create function');
-like($stderr, qr/source database "dbbranch_function_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create function holds db branch writer gate');
 
 $function_locker->query_safe(q[COMMIT;]);
@@ -695,12 +702,12 @@ WHERE datname = 'dbbranch_alter_function_drain_source'
 ]), 'active source alter function waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_function_drain_target FROM DATABASE dbbranch_alter_function_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter function');
-like($stderr, qr/source database "dbbranch_alter_function_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter function holds db branch writer gate');
 
 $alter_function_locker->query_safe(q[COMMIT;]);
@@ -740,12 +747,12 @@ WHERE datname = 'dbbranch_domain_drain_source'
 ]), 'active source create domain waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_domain_drain_target FROM DATABASE dbbranch_domain_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create domain');
-like($stderr, qr/source database "dbbranch_domain_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create domain holds db branch writer gate');
 
 $domain_locker->query_safe(q[COMMIT;]);
@@ -790,12 +797,12 @@ WHERE datname = 'dbbranch_alter_domain_drain_source'
 ]), 'active source alter domain waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_domain_drain_target FROM DATABASE dbbranch_alter_domain_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter domain');
-like($stderr, qr/source database "dbbranch_alter_domain_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter domain holds db branch writer gate');
 
 $alter_domain_locker->query_safe(q[COMMIT;]);
@@ -835,12 +842,12 @@ WHERE datname = 'dbbranch_enum_drain_source'
 ]), 'active source create enum waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_enum_drain_target FROM DATABASE dbbranch_enum_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create enum');
-like($stderr, qr/source database "dbbranch_enum_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create enum holds db branch writer gate');
 
 $enum_locker->query_safe(q[COMMIT;]);
@@ -885,12 +892,12 @@ WHERE datname = 'dbbranch_composite_type_drain_source'
 ]), 'active source create composite type waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_composite_type_drain_target FROM DATABASE dbbranch_composite_type_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create composite type');
-like($stderr, qr/source database "dbbranch_composite_type_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create composite type holds db branch writer gate');
 
 $composite_type_locker->query_safe(q[COMMIT;]);
@@ -930,12 +937,12 @@ WHERE datname = 'dbbranch_range_type_drain_source'
 ]), 'active source create range type waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_range_type_drain_target FROM DATABASE dbbranch_range_type_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create range type');
-like($stderr, qr/source database "dbbranch_range_type_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create range type holds db branch writer gate');
 
 $range_type_locker->query_safe(q[COMMIT;]);
@@ -995,12 +1002,12 @@ WHERE datname = 'dbbranch_alter_type_drain_source'
 ]), 'active source alter type waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_type_drain_target FROM DATABASE dbbranch_alter_type_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter type');
-like($stderr, qr/source database "dbbranch_alter_type_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter type holds db branch writer gate');
 
 $alter_type_locker->query_safe(q[COMMIT;]);
@@ -1045,12 +1052,12 @@ WHERE datname = 'dbbranch_alter_enum_drain_source'
 ]), 'active source alter enum waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_enum_drain_target FROM DATABASE dbbranch_alter_enum_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter enum');
-like($stderr, qr/source database "dbbranch_alter_enum_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter enum holds db branch writer gate');
 
 $alter_enum_locker->query_safe(q[COMMIT;]);
@@ -1095,12 +1102,12 @@ WHERE datname = 'dbbranch_define_drain_source'
 ]), 'active source create collation waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_define_drain_target FROM DATABASE dbbranch_define_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create collation');
-like($stderr, qr/source database "dbbranch_define_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create collation holds db branch writer gate');
 
 $define_locker->query_safe(q[COMMIT;]);
@@ -1145,12 +1152,12 @@ WHERE datname = 'dbbranch_alter_collation_drain_source'
 ]), 'active source alter collation waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_collation_drain_target FROM DATABASE dbbranch_alter_collation_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter collation');
-like($stderr, qr/source database "dbbranch_alter_collation_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter collation holds db branch writer gate');
 
 $alter_collation_locker->query_safe(q[COMMIT;]);
@@ -1190,12 +1197,12 @@ WHERE datname = 'dbbranch_create_sequence_drain_source'
 ]), 'active source create sequence waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_create_sequence_drain_target FROM DATABASE dbbranch_create_sequence_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create sequence');
-like($stderr, qr/source database "dbbranch_create_sequence_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create sequence holds db branch writer gate');
 
 $create_sequence_locker->query_safe(q[COMMIT;]);
@@ -1240,12 +1247,12 @@ WHERE datname = 'dbbranch_sequence_drain_source'
 ]), 'active source alter sequence waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_sequence_drain_target FROM DATABASE dbbranch_sequence_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter sequence');
-like($stderr, qr/source database "dbbranch_sequence_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter sequence holds db branch writer gate');
 
 $sequence_locker->query_safe(q[COMMIT;]);
@@ -1291,12 +1298,12 @@ WHERE datname = 'dbbranch_ctas_drain_source'
 ]), 'active source create table as waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_ctas_drain_target FROM DATABASE dbbranch_ctas_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create table as');
-like($stderr, qr/source database "dbbranch_ctas_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create table as holds db branch writer gate');
 
 $ctas_locker->query_safe(q[COMMIT;]);
@@ -1344,12 +1351,12 @@ WHERE datname = 'dbbranch_refresh_matview_drain_source'
 ]), 'active source refresh materialized view waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_refresh_matview_drain_target FROM DATABASE dbbranch_refresh_matview_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source refresh materialized view');
-like($stderr, qr/source database "dbbranch_refresh_matview_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source refresh materialized view holds db branch writer gate');
 
 $refresh_matview_locker->query_safe(q[COMMIT;]);
@@ -1389,12 +1396,12 @@ WHERE datname = 'dbbranch_conversion_drain_source'
 ]), 'active source create conversion waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_conversion_drain_target FROM DATABASE dbbranch_conversion_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create conversion');
-like($stderr, qr/source database "dbbranch_conversion_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create conversion holds db branch writer gate');
 
 $conversion_locker->query_safe(q[COMMIT;]);
@@ -1441,12 +1448,12 @@ WHERE datname = 'dbbranch_cast_drain_source'
 ]), 'active source create cast waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_cast_drain_target FROM DATABASE dbbranch_cast_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create cast');
-like($stderr, qr/source database "dbbranch_cast_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create cast holds db branch writer gate');
 
 $cast_locker->query_safe(q[COMMIT;]);
@@ -1491,12 +1498,12 @@ WHERE datname = 'dbbranch_opclass_drain_source'
 ]), 'active source create operator class waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_opclass_drain_target FROM DATABASE dbbranch_opclass_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create operator class');
-like($stderr, qr/source database "dbbranch_opclass_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create operator class holds db branch writer gate');
 
 $opclass_locker->query_safe(q[COMMIT;]);
@@ -1548,12 +1555,12 @@ WHERE datname = 'dbbranch_operator_drain_source'
 ]), 'active source alter operator waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_operator_drain_target FROM DATABASE dbbranch_operator_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter operator');
-like($stderr, qr/source database "dbbranch_operator_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter operator holds db branch writer gate');
 
 $operator_locker->query_safe(q[COMMIT;]);
@@ -1599,12 +1606,12 @@ WHERE datname = 'dbbranch_opfamily_drain_source'
 ]), 'active source create operator family waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_opfamily_drain_target FROM DATABASE dbbranch_opfamily_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create operator family');
-like($stderr, qr/source database "dbbranch_opfamily_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create operator family holds db branch writer gate');
 
 $opfamily_locker->query_safe(q[COMMIT;]);
@@ -1649,12 +1656,12 @@ WHERE datname = 'dbbranch_alter_opfamily_drain_source'
 ]), 'active source alter operator family waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_opfamily_drain_target FROM DATABASE dbbranch_alter_opfamily_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter operator family');
-like($stderr, qr/source database "dbbranch_alter_opfamily_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter operator family holds db branch writer gate');
 
 $alter_opfamily_locker->query_safe(q[COMMIT;]);
@@ -1704,12 +1711,12 @@ WHERE datname = 'dbbranch_tsdict_drain_source'
 ]), 'active source alter text search dictionary waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_tsdict_drain_target FROM DATABASE dbbranch_tsdict_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter text search dictionary');
-like($stderr, qr/source database "dbbranch_tsdict_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter text search dictionary holds db branch writer gate');
 
 $tsdict_locker->query_safe(q[COMMIT;]);
@@ -1754,12 +1761,12 @@ WHERE datname = 'dbbranch_tsconfig_drain_source'
 ]), 'active source alter text search configuration waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_tsconfig_drain_target FROM DATABASE dbbranch_tsconfig_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter text search configuration');
-like($stderr, qr/source database "dbbranch_tsconfig_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter text search configuration holds db branch writer gate');
 
 $tsconfig_locker->query_safe(q[COMMIT;]);
@@ -1806,12 +1813,12 @@ WHERE datname = 'dbbranch_fdw_drain_source'
 ]), 'active source create foreign data wrapper waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_fdw_drain_target FROM DATABASE dbbranch_fdw_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create foreign data wrapper');
-like($stderr, qr/source database "dbbranch_fdw_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create foreign data wrapper holds db branch writer gate');
 
 $fdw_locker->query_safe(q[COMMIT;]);
@@ -1856,12 +1863,12 @@ WHERE datname = 'dbbranch_alter_fdw_drain_source'
 ]), 'active source alter foreign data wrapper waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_fdw_drain_target FROM DATABASE dbbranch_alter_fdw_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter foreign data wrapper');
-like($stderr, qr/source database "dbbranch_alter_fdw_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter foreign data wrapper holds db branch writer gate');
 
 $alter_fdw_locker->query_safe(q[COMMIT;]);
@@ -1906,12 +1913,12 @@ WHERE datname = 'dbbranch_server_drain_source'
 ]), 'active source create foreign server waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_server_drain_target FROM DATABASE dbbranch_server_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create foreign server');
-like($stderr, qr/source database "dbbranch_server_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create foreign server holds db branch writer gate');
 
 $server_locker->query_safe(q[COMMIT;]);
@@ -1957,12 +1964,12 @@ WHERE datname = 'dbbranch_alter_server_drain_source'
 ]), 'active source alter foreign server waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_server_drain_target FROM DATABASE dbbranch_alter_server_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter foreign server');
-like($stderr, qr/source database "dbbranch_alter_server_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter foreign server holds db branch writer gate');
 
 $alter_server_locker->query_safe(q[COMMIT;]);
@@ -2008,12 +2015,12 @@ WHERE datname = 'dbbranch_user_mapping_drain_source'
 ]), 'active source create user mapping waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_user_mapping_drain_target FROM DATABASE dbbranch_user_mapping_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create user mapping');
-like($stderr, qr/source database "dbbranch_user_mapping_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create user mapping holds db branch writer gate');
 
 $user_mapping_locker->query_safe(q[COMMIT;]);
@@ -2065,12 +2072,12 @@ WHERE datname = 'dbbranch_alter_mapping_drain_source'
 ]), 'active source alter user mapping waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_mapping_drain_target FROM DATABASE dbbranch_alter_mapping_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter user mapping');
-like($stderr, qr/source database "dbbranch_alter_mapping_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter user mapping holds db branch writer gate');
 
 $alter_mapping_locker->query_safe(q[COMMIT;]);
@@ -2122,12 +2129,12 @@ WHERE datname = 'dbbranch_drop_mapping_drain_source'
 ]), 'active source drop user mapping waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_drop_mapping_drain_target FROM DATABASE dbbranch_drop_mapping_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source drop user mapping');
-like($stderr, qr/source database "dbbranch_drop_mapping_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source drop user mapping holds db branch writer gate');
 
 $drop_mapping_locker->query_safe(q[COMMIT;]);
@@ -2178,12 +2185,12 @@ WHERE datname = 'dbbranch_policy_drain_source'
 ]), 'active source create policy waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_policy_drain_target FROM DATABASE dbbranch_policy_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create policy');
-like($stderr, qr/source database "dbbranch_policy_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create policy holds db branch writer gate');
 
 $policy_locker->query_safe(q[COMMIT;]);
@@ -2225,12 +2232,12 @@ WHERE datname = 'dbbranch_alter_policy_drain_source'
 ]), 'active source alter policy waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_policy_drain_target FROM DATABASE dbbranch_alter_policy_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter policy');
-like($stderr, qr/source database "dbbranch_alter_policy_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter policy holds db branch writer gate');
 
 $alter_policy_locker->query_safe(q[COMMIT;]);
@@ -2271,12 +2278,12 @@ WHERE datname = 'dbbranch_rename_drain_source'
 ]), 'active source rename waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_rename_drain_target FROM DATABASE dbbranch_rename_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source rename');
-like($stderr, qr/source database "dbbranch_rename_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source rename holds db branch writer gate');
 
 $rename_locker->query_safe(q[COMMIT;]);
@@ -2311,12 +2318,12 @@ WHERE datname = 'dbbranch_create_schema_drain_source'
 ]), 'active source create schema waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_create_schema_drain_target FROM DATABASE dbbranch_create_schema_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create schema');
-like($stderr, qr/source database "dbbranch_create_schema_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create schema holds db branch writer gate');
 
 $create_schema_locker->query_safe(q[COMMIT;]);
@@ -2363,12 +2370,12 @@ WHERE datname = 'dbbranch_schema_drain_source'
 ]), 'active source set schema waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_schema_drain_target FROM DATABASE dbbranch_schema_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source set schema');
-like($stderr, qr/source database "dbbranch_schema_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source set schema holds db branch writer gate');
 
 $schema_locker->query_safe(q[COMMIT;]);
@@ -2409,12 +2416,12 @@ WHERE datname = 'dbbranch_owner_drain_source'
 ]), 'active source alter schema owner waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_owner_drain_target FROM DATABASE dbbranch_owner_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter schema owner');
-like($stderr, qr/source database "dbbranch_owner_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter schema owner holds db branch writer gate');
 
 $owner_locker->query_safe(q[COMMIT;]);
@@ -2450,12 +2457,12 @@ WHERE datname = 'dbbranch_extension_drain_source'
 ]), 'active source create extension waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_extension_drain_target FROM DATABASE dbbranch_extension_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create extension');
-like($stderr, qr/source database "dbbranch_extension_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create extension holds db branch writer gate');
 
 $extension_locker->query_safe(q[COMMIT;]);
@@ -2501,12 +2508,12 @@ WHERE datname = 'dbbranch_alter_extension_drain_source'
 ]), 'active source alter extension waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_extension_drain_target FROM DATABASE dbbranch_alter_extension_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter extension');
-like($stderr, qr/source database "dbbranch_alter_extension_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter extension holds db branch writer gate');
 
 $alter_extension_locker->query_safe(q[COMMIT;]);
@@ -2557,12 +2564,12 @@ WHERE datname = 'dbbranch_alter_extension_contents_drain_source'
 ]), 'active source alter extension contents waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_extension_contents_drain_target FROM DATABASE dbbranch_alter_extension_contents_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter extension contents');
-like($stderr, qr/source database "dbbranch_alter_extension_contents_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter extension contents holds db branch writer gate');
 
 $alter_extension_contents_locker->query_safe(q[COMMIT;]);
@@ -2612,12 +2619,12 @@ CREATE EVENT TRIGGER dbbranch_event_trigger_waiter
 ]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_event_trigger_drain_target FROM DATABASE dbbranch_event_trigger_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create event trigger');
-like($stderr, qr/source database "dbbranch_event_trigger_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create event trigger holds db branch writer gate');
 
 $event_trigger_writer->query_safe(q[COMMIT;]);
@@ -2655,12 +2662,12 @@ WHERE datname = 'dbbranch_depends_drain_source'
 ]), 'active source depends on extension waits on source matview lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_depends_drain_target FROM DATABASE dbbranch_depends_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source depends on extension');
-like($stderr, qr/source database "dbbranch_depends_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source depends on extension holds db branch writer gate');
 
 $depends_locker->query_safe(q[COMMIT;]);
@@ -2682,12 +2689,12 @@ my $create_role_writer =
 $create_role_writer->query_safe(q[BEGIN; CREATE ROLE dbbranch_create_role_waiter;]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_create_role_drain_target FROM DATABASE dbbranch_create_role_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create role');
-like($stderr, qr/source database "dbbranch_create_role_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create role holds db branch writer gate');
 
 $create_role_writer->query_safe(q[COMMIT;]);
@@ -2715,12 +2722,12 @@ $grant_role_writer->query_safe(
 	q[BEGIN; GRANT dbbranch_grant_role_parent TO dbbranch_grant_role_member;]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_grant_role_drain_target FROM DATABASE dbbranch_grant_role_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source grant role');
-like($stderr, qr/source database "dbbranch_grant_role_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source grant role holds db branch writer gate');
 
 $grant_role_writer->query_safe(q[COMMIT;]);
@@ -2756,12 +2763,12 @@ WHERE datname = 'dbbranch_default_drain_source'
 ]), 'active source alter default privileges waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_default_drain_target FROM DATABASE dbbranch_default_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter default privileges');
-like($stderr, qr/source database "dbbranch_default_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter default privileges holds db branch writer gate');
 
 $default_locker->query_safe(q[COMMIT;]);
@@ -2805,12 +2812,12 @@ WHERE datname = 'dbbranch_grant_drain_source'
 ]), 'active source grant waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_grant_drain_target FROM DATABASE dbbranch_grant_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source grant');
-like($stderr, qr/source database "dbbranch_grant_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source grant holds db branch writer gate');
 
 $grant_locker->query_safe(q[COMMIT;]);
@@ -2855,12 +2862,12 @@ WHERE datname = 'dbbranch_drop_owned_drain_source'
 ]), 'active source drop owned waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_drop_owned_drain_target FROM DATABASE dbbranch_drop_owned_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source drop owned');
-like($stderr, qr/source database "dbbranch_drop_owned_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source drop owned holds db branch writer gate');
 
 $drop_owned_locker->query_safe(q[COMMIT;]);
@@ -2906,12 +2913,12 @@ WHERE datname = 'dbbranch_reassign_owned_drain_source'
 ]), 'active source reassign owned waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_reassign_owned_drain_target FROM DATABASE dbbranch_reassign_owned_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source reassign owned');
-like($stderr, qr/source database "dbbranch_reassign_owned_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source reassign owned holds db branch writer gate');
 
 $reassign_owned_locker->query_safe(q[COMMIT;]);
@@ -2954,12 +2961,12 @@ WHERE datname = 'dbbranch_comment_drain_source'
 ]), 'active source comment waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_comment_drain_target FROM DATABASE dbbranch_comment_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source comment');
-like($stderr, qr/source database "dbbranch_comment_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source comment holds db branch writer gate');
 
 $comment_locker->query_safe(q[COMMIT;]);
@@ -2987,12 +2994,12 @@ $comment_role_writer->query_safe(
 	q[BEGIN; COMMENT ON ROLE dbbranch_comment_role_waiter IS 'branch role comment';]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_comment_role_drain_target FROM DATABASE dbbranch_comment_role_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source comment role');
-like($stderr, qr/source database "dbbranch_comment_role_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source comment role holds db branch writer gate');
 
 $comment_role_writer->query_safe(q[COMMIT;]);
@@ -3022,12 +3029,12 @@ $seclabel_role_writer->query_safe(
 	q[BEGIN; SECURITY LABEL FOR 'dummy' ON ROLE dbbranch_seclabel_role_waiter IS 'classified';]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_seclabel_role_drain_target FROM DATABASE dbbranch_seclabel_role_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source security label role');
-like($stderr, qr/source database "dbbranch_seclabel_role_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source security label role holds db branch writer gate');
 
 $seclabel_role_writer->query_safe(q[COMMIT;]);
@@ -3070,12 +3077,12 @@ WHERE datname = 'dbbranch_copy_drain_source'
 ]), 'active source copy from waits on source table lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_copy_drain_target FROM DATABASE dbbranch_copy_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source copy from');
-like($stderr, qr/source database "dbbranch_copy_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source copy from holds db branch writer gate');
 
 $copy_locker->query_safe(q[COMMIT;]);
@@ -3093,7 +3100,7 @@ note('DB Branch section: injection-point failure and cleanup paths');
 
 SKIP:
 {
-	skip 'Injection points not supported by this build', 178
+	skip 'Injection points not supported by this build', 182
 	  if ($ENV{enable_injection_points} // '') ne 'yes'
 	  || !$node->check_extension('injection_points');
 
@@ -3114,12 +3121,12 @@ CREATE DATABASE dbbranch_createdb_created;
 	$node->wait_for_event('client backend', 'db-branch-create-database');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_createdb_drain_target FROM DATABASE dbbranch_createdb_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source create database');
-	like($stderr, qr/source database "dbbranch_createdb_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source create database holds db branch writer gate');
 
 	$node->safe_psql('postgres',
@@ -3152,12 +3159,12 @@ DROP DATABASE dbbranch_dropdb_dropped;
 	$node->wait_for_event('client backend', 'db-branch-drop-database');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_dropdb_drain_target FROM DATABASE dbbranch_dropdb_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source drop database');
-	like($stderr, qr/source database "dbbranch_dropdb_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source drop database holds db branch writer gate');
 
 	$node->safe_psql('postgres',
@@ -3190,12 +3197,12 @@ DROP DATABASE dbbranch_dropdb_source_drain_source;
 	my @dropdb_source_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_dropdb_source_drain_target FROM DATABASE dbbranch_dropdb_source_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source database drop');
-	like($stderr, qr/source database "dbbranch_dropdb_source_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source database drop holds db branch writer gate');
 
 	my @dropdb_source_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -3234,12 +3241,12 @@ ALTER DATABASE dbbranch_movedb_drain_source SET TABLESPACE dbbranch_movedb_ts;
 	my @movedb_metadata_before = glob $node->data_dir . '/global/pg_dbbranch_*.state';
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_movedb_drain_target FROM DATABASE dbbranch_movedb_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source database tablespace move');
-	like($stderr, qr/source database "dbbranch_movedb_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source database tablespace move holds db branch writer gate');
 
 	my @movedb_metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -3277,12 +3284,12 @@ CREATE TABLESPACE dbbranch_create_tspc LOCATION '$create_tspc_dir';
 	$node->wait_for_event('client backend', 'db-branch-create-tablespace');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_create_tspc_drain_target FROM DATABASE dbbranch_create_tspc_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source create tablespace');
-	like($stderr, qr/source database "dbbranch_create_tspc_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source create tablespace holds db branch writer gate');
 
 	$node->safe_psql('postgres',
@@ -3319,12 +3326,12 @@ DROP TABLESPACE dbbranch_drop_tspc;
 	$node->wait_for_event('client backend', 'db-branch-drop-tablespace');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_drop_tspc_drain_target FROM DATABASE dbbranch_drop_tspc_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source drop tablespace');
-	like($stderr, qr/source database "dbbranch_drop_tspc_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source drop tablespace holds db branch writer gate');
 
 	$node->safe_psql('postgres',
@@ -3368,12 +3375,12 @@ IMPORT FOREIGN SCHEMA import_src LIMIT TO (import_rows) FROM SERVER dbbranch_imp
 	$node->wait_for_event('client backend', 'db-branch-import-foreign-schema');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_import_schema_drain_target FROM DATABASE dbbranch_import_schema_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source import foreign schema');
-	like($stderr, qr/source database "dbbranch_import_schema_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source import foreign schema holds db branch writer gate');
 
 	$node->safe_psql('postgres',
@@ -3543,12 +3550,12 @@ WHERE datname = 'dbbranch_refresh_drain_source'
 ]), 'active source refresh materialized view waits on source matview lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_refresh_drain_target FROM DATABASE dbbranch_refresh_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source refresh materialized view');
-	like($stderr, qr/source database "dbbranch_refresh_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source refresh materialized view holds db branch writer gate');
 
 	$refresh_locker->query_safe(q[COMMIT;]);
@@ -3579,17 +3586,60 @@ CHECKPOINT;
 
 	my $drain_writer = $node->background_psql('dbbranch_drain_source', on_error_stop => 1);
 	$drain_writer->query_safe(q[BEGIN; INSERT INTO drain_rows VALUES (2);]);
+	my $drain_source_oid = $node->safe_psql(
+		'postgres',
+		q[SELECT oid FROM pg_database WHERE datname = 'dbbranch_drain_source';]);
 	$node->safe_psql('postgres',
 		q[SELECT injection_points_attach('db-branch-before-drain', 'wait');]);
 
 	my $drain_branch = $node->background_psql('postgres', on_error_stop => 1);
+	$drain_branch->query_safe(q[SET lock_timeout = 0;]);
+	my $drain_branch_pid = $drain_branch->query_safe(q[SELECT pg_backend_pid();]);
 	$drain_branch->query_until(
 		qr/start_drain_branch/,
 		q(\echo start_drain_branch
 CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 \echo finish_drain_branch
 ));
-	usleep(200_000);
+	ok($node->poll_query_until(
+		'postgres',
+		q[
+SELECT count(*) = 1
+FROM pg_locks
+WHERE pid = ] . $drain_branch_pid . q[
+  AND locktype = 'object'
+  AND classid = 'pg_dbbranch'::regclass
+  AND objid = ] . $drain_source_oid . q[
+  AND objsubid = 0
+  AND mode = 'ShareLock'
+  AND NOT granted;
+]), 'db branch joins the source freeze-gate wait queue');
+
+	my $drain_late_writer =
+	  $node->background_psql('dbbranch_drain_source', on_error_stop => 1);
+	$drain_late_writer->query_safe(q[SET lock_timeout = 0;]);
+	my $drain_late_writer_pid =
+	  $drain_late_writer->query_safe(q[SELECT pg_backend_pid();]);
+	$drain_late_writer->query_until(
+		qr/start_drain_late_writer/,
+		q(\echo start_drain_late_writer
+INSERT INTO drain_rows VALUES (3);
+\echo finish_drain_late_writer
+));
+	ok($node->poll_query_until(
+		'postgres',
+		q[
+SELECT count(*) = 1
+FROM pg_locks
+WHERE pid = ] . $drain_late_writer_pid . q[
+  AND locktype = 'object'
+  AND classid = 'pg_dbbranch'::regclass
+  AND objid = ] . $drain_source_oid . q[
+  AND objsubid = 0
+  AND mode = 'RowExclusiveLock'
+  AND NOT granted;
+]), 'later source writer queues behind the waiting db branch');
+
 	my $drain_branch_count = $node->safe_psql(
 		'postgres',
 		q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_drain_target';]);
@@ -3598,6 +3648,33 @@ CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 	$drain_writer->query_safe('COMMIT;');
 	$drain_writer->quit;
 	$node->wait_for_event('client backend', 'db-branch-before-drain');
+	my $drain_queue_order = $node->safe_psql(
+		'postgres',
+		q[
+SELECT
+  EXISTS (
+    SELECT 1
+    FROM pg_locks
+    WHERE pid = ] . $drain_branch_pid . q[
+      AND locktype = 'object'
+      AND classid = 'pg_dbbranch'::regclass
+      AND objid = ] . $drain_source_oid . q[
+      AND objsubid = 0
+      AND mode = 'ShareLock'
+      AND granted)
+  AND EXISTS (
+    SELECT 1
+    FROM pg_locks
+    WHERE pid = ] . $drain_late_writer_pid . q[
+      AND locktype = 'object'
+      AND classid = 'pg_dbbranch'::regclass
+      AND objid = ] . $drain_source_oid . q[
+      AND objsubid = 0
+      AND mode = 'RowExclusiveLock'
+      AND NOT granted);
+]);
+	is($drain_queue_order, 't',
+		'waiting db branch acquires the freeze gate before the later writer');
 	my $freeze_timed_out = 0;
 	$node->psql(
 		'dbbranch_drain_source',
@@ -3609,11 +3686,19 @@ CREATE BRANCH dbbranch_drain_target FROM DATABASE dbbranch_drain_source;
 	$node->safe_psql('postgres', q[SELECT injection_points_wakeup('db-branch-before-drain');]);
 	$drain_branch->query_until(qr/finish_drain_branch/, '');
 	$drain_branch->quit;
+	$drain_late_writer->query_until(qr/finish_drain_late_writer/, '');
+	$drain_late_writer->quit;
 
 	my $drain_rows = $node->safe_psql(
 		'dbbranch_drain_target',
 		q[SELECT string_agg(id::text, ',' ORDER BY id) FROM drain_rows;]);
-	is($drain_rows, '1,2', 'db branch waits for a short source writer to drain');
+	is($drain_rows, '1,2',
+		'db branch includes the drained writer and excludes the later writer');
+	my $drain_source_rows = $node->safe_psql(
+		'dbbranch_drain_source',
+		q[SELECT string_agg(id::text, ',' ORDER BY id) FROM drain_rows;]);
+	is($drain_source_rows, '1,2,3',
+		'later source writer finishes after db branch releases the freeze gate');
 	my $drain_blocking_recorded = $node->safe_psql(
 		'postgres',
 		q[SELECT source_blocking_ms > 0 FROM pg_dbbranch WHERE branch_db_oid = (SELECT oid FROM pg_database WHERE datname = 'dbbranch_drain_target');]);
@@ -3652,12 +3737,12 @@ WHERE datname = 'dbbranch_vacuum_drain_source'
 ]), 'active source vacuum waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_vacuum_drain_target FROM DATABASE dbbranch_vacuum_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source vacuum');
-	like($stderr, qr/source database "dbbranch_vacuum_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source vacuum holds db branch writer gate');
 
 	$vacuum_locker->query_safe(q[COMMIT;]);
@@ -3706,12 +3791,12 @@ WHERE datname = 'dbbranch_vacuum_full_drain_source'
 ]), 'active source vacuum full waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_vacuum_full_drain_target FROM DATABASE dbbranch_vacuum_full_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source vacuum full');
-	like($stderr, qr/source database "dbbranch_vacuum_full_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source vacuum full holds db branch writer gate');
 
 	$vacuum_full_locker->query_safe(q[COMMIT;]);
@@ -3757,12 +3842,12 @@ WHERE datname = 'dbbranch_cluster_drain_source'
 ]), 'active source cluster waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_cluster_drain_target FROM DATABASE dbbranch_cluster_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source cluster');
-	like($stderr, qr/source database "dbbranch_cluster_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source cluster holds db branch writer gate');
 
 	$cluster_locker->query_safe(q[COMMIT;]);
@@ -3808,12 +3893,12 @@ WHERE datname = 'dbbranch_reindex_drain_source'
 ]), 'active source reindex waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_reindex_drain_target FROM DATABASE dbbranch_reindex_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source reindex');
-	like($stderr, qr/source database "dbbranch_reindex_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source reindex holds db branch writer gate');
 
 	$reindex_locker->query_safe(q[COMMIT;]);
@@ -3859,12 +3944,12 @@ WHERE datname = 'dbbranch_truncate_drain_source'
 ]), 'active source truncate waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_truncate_drain_target FROM DATABASE dbbranch_truncate_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source truncate');
-	like($stderr, qr/source database "dbbranch_truncate_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source truncate holds db branch writer gate');
 
 	$truncate_locker->query_safe(q[COMMIT;]);
@@ -3910,12 +3995,12 @@ WHERE datname = 'dbbranch_alter_drain_source'
 ]), 'active source alter table waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_alter_drain_target FROM DATABASE dbbranch_alter_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source alter table');
-	like($stderr, qr/source database "dbbranch_alter_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source alter table holds db branch writer gate');
 
 	$alter_locker->query_safe(q[COMMIT;]);
@@ -3953,12 +4038,12 @@ INSERT INTO rewrite_rows VALUES (3, 30);
 ]);
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_rewrite_drain_target FROM DATABASE dbbranch_rewrite_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source relation rewrite');
-	like($stderr, qr/source database "dbbranch_rewrite_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source relation rewrite holds db branch writer gate');
 
 	$rewrite_writer->query_safe(q[COMMIT;]);
@@ -4008,12 +4093,12 @@ WHERE datname = 'dbbranch_index_drain_source'
 ]), 'active source create index waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_index_drain_target FROM DATABASE dbbranch_index_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source create index');
-	like($stderr, qr/source database "dbbranch_index_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source create index holds db branch writer gate');
 
 	$index_locker->query_safe(q[COMMIT;]);
@@ -4059,12 +4144,12 @@ WHERE datname = 'dbbranch_stats_drain_source'
 ]), 'active source create statistics waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_stats_drain_target FROM DATABASE dbbranch_stats_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source create statistics');
-	like($stderr, qr/source database "dbbranch_stats_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source create statistics holds db branch writer gate');
 
 	$stats_locker->query_safe(q[COMMIT;]);
@@ -4111,12 +4196,12 @@ WHERE datname = 'dbbranch_alter_stats_drain_source'
 ]), 'active source alter statistics waits on source catalog lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_alter_stats_drain_target FROM DATABASE dbbranch_alter_stats_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source alter statistics');
-	like($stderr, qr/source database "dbbranch_alter_stats_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source alter statistics holds db branch writer gate');
 
 	$alter_stats_locker->query_safe(q[COMMIT;]);
@@ -4156,12 +4241,12 @@ WHERE datname = 'dbbranch_create_publication_drain_source'
 ]), 'active source create publication waits on source catalog lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_create_publication_drain_target FROM DATABASE dbbranch_create_publication_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source create publication');
-	like($stderr, qr/source database "dbbranch_create_publication_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source create publication holds db branch writer gate');
 
 	$create_publication_locker->query_safe(q[COMMIT;]);
@@ -4208,12 +4293,12 @@ WHERE datname = 'dbbranch_publication_drain_source'
 ]), 'active source alter publication waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_publication_drain_target FROM DATABASE dbbranch_publication_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source alter publication');
-	like($stderr, qr/source database "dbbranch_publication_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source alter publication holds db branch writer gate');
 
 	$publication_locker->query_safe(q[COMMIT;]);
@@ -4259,12 +4344,12 @@ WHERE datname = 'dbbranch_drop_drain_source'
 ]), 'active source drop table waits on source table lock');
 
 	$stderr = '';
-	$result = $node->psql(
+	$result = psql_with_branch_lock_timeout($node,
 		'postgres',
 		q[CREATE BRANCH dbbranch_drop_drain_target FROM DATABASE dbbranch_drop_drain_source],
 		stderr => \$stderr);
 	is($result, 3, 'db branch reports active source drop table');
-	like($stderr, qr/source database "dbbranch_drop_drain_source" has active write transactions/,
+	like($stderr, qr/canceling statement due to lock timeout/,
 		'active source drop table holds db branch writer gate');
 
 	$drop_locker->query_safe(q[COMMIT;]);
@@ -5508,12 +5593,12 @@ $alter_database_set_writer->query_safe(
 	q[BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source SET work_mem = '65MB';]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_database_set_drain_target FROM DATABASE dbbranch_alter_database_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter database set');
-like($stderr, qr/source database "dbbranch_alter_database_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter database set holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5536,12 +5621,12 @@ $alter_database_writer->query_safe(
 	q[BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source CONNECTION LIMIT 8;]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_database_drain_target FROM DATABASE dbbranch_alter_database_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter database');
-like($stderr, qr/source database "dbbranch_alter_database_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter database holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5564,12 +5649,12 @@ $alter_database_refresh_writer->query_safe(
 	q[SET client_min_messages = warning; BEGIN; ALTER DATABASE dbbranch_alter_database_drain_source REFRESH COLLATION VERSION;]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_database_refresh_drain_target FROM DATABASE dbbranch_alter_database_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter database refresh collation');
-like($stderr, qr/source database "dbbranch_alter_database_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter database refresh collation holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5597,12 +5682,12 @@ $database_rename_writer->query_safe(
 	q[BEGIN; ALTER DATABASE dbbranch_database_rename_drain_source RENAME TO dbbranch_database_rename_drain_source_renamed;]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_database_rename_drain_target FROM DATABASE dbbranch_database_rename_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source database rename');
-like($stderr, qr/source database "dbbranch_database_rename_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source database rename holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5637,12 +5722,12 @@ $database_owner_writer->query_safe(
 	q[BEGIN; ALTER DATABASE dbbranch_database_owner_drain_source OWNER TO dbbranch_database_owner_drain_role;]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_database_owner_drain_target FROM DATABASE dbbranch_database_owner_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source database owner change');
-like($stderr, qr/source database "dbbranch_database_owner_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source database owner change holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5676,12 +5761,12 @@ $database_grant_writer->query_safe(
 	q[BEGIN; GRANT CONNECT ON DATABASE dbbranch_database_grant_drain_source TO dbbranch_database_grant_drain_role;]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_database_grant_drain_target FROM DATABASE dbbranch_database_grant_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source database grant');
-like($stderr, qr/source database "dbbranch_database_grant_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source database grant holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5715,12 +5800,12 @@ $database_comment_writer->query_safe(
 	q[BEGIN; COMMENT ON DATABASE dbbranch_database_comment_drain_source IS 'branch database comment';]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_database_comment_drain_target FROM DATABASE dbbranch_database_comment_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source database comment');
-like($stderr, qr/source database "dbbranch_database_comment_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source database comment holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5749,12 +5834,12 @@ $database_seclabel_writer->query_safe(
 	q[BEGIN; SECURITY LABEL FOR 'dummy' ON DATABASE dbbranch_database_seclabel_drain_source IS 'classified';]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_database_seclabel_drain_target FROM DATABASE dbbranch_database_seclabel_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source database security label');
-like($stderr, qr/source database "dbbranch_database_seclabel_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source database security label holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5783,12 +5868,12 @@ $role_setting_writer->query_safe(
 	q[BEGIN; ALTER ROLE dbbranch_role_setting_drain_role IN DATABASE dbbranch_role_setting_drain_source SET maintenance_work_mem = '33MB';]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_role_setting_drain_target FROM DATABASE dbbranch_role_setting_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source role-in-database setting');
-like($stderr, qr/source database "dbbranch_role_setting_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source role-in-database setting holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5936,12 +6021,12 @@ $tablespace_options_writer->query_safe(
 	q[BEGIN; ALTER TABLESPACE dbbranch_options_ts SET (random_page_cost = 1.7);]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_tablespace_options_drain_target FROM DATABASE dbbranch_tablespace_options_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter tablespace options');
-like($stderr, qr/source database "dbbranch_tablespace_options_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter tablespace options holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -5984,12 +6069,12 @@ INSERT INTO rel_move_rows VALUES (3, 'after-move');
 ]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_rel_move_drain_target FROM DATABASE dbbranch_rel_move_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source relation tablespace move');
-like($stderr, qr/source database "dbbranch_rel_move_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source relation tablespace move holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -6108,12 +6193,12 @@ INSERT INTO set_unlogged_rows VALUES (3, 'after-unlogged');
 ]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_set_unlogged_drain_target FROM DATABASE dbbranch_set_unlogged_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source set unlogged rewrite');
-like($stderr, qr/source database "dbbranch_set_unlogged_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source set unlogged rewrite holds db branch writer gate');
 
 $set_unlogged_writer->query_safe(q[COMMIT;]);
@@ -6164,12 +6249,12 @@ INSERT INTO set_logged_rows VALUES (3, 'after-logged');
 ]);
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_set_logged_drain_target FROM DATABASE dbbranch_set_logged_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source set logged rewrite');
-like($stderr, qr/source database "dbbranch_set_logged_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source set logged rewrite holds db branch writer gate');
 
 $set_logged_writer->query_safe(q[COMMIT;]);
@@ -6335,12 +6420,12 @@ WHERE datname = 'dbbranch_create_subscription_drain_source'
 ]), 'active source create subscription waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_create_subscription_drain_target FROM DATABASE dbbranch_create_subscription_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source create subscription');
-like($stderr, qr/source database "dbbranch_create_subscription_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source create subscription holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -6394,12 +6479,12 @@ WHERE datname = 'dbbranch_alter_subscription_drain_source'
 ]), 'active source alter subscription waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_alter_subscription_drain_target FROM DATABASE dbbranch_alter_subscription_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source alter subscription');
-like($stderr, qr/source database "dbbranch_alter_subscription_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source alter subscription holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
@@ -6453,12 +6538,12 @@ WHERE datname = 'dbbranch_drop_subscription_drain_source'
 ]), 'active source drop subscription waits on source catalog lock');
 
 $stderr = '';
-$result = $node->psql(
+$result = psql_with_branch_lock_timeout($node,
 	'postgres',
 	q[CREATE BRANCH dbbranch_drop_subscription_drain_target FROM DATABASE dbbranch_drop_subscription_drain_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source drop subscription');
-like($stderr, qr/source database "dbbranch_drop_subscription_drain_source" has active write transactions/,
+like($stderr, qr/canceling statement due to lock timeout/,
 	'active source drop subscription holds db branch writer gate');
 
 @metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';

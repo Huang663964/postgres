@@ -7,6 +7,7 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init(allows_streaming => 1);
+$node->append_conf('postgresql.conf', q[lock_timeout = '1s']);
 $node->start;
 
 $node->safe_psql('postgres', q[CREATE DATABASE dbbranch_dml_gate_source;]);
@@ -128,8 +129,8 @@ my $result = $node->psql(
 	q[CREATE BRANCH dbbranch_dml_gate_target FROM DATABASE dbbranch_dml_gate_source],
 	stderr => \$stderr);
 is($result, 3, 'db branch reports active source DML writer');
-like($stderr, qr/source database "dbbranch_dml_gate_source" has active write transactions/,
-	'active source DML writer blocks CREATE BRANCH');
+like($stderr, qr/canceling statement due to lock timeout/,
+	'CREATE BRANCH uses standard lock timeout while waiting for source DML writer');
 
 my $target_count = $node->safe_psql(
 	'postgres',
@@ -154,8 +155,8 @@ for my $metadata_file (@metadata_files)
 }
 like($metadata, qr/^status=FAILED$/m,
 	'active source DML writer metadata final state is FAILED');
-like($metadata, qr/^failure=source database has active write transactions$/m,
-	'active source DML writer metadata records failure');
+like($metadata, qr/^failure=canceling statement due to lock timeout$/m,
+	'freeze-gate timeout metadata records the original failure');
 my ($metadata_source_blocking_ms) = $metadata =~ /^source_blocking_ms=([0-9]+(?:\.[0-9]+)?)$/m;
 ok(defined $metadata_source_blocking_ms && $metadata_source_blocking_ms > 0,
 	'active source DML writer metadata records source blocking time');
@@ -167,6 +168,69 @@ like($metadata, qr/^cleanup=not_started$/m,
 	'active source DML writer metadata records cleanup not started');
 like($metadata, qr/^replay_method=not_started$/m,
 	'active source DML writer metadata records replay not started');
+
+my $cancel_branch =
+  $node->background_psql('postgres', on_error_stop => 0);
+$cancel_branch->query_safe(q[SET lock_timeout = 0;]);
+my $cancel_branch_pid =
+  $cancel_branch->query_safe(q[SELECT pg_backend_pid();]);
+$cancel_branch->query_until(
+	qr/start_cancel_gate_branch/,
+	q(\echo start_cancel_gate_branch
+CREATE BRANCH dbbranch_dml_gate_cancel_target FROM DATABASE dbbranch_dml_gate_source;
+\echo finish_cancel_gate_branch
+));
+ok($node->poll_query_until(
+	'postgres',
+	q[
+SELECT count(*) = 1
+FROM pg_locks
+WHERE pid = ] . $cancel_branch_pid . q[
+  AND locktype = 'object'
+  AND classid = 'pg_dbbranch'::regclass
+  AND objid = ] . $source_oid . q[
+  AND objsubid = 0
+  AND mode = 'ShareLock'
+  AND NOT granted;
+]), 'cancelable CREATE BRANCH is waiting in the source freeze-gate queue');
+is(
+	$node->safe_psql(
+		'postgres',
+		q[SELECT pg_cancel_backend(] . $cancel_branch_pid . q[);]),
+	't',
+	'cancel the CREATE BRANCH freeze-gate wait');
+$cancel_branch->query_until(qr/finish_cancel_gate_branch/, '');
+like($cancel_branch->{stderr}, qr/canceling statement due to user request/,
+	'CREATE BRANCH reports user cancellation while waiting for freeze gate');
+$cancel_branch->quit;
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, $metadata_file_count + 2,
+	'canceled freeze-gate wait writes a separate metadata file');
+my $cancel_metadata = '';
+for my $metadata_file (@metadata_files)
+{
+	open my $metadata_fh, '<', $metadata_file
+	  or die "could not open $metadata_file: $!";
+	my $contents = do { local $/; <$metadata_fh> };
+	close $metadata_fh;
+	if ($contents =~ /^branch_name=dbbranch_dml_gate_cancel_target$/m)
+	{
+		$cancel_metadata = $contents;
+		last;
+	}
+}
+like($cancel_metadata, qr/^status=FAILED$/m,
+	'canceled freeze-gate wait metadata final state is FAILED');
+like($cancel_metadata, qr/^failure=canceling statement due to user request$/m,
+	'canceled freeze-gate wait metadata preserves the original failure');
+like($cancel_metadata, qr/^wal_pin=not_started$/m,
+	'canceled freeze-gate wait never starts WAL pinning');
+my $cancel_target_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_dml_gate_cancel_target';]);
+is($cancel_target_count, '0',
+	'canceled freeze-gate wait creates no branch database');
 
 $writer->query_safe(q[COMMIT;]);
 $writer->quit;

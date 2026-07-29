@@ -4078,25 +4078,17 @@ LockDBBranchTargetWriteGate(Oid dboid)
 static bool
 LockDBBranchSourceWriteGate(Oid source_dboid, int *npreparedxacts)
 {
-	int			tries;
-
-	for (tries = 0; tries < 50; tries++)
-	{
-		CHECK_FOR_INTERRUPTS();
-
-		*npreparedxacts = CountDBPreparedXacts(source_dboid);
-		if (*npreparedxacts > 0)
-			return false;
-
-		if (ConditionalLockSharedObject(DbBranchRelationId, source_dboid, 0,
-										ShareLock))
-			return true;
-
-		pg_usleep(100 * 1000L);
-	}
-
 	*npreparedxacts = CountDBPreparedXacts(source_dboid);
-	return false;
+	if (*npreparedxacts > 0)
+		return false;
+
+	/*
+	 * Join the heavyweight-lock wait queue once.  A conditional retry loop
+	 * would leave the queue between attempts and let later writers overtake
+	 * CREATE BRANCH indefinitely.
+	 */
+	LockSharedObject(DbBranchRelationId, source_dboid, 0, ShareLock);
+	return true;
 }
 
 static void
@@ -4392,7 +4384,47 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				(errcode(ERRCODE_DUPLICATE_DATABASE),
 				 errmsg("database \"%s\" already exists", branch_name)));
 
-	if (!LockDBBranchSourceWriteGate(source_dboid, &npreparedxacts))
+	/*
+	 * Keep failures while waiting for the freeze gate observable.  In
+	 * particular, lock_timeout and user cancellation happen before the main
+	 * clone cleanup PG_TRY block below.
+	 */
+	{
+		MemoryContext oldcontext = CurrentMemoryContext;
+
+		PG_TRY();
+		{
+			source_write_gate_held =
+				LockDBBranchSourceWriteGate(source_dboid, &npreparedxacts);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			MemoryContextSwitchTo(oldcontext);
+			edata = CopyErrorData();
+			FlushErrorState();
+			snprintf(failure, sizeof(failure), "%s",
+					 edata->message ? edata->message :
+					 "could not acquire DB Branch source write gate");
+
+			INSTR_TIME_SET_CURRENT(elapsed);
+			INSTR_TIME_SUBTRACT(elapsed, source_block_start);
+			source_blocking_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+
+			WriteDBBranchMetadata(source_dboid, source_name, branch_name,
+							  InvalidXLogRecPtr, InvalidXLogRecPtr, "",
+							  "not_started",
+							  "not_started", "not_started", "not_started",
+							  NULL,
+							  source_blocking_ms, 0.0, 0.0,
+							  "CREATING,FAILED", "FAILED", failure);
+			ReThrowError(edata);
+		}
+		PG_END_TRY();
+	}
+
+	if (!source_write_gate_held)
 	{
 		const char *busy_failure =
 			(npreparedxacts > 0) ?
@@ -4422,7 +4454,6 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 					 errmsg("source database \"%s\" has active write transactions",
 							source_name)));
 	}
-	source_write_gate_held = true;
 
 	if (!get_db_info(source_name, ShareLock,
 					 &locked_source_dboid, NULL, &source_encoding,
