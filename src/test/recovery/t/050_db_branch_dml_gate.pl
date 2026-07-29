@@ -232,6 +232,73 @@ my $cancel_target_count = $node->safe_psql(
 is($cancel_target_count, '0',
 	'canceled freeze-gate wait creates no branch database');
 
+my $deadlock_branch =
+  $node->background_psql('dbbranch_dml_gate_source', on_error_stop => 0);
+$deadlock_branch->query_safe(q[
+SET lock_timeout = 0;
+SET deadlock_timeout = '100ms';
+SELECT pg_advisory_lock(505050);
+]);
+my $writer_pid = $writer->query_safe(q[SELECT pg_backend_pid();]);
+$writer->query_until(
+	qr/start_gate_deadlock_writer/,
+	q(\echo start_gate_deadlock_writer
+SELECT pg_advisory_xact_lock(505050);
+\echo finish_gate_deadlock_writer
+));
+ok($node->poll_query_until(
+	'postgres',
+	q[
+SELECT count(*) = 1
+FROM pg_stat_activity
+WHERE pid = ] . $writer_pid . q[
+  AND wait_event_type = 'Lock'
+  AND wait_event = 'advisory';
+]), 'source writer waits on lock held by CREATE BRANCH session');
+
+$deadlock_branch->query_until(
+	qr/start_gate_deadlock_branch/,
+	q(\echo start_gate_deadlock_branch
+CREATE BRANCH dbbranch_dml_gate_deadlock_target FROM DATABASE dbbranch_dml_gate_source;
+\echo finish_gate_deadlock_branch
+));
+$deadlock_branch->query_until(qr/finish_gate_deadlock_branch/, '');
+like($deadlock_branch->{stderr}, qr/deadlock detected/,
+	'CREATE BRANCH reports freeze-gate deadlock');
+
+@metadata_files = glob $node->data_dir . '/global/pg_dbbranch_*.state';
+is(scalar @metadata_files, $metadata_file_count + 3,
+	'deadlocked freeze-gate wait writes a separate metadata file');
+my $deadlock_metadata = '';
+for my $metadata_file (@metadata_files)
+{
+	open my $metadata_fh, '<', $metadata_file
+	  or die "could not open $metadata_file: $!";
+	my $contents = do { local $/; <$metadata_fh> };
+	close $metadata_fh;
+	if ($contents =~ /^branch_name=dbbranch_dml_gate_deadlock_target$/m)
+	{
+		$deadlock_metadata = $contents;
+		last;
+	}
+}
+like($deadlock_metadata, qr/^status=FAILED$/m,
+	'deadlocked freeze-gate wait metadata final state is FAILED');
+like($deadlock_metadata, qr/^failure=deadlock detected$/m,
+	'deadlocked freeze-gate wait metadata preserves the original failure');
+like($deadlock_metadata, qr/^wal_pin=not_started$/m,
+	'deadlocked freeze-gate wait never starts WAL pinning');
+my $deadlock_target_count = $node->safe_psql(
+	'postgres',
+	q[SELECT count(*) FROM pg_database WHERE datname = 'dbbranch_dml_gate_deadlock_target';]);
+is($deadlock_target_count, '0',
+	'deadlocked freeze-gate wait creates no branch database');
+
+$deadlock_branch->{stderr} = '';
+$deadlock_branch->query_safe(q[SELECT pg_advisory_unlock(505050);]);
+$deadlock_branch->quit;
+$writer->query_until(qr/finish_gate_deadlock_writer/, '');
+
 $writer->query_safe(q[COMMIT;]);
 $writer->quit;
 
