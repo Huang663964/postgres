@@ -108,7 +108,8 @@ operation; it is not a production Buffer Manager locking pattern.  Attach
 then changes the source count from one to two, makes the global non-identity
 fast-path count nonzero, publishes target-to-source, changes the reserved
 target-home count from one to zero, and increments the target generation.
-Only this function writes a non-identity FrameId.
+Only this function and the test-only read promotion described below write a
+non-identity FrameId.
 
 While attached, both the non-identity target and the identity source fail
 MarkBufferDirty() and MarkBufferDirtyHint().  Free-list, clock-sweep, and
@@ -141,9 +142,52 @@ End clears the target first-pin gate only after publication.  Calling detach
 again on the resulting private target is an idempotent no-op.  ERROR after
 attach leaves a valid shared mapping for explicit cleanup; cancel before
 detach publication leaves the shared mapping unchanged; ERROR after detach
-leaves a valid private mapping.  No allocator, frame free list, family hash,
-GUC, automatic promotion, ordinary SQL entry point, or production COW
-closure exists.
+leaves a valid private mapping.  No allocator, frame free list, GUC, ordinary
+SQL entry point, or production COW closure exists.
+
+Test-only Read Promotion
+------------------------
+
+The P3 promotion path is deliberately reachable only while
+test_buffer_frame enables a backend-local test switch around one ReadBuffer
+or StartReadBuffer/WaitReadBuffers call.  Normal backends always return at the
+first branch of the hook.  There is no product GUC or SQL switch.  The durable
+database mode and family are cached once per backend, but promotion accepts
+only a shared-readonly branch, a permanent MAIN-fork page in the current
+database, and a valid, clean, idle private frame.  Source databases,
+temporary and unlogged relations, local buffers, and recovery are excluded
+before candidate lookup.  Tests can override family and digest only to make
+negative cases deterministic.
+
+One weak candidate per key is stored in a small shared hash protected by one
+short-lived LWLock.  A key contains the branch-family root, canonical
+tablespace/relation/fork/block identity, and a content digest.  Candidate
+ownership is tied to the source descriptor's tag generation and is removed
+when that descriptor loses its mapping.  A digest match is only a filter.
+Promotion pins and revalidates the candidate, conditionally takes both
+content locks in descriptor order, compares all BLCKSZ bytes, then revalidates
+both descriptors under their header locks.  Lock contention, stale state,
+collision, cancellation, or any failed check leaves the target private and
+does not block the read.
+
+Publication increments the identity source frame's attachment count, then
+publishes the target FrameId, releases its reserved home attachment, and
+increments its mapping generation while both descriptor headers and content
+locks are held.  The target must have exactly the caller's one pin throughout,
+so no earlier Page pointer can refer to its old home frame.  Concurrent
+targets may attach to the same immutable source.  Attempts, registrations,
+digest matches, full-page mismatches, promotions, and skips are test metrics.
+
+The extension ABI extra string includes a frame-accessor version so an
+extension compiled before BufferGetBlock() learned FrameIds is rejected at
+LOAD instead of silently using the old address calculation.  This P3 slice
+always adds one tag-generation word per descriptor, one reverse candidate
+slot per descriptor, and shared-hash capacity even though promotion is
+feature-off.  It still keeps every target home frame and leaves all mutation,
+hint, eviction, checkpoint, writeback, restart, and materialization closure to
+later phases.  It proves safe pre-Page publication in controlled tests, not
+ordinary SQL sharing, effective cache-capacity gain, RSS reduction, or
+production COW.
 
 There are two separate access control mechanisms for shared disk buffers:
 reference counts (a/k/a pin counts) and buffer content locks.  (Actually,

@@ -783,3 +783,136 @@ test_buffer_frame_pages_alias(PG_FUNCTION_ARGS)
 
 	PG_RETURN_BOOL(aliased);
 }
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_promote);
+Datum
+test_buffer_frame_promote(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		block = PG_GETARG_INT32(1);
+	Oid			family_root_dboid = PG_ARGISNULL(2) ?
+		InvalidOid : PG_GETARG_OID(2);
+	bool		override_hash = !PG_ARGISNULL(3);
+	uint64		content_hash = override_hash ?
+		(uint64) PG_GETARG_INT64(3) : 0;
+	bool		async = PG_GETARG_BOOL(4);
+	Relation	rel;
+	BlockNumber nblocks;
+	volatile Buffer promoted_buffer = InvalidBuffer;
+
+	if (block < 0)
+		elog(ERROR, "invalid block number: %d", block);
+
+	rel = table_open(relid, AccessShareLock);
+	nblocks = RelationGetNumberOfBlocks(rel);
+	if ((BlockNumber) block >= nblocks)
+		elog(ERROR, "block %d is past relation size %u", block, nblocks);
+
+	TestOnlyConfigureDBBranchFramePromotion(true, family_root_dboid,
+											override_hash, content_hash);
+	PG_TRY();
+	{
+		Buffer		buffer;
+
+		if (async)
+		{
+			ReadBuffersOperation operation;
+
+			MemSet(&operation, 0, sizeof(operation));
+			operation.smgr = RelationGetSmgr(rel);
+			operation.rel = rel;
+			operation.persistence = rel->rd_rel->relpersistence;
+			operation.forknum = MAIN_FORKNUM;
+			operation.strategy = NULL;
+			if (StartReadBuffer(&operation, &buffer,
+								(BlockNumber) block, 0))
+				WaitReadBuffers(&operation);
+		}
+		else
+			buffer = ReadBuffer(rel, (BlockNumber) block);
+
+		promoted_buffer = buffer;
+	}
+	PG_FINALLY();
+	{
+		TestOnlyConfigureDBBranchFramePromotion(false, InvalidOid, false, 0);
+	}
+	PG_END_TRY();
+
+	ReleaseBuffer(promoted_buffer);
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_INT32(promoted_buffer);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_reset_promotion_stats);
+Datum
+test_buffer_frame_reset_promotion_stats(PG_FUNCTION_ARGS)
+{
+	TestOnlyResetDBBranchFramePromotionStats();
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_promotion_stats);
+Datum
+test_buffer_frame_promotion_stats(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+											  UINT64_FORMAT ":" UINT64_FORMAT ":" UINT64_FORMAT ":" UINT64_FORMAT
+											  ":" UINT64_FORMAT ":" UINT64_FORMAT,
+											  pg_atomic_read_u64(&DBBranchFrameStats->attempts),
+											  pg_atomic_read_u64(&DBBranchFrameStats->registrations),
+											  pg_atomic_read_u64(&DBBranchFrameStats->hash_matches),
+											  pg_atomic_read_u64(&DBBranchFrameStats->full_mismatches),
+											  pg_atomic_read_u64(&DBBranchFrameStats->promotions),
+											  pg_atomic_read_u64(&DBBranchFrameStats->skips))));
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_hold_page_lock);
+Datum
+test_buffer_frame_hold_page_lock(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	Buffer		buffer;
+
+	buffer = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1), &rel);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	run_test_injection_point(PG_GETARG_TEXT_PP(2));
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buffer);
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_VOID();
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_overwrite_clean_page);
+Datum
+test_buffer_frame_overwrite_clean_page(PG_FUNCTION_ARGS)
+{
+	Relation	rel;
+	Buffer		buffer;
+	BufferDesc *desc;
+	int32		fill = PG_GETARG_INT32(2);
+
+	if (fill < 0 || fill > UCHAR_MAX)
+		elog(ERROR, "page fill byte is out of range: %d", fill);
+
+	buffer = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1), &rel);
+	if (BufferIsLocal(buffer))
+		elog(ERROR, "clean page overwrite requires a shared buffer");
+	desc = GetBufferDescriptor(buffer - 1);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (!BufferHasPrivateFrame(desc) || test_buffer_is_dirty(buffer))
+		elog(ERROR, "clean page overwrite requires a clean private frame");
+
+	/*
+	 * Deliberately create a deterministic in-memory image for negative family
+	 * tests.  The page is never marked dirty or interpreted as a heap page.
+	 */
+	memset(BufferGetPage(buffer), fill, BLCKSZ);
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	ReleaseBuffer(buffer);
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_VOID();
+}

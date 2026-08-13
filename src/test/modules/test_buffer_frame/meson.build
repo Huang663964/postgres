@@ -16,6 +16,12 @@ test_buffer_frame = shared_module('test_buffer_frame',
 )
 test_install_libs += test_buffer_frame
 
+test_buffer_frame_legacy = shared_module('test_buffer_frame_legacy',
+  files('test_buffer_frame_legacy.c'),
+  kwargs: pg_test_mod_args,
+)
+test_install_libs += test_buffer_frame_legacy
+
 test_install_data += files(
   'test_buffer_frame.control',
   'test_buffer_frame--1.0.sql',
@@ -31,6 +37,7 @@ tests += {
     },
     'tests': [
       't/001_pin_gate.pl',
+      't/002_read_promotion.pl',
     ],
   },
 }

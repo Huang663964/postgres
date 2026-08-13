@@ -141,6 +141,10 @@ typedef struct DBBranchWalScan
 	uint64		replayed_records;
 } DBBranchWalScan;
 
+/* Immutable for the lifetime of a backend connected to one database. */
+static char MyDBBranchBufferMode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
+static Oid MyDBBranchFamilyRootOid = InvalidOid;
+
 
 /* non-export function prototypes */
 static void createdb_failure_callback(int code, Datum arg);
@@ -4108,6 +4112,54 @@ LockDBBranchWriteGate(Oid dboid)
 				 errdetail("Database branch with OID %u has buffer mode \"%c\".",
 						   dboid, buffer_mode),
 				 errhint("Create a private writable branch when writes are required.")));
+}
+
+/*
+ * Cache the connected database's durable branch policy once catalog access is
+ * available.  The read hot path must never recurse into catalog I/O.
+ */
+void
+InitializeDBBranchSessionBufferMode(void)
+{
+	Relation	relation;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	MyDBBranchBufferMode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
+	MyDBBranchFamilyRootOid = InvalidOid;
+
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	relation = table_open(DbBranchRelationId, AccessShareLock);
+	ScanKeyInit(&key[0],
+				Anum_pg_dbbranch_branch_db_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(MyDatabaseId));
+	scan = systable_beginscan(relation, DbBranchBranchIndexId, true,
+							  NULL, 1, key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_dbbranch form = (Form_pg_dbbranch) GETSTRUCT(tuple);
+
+		MyDBBranchBufferMode = form->buffer_mode;
+		MyDBBranchFamilyRootOid = form->family_root_db_oid;
+	}
+	systable_endscan(scan);
+	table_close(relation, AccessShareLock);
+}
+
+bool
+GetMyDBBranchSharedReadOnlyFamily(Oid *family_root_dboid)
+{
+	if (MyDBBranchBufferMode != DBBRANCH_BUFFER_MODE_SHARED_READ_ONLY ||
+		!OidIsValid(MyDBBranchFamilyRootOid))
+		return false;
+
+	*family_root_dboid = MyDBBranchFamilyRootOid;
+	return true;
 }
 
 static void

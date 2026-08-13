@@ -1,6 +1,7 @@
 # src/test/modules/test_buffer_frame/Makefile
 
 MODULE_big = test_buffer_frame
+MODULES = test_buffer_frame_legacy
 OBJS = \
 	$(WIN32RES) \
 	test_buffer_frame.o

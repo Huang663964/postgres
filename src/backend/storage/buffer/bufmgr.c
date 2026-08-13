@@ -40,11 +40,13 @@
 #include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "catalog/pg_dbbranch.h"
 #ifdef USE_ASSERT_CHECKING
 #include "catalog/pg_tablespace_d.h"
 #endif
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
+#include "common/hashfn.h"
 #include "executor/instrument.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
@@ -187,6 +189,16 @@ int			io_max_combine_limit = DEFAULT_IO_COMBINE_LIMIT;
 int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
+
+/*
+ * P3 promotion is deliberately reachable only from test_buffer_frame.
+ * Phase 4 must close hint/lifecycle mutation before this becomes a product
+ * GUC.
+ */
+static bool TestOnlyDBBranchFramePromotionEnabled = false;
+static Oid	TestOnlyDBBranchFrameFamilyOverride = InvalidOid;
+static bool TestOnlyDBBranchFrameHashOverrideEnabled = false;
+static uint64 TestOnlyDBBranchFrameHashOverride = 0;
 
 /* local state for LockBufferForCleanup */
 static BufferDesc *PinCountWaitBuf = NULL;
@@ -579,6 +591,17 @@ static void LockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
 									 uint32 *a_state, uint32 *b_state);
 static void UnlockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
 									   uint32 a_state, uint32 b_state);
+static bool LockBufferContentPairConditional(BufferDesc *a, BufferDesc *b);
+static void UnlockBufferContentPair(BufferDesc *a, BufferDesc *b);
+static bool DBBranchFramePromotionPairValid(BufferDesc *target,
+											BufferDesc *source,
+											uint32 target_state,
+											uint32 source_state,
+											const BufferTag *target_tag,
+											uint32 target_tag_generation,
+											const DBBranchFrameCandidateKey * key,
+											const DBBranchFrameCandidate * candidate);
+static void TryDBBranchFramePromotion(Buffer buffer, char persistence);
 static ProcNumber BufferWriteIntentOwner(BufferDesc *buf);
 static void ClearBufferWriteIntent(BufferDesc *buf, ProcNumber owner);
 static void WaitBufferWriteIntent(BufferDesc *buf,
@@ -1422,6 +1445,8 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 				operation->nblocks_done = 1;
 				CheckReadBuffersOperation(operation, true);
 #endif
+				TryDBBranchFramePromotion(buffers[0],
+										  operation->persistence);
 				return false;
 			}
 
@@ -1530,6 +1555,12 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 	}
 
 	CheckReadBuffersOperation(operation, !did_start_io);
+	if (!did_start_io)
+	{
+		for (int i = 0; i < operation->nblocks_done; i++)
+			TryDBBranchFramePromotion(operation->buffers[i],
+									  operation->persistence);
+	}
 
 	return did_start_io;
 }
@@ -1811,6 +1842,9 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 	}
 
 	CheckReadBuffersOperation(operation, true);
+	for (int i = 0; i < operation->nblocks; i++)
+		TryDBBranchFramePromotion(operation->buffers[i],
+								  operation->persistence);
 
 	/* NB: READ_DONE tracepoint was already executed in completion callback */
 }
@@ -3193,6 +3227,327 @@ UnlockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
 		UnlockBufHdr(a, a_state);
 		UnlockBufHdr(b, b_state);
 	}
+}
+
+/* Promotion must never wait while holding one of a pair of content locks. */
+static bool
+LockBufferContentPairConditional(BufferDesc *a, BufferDesc *b)
+{
+	BufferDesc *first = a->buf_id < b->buf_id ? a : b;
+	BufferDesc *second = first == a ? b : a;
+
+	if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(first),
+								  LW_EXCLUSIVE))
+		return false;
+	if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(second),
+								  LW_EXCLUSIVE))
+	{
+		LWLockRelease(BufferDescriptorGetContentLock(first));
+		return false;
+	}
+
+	return true;
+}
+
+static void
+UnlockBufferContentPair(BufferDesc *a, BufferDesc *b)
+{
+	BufferDesc *first = a->buf_id < b->buf_id ? a : b;
+	BufferDesc *second = first == a ? b : a;
+
+	LWLockRelease(BufferDescriptorGetContentLock(second));
+	LWLockRelease(BufferDescriptorGetContentLock(first));
+}
+
+/* Caller holds both descriptor header locks and both content locks. */
+static bool
+DBBranchFramePromotionPairValid(BufferDesc *target, BufferDesc *source,
+								uint32 target_state, uint32 source_state,
+								const BufferTag *target_tag,
+								uint32 target_tag_generation,
+								const DBBranchFrameCandidateKey * key,
+								const DBBranchFrameCandidate * candidate)
+{
+	const uint32 required = BM_VALID | BM_TAG_VALID | BM_PERMANENT;
+	const uint32 rejected = BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS |
+		BM_IO_ERROR | BM_PIN_COUNT_WAITER;
+	BufferFrameId target_frame;
+	BufferFrameId source_frame;
+
+	if (BUF_STATE_GET_REFCOUNT(target_state) != 1 ||
+		BUF_STATE_GET_REFCOUNT(source_state) < 1 ||
+		(target_state & required) != required ||
+		(source_state & required) != required ||
+		(target_state & rejected) != 0 ||
+		(source_state & rejected) != 0 ||
+		BufferWriteIntentOwner(target) != INVALID_PROC_NUMBER ||
+		BufferWriteIntentOwner(source) != INVALID_PROC_NUMBER)
+		return false;
+
+	if (!BufferTagsEqual(&target->tag, target_tag) ||
+		!BufferTagsEqual(&source->tag, &candidate->source_tag) ||
+		pg_atomic_read_u32(&BufferTagGenerations[target->buf_id]) !=
+		target_tag_generation ||
+		pg_atomic_read_u32(&BufferTagGenerations[source->buf_id]) !=
+		candidate->source_tag_generation)
+		return false;
+
+	if (target->tag.dbOid != MyDatabaseId ||
+		target->tag.spcOid != key->spc_oid ||
+		source->tag.spcOid != key->spc_oid ||
+		BufTagGetRelNumber(&target->tag) != key->rel_number ||
+		BufTagGetRelNumber(&source->tag) != key->rel_number ||
+		BufTagGetForkNum(&target->tag) != key->fork_num ||
+		BufTagGetForkNum(&source->tag) != key->fork_num ||
+		target->tag.blockNum != key->block_num ||
+		source->tag.blockNum != key->block_num)
+		return false;
+
+	target_frame = pg_atomic_read_u32(&BufferFrameIds[target->buf_id]);
+	source_frame = pg_atomic_read_u32(&BufferFrameIds[source->buf_id]);
+	if (target_frame != (BufferFrameId) target->buf_id ||
+		source_frame != (BufferFrameId) source->buf_id ||
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[target->buf_id]) != 1 ||
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[source->buf_id]) < 1)
+		return false;
+
+	return true;
+}
+
+void
+TestOnlyConfigureDBBranchFramePromotion(bool enabled, Oid family_root_dboid,
+										bool override_hash, uint64 content_hash)
+{
+	TestOnlyDBBranchFramePromotionEnabled = enabled;
+	TestOnlyDBBranchFrameFamilyOverride = family_root_dboid;
+	TestOnlyDBBranchFrameHashOverrideEnabled = override_hash;
+	TestOnlyDBBranchFrameHashOverride = content_hash;
+}
+
+void
+TestOnlyResetDBBranchFramePromotionStats(void)
+{
+	pg_atomic_write_u64(&DBBranchFrameStats->attempts, 0);
+	pg_atomic_write_u64(&DBBranchFrameStats->registrations, 0);
+	pg_atomic_write_u64(&DBBranchFrameStats->hash_matches, 0);
+	pg_atomic_write_u64(&DBBranchFrameStats->full_mismatches, 0);
+	pg_atomic_write_u64(&DBBranchFrameStats->promotions, 0);
+	pg_atomic_write_u64(&DBBranchFrameStats->skips, 0);
+}
+
+/*
+ * Try to replace a just-read private frame with an equal family candidate.
+ * The feature is test-only until Phase 4 closes all in-place mutation paths.
+ * A miss merely registers one weak candidate; every hit is confirmed by a
+ * full-page comparison while both content locks are held exclusively.
+ */
+static void
+TryDBBranchFramePromotion(Buffer target_buffer, char persistence)
+{
+	BufferDesc *target;
+	BufferDesc *source;
+	BufferTag	target_tag;
+	DBBranchFrameCandidateKey key;
+	DBBranchFrameCandidate target_candidate;
+	DBBranchFrameCandidate candidate;
+	Oid			family_root_dboid;
+	uint64		target_hash;
+	uint32		target_state;
+	uint32		source_state;
+	uint32		target_hashcode;
+	uint32		target_tag_generation;
+	uint32		old_attachments;
+	uint32		old_nonidentity PG_USED_FOR_ASSERTS_ONLY;
+	PinBufferResult pin_result;
+	bool		source_pinned = false;
+	bool		content_locked = false;
+	bool		replace_candidate = false;
+
+	if (!TestOnlyDBBranchFramePromotionEnabled ||
+		persistence != RELPERSISTENCE_PERMANENT ||
+		!BufferIsValid(target_buffer) || BufferIsLocal(target_buffer) ||
+		RecoveryInProgress())
+		return;
+
+	if (OidIsValid(TestOnlyDBBranchFrameFamilyOverride))
+		family_root_dboid = TestOnlyDBBranchFrameFamilyOverride;
+	else if (!GetMyDBBranchSharedReadOnlyFamily(&family_root_dboid))
+		return;
+
+	target = GetBufferDescriptor(target_buffer - 1);
+	if (GetPrivateRefCount(target_buffer) != 1 ||
+		LWLockHeldByMe(BufferDescriptorGetContentLock(target)))
+		return;
+
+	pg_atomic_fetch_add_u64(&DBBranchFrameStats->attempts, 1);
+	if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(target),
+								  LW_EXCLUSIVE))
+		goto skipped;
+
+	target_state = LockBufHdr(target);
+	if (BUF_STATE_GET_REFCOUNT(target_state) != 1 ||
+		(target_state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT)) !=
+		(BM_VALID | BM_TAG_VALID | BM_PERMANENT) ||
+		(target_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS |
+						 BM_IO_ERROR | BM_PIN_COUNT_WAITER)) != 0 ||
+		BufferWriteIntentOwner(target) != INVALID_PROC_NUMBER ||
+		target->tag.dbOid != MyDatabaseId ||
+		BufTagGetForkNum(&target->tag) != MAIN_FORKNUM ||
+		!BufferHasPrivateFrame(target))
+	{
+		UnlockBufHdr(target, target_state);
+		LWLockRelease(BufferDescriptorGetContentLock(target));
+		goto skipped;
+	}
+
+	target_tag = target->tag;
+	target_tag_generation =
+		pg_atomic_read_u32(&BufferTagGenerations[target->buf_id]);
+	if (TestOnlyDBBranchFrameHashOverrideEnabled)
+		target_hash = TestOnlyDBBranchFrameHashOverride;
+	else
+		target_hash = hash_bytes_extended(
+										  (unsigned char *) (BufferBlocks + ((Size) target->buf_id * BLCKSZ)),
+										  BLCKSZ, 0);
+
+	MemSet(&key, 0, sizeof(key));
+	key.family_root_db_oid = family_root_dboid;
+	key.spc_oid = target_tag.spcOid;
+	key.rel_number = BufTagGetRelNumber(&target_tag);
+	key.fork_num = BufTagGetForkNum(&target_tag);
+	key.block_num = target_tag.blockNum;
+	key.content_hash = target_hash;
+
+	target_candidate.source_tag = target_tag;
+	target_candidate.source_buf_id = target->buf_id;
+	target_candidate.source_tag_generation = target_tag_generation;
+	UnlockBufHdr(target, target_state);
+	LWLockRelease(BufferDescriptorGetContentLock(target));
+
+	if (!DBBranchFrameCandidateLookup(&key, &candidate))
+	{
+		if (DBBranchFrameCandidateReplace(&key, NULL, &target_candidate))
+			pg_atomic_fetch_add_u64(&DBBranchFrameStats->registrations, 1);
+		else
+			pg_atomic_fetch_add_u64(&DBBranchFrameStats->skips, 1);
+		return;
+	}
+
+	if (candidate.source_buf_id == target->buf_id &&
+		candidate.source_tag_generation == target_tag_generation &&
+		BufferTagsEqual(&candidate.source_tag, &target_tag))
+		goto skipped;
+	if (candidate.source_buf_id == target->buf_id)
+	{
+		replace_candidate = true;
+		goto skipped;
+	}
+
+	pg_atomic_fetch_add_u64(&DBBranchFrameStats->hash_matches, 1);
+	if (candidate.source_buf_id < 0 || candidate.source_buf_id >= NBuffers)
+	{
+		replace_candidate = true;
+		goto skipped;
+	}
+
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+	ReservePrivateRefCountEntry();
+	target_hashcode = BufTableHashCode(&candidate.source_tag);
+	LWLockAcquire(BufMappingPartitionLock(target_hashcode), LW_SHARED);
+	if (BufTableLookup(&candidate.source_tag, target_hashcode) !=
+		candidate.source_buf_id)
+	{
+		LWLockRelease(BufMappingPartitionLock(target_hashcode));
+		replace_candidate = true;
+		goto skipped;
+	}
+
+	source = GetBufferDescriptor(candidate.source_buf_id);
+	pin_result = PinBuffer(source, NULL);
+	LWLockRelease(BufMappingPartitionLock(target_hashcode));
+	if (pin_result == PINBUFFER_WRITE_GATED)
+		goto skipped;
+	source_pinned = true;
+	if (pin_result != PINBUFFER_VALID ||
+		pg_atomic_read_u32(&BufferTagGenerations[source->buf_id]) !=
+		candidate.source_tag_generation)
+	{
+		replace_candidate = true;
+		goto skipped;
+	}
+
+	INJECTION_POINT("dbbranch-frame-promotion-before-content-lock", NULL);
+	if (LWLockHeldByMe(BufferDescriptorGetContentLock(source)) ||
+		!LockBufferContentPairConditional(target, source))
+		goto skipped;
+	content_locked = true;
+
+	LockBufferDescriptorPair(target, source, &target_state, &source_state);
+	if (!DBBranchFramePromotionPairValid(target, source,
+										 target_state, source_state,
+										 &target_tag, target_tag_generation,
+										 &key, &candidate))
+	{
+		UnlockBufferDescriptorPair(target, source,
+								   target_state, source_state);
+		goto skipped;
+	}
+	UnlockBufferDescriptorPair(target, source, target_state, source_state);
+
+	if ((!TestOnlyDBBranchFrameHashOverrideEnabled &&
+		 hash_bytes_extended(
+							 (unsigned char *) (BufferBlocks +
+												((Size) target->buf_id * BLCKSZ)),
+							 BLCKSZ, 0) != key.content_hash) ||
+		memcmp(BufferBlocks + ((Size) target->buf_id * BLCKSZ),
+			   BufferBlocks + ((Size) source->buf_id * BLCKSZ),
+			   BLCKSZ) != 0)
+	{
+		pg_atomic_fetch_add_u64(&DBBranchFrameStats->full_mismatches, 1);
+		replace_candidate = true;
+		goto skipped;
+	}
+	/* Refcount=1 here proves no earlier target Page pointer is still live. */
+	LockBufferDescriptorPair(target, source, &target_state, &source_state);
+	if (!DBBranchFramePromotionPairValid(target, source,
+										 target_state, source_state,
+										 &target_tag, target_tag_generation,
+										 &key, &candidate))
+	{
+		UnlockBufferDescriptorPair(target, source,
+								   target_state, source_state);
+		goto skipped;
+	}
+
+	old_attachments =
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[source->buf_id]);
+	Assert(old_attachments > 0 && old_attachments < (uint32) NBuffers);
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[source->buf_id],
+						old_attachments + 1);
+	old_nonidentity = pg_atomic_fetch_add_u32(BufferNonIdentityFrameCount, 1);
+	Assert(old_nonidentity < (uint32) NBuffers);
+	pg_write_barrier();
+	pg_atomic_write_u32(&BufferFrameIds[target->buf_id], source->buf_id);
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[target->buf_id], 0);
+	pg_atomic_fetch_add_u32(&BufferFrameGenerations[target->buf_id], 1);
+	UnlockBufferDescriptorPair(target, source, target_state, source_state);
+
+	UnlockBufferContentPair(target, source);
+	content_locked = false;
+	DBBranchFrameCandidateUnregister(target->buf_id);
+	ReleaseBuffer(BufferDescriptorGetBuffer(source));
+	pg_atomic_fetch_add_u64(&DBBranchFrameStats->promotions, 1);
+	return;
+
+skipped:
+	if (content_locked)
+		UnlockBufferContentPair(target, source);
+	if (source_pinned)
+		ReleaseBuffer(BufferDescriptorGetBuffer(source));
+	if (replace_candidate &&
+		DBBranchFrameCandidateReplace(&key, &candidate, &target_candidate))
+		pg_atomic_fetch_add_u64(&DBBranchFrameStats->registrations, 1);
+	pg_atomic_fetch_add_u64(&DBBranchFrameStats->skips, 1);
 }
 
 /*

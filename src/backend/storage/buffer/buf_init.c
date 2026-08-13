@@ -24,6 +24,7 @@ pg_atomic_uint32 *BufferFrameIds;
 pg_atomic_uint32 *BufferNonIdentityFrameCount;
 pg_atomic_uint32 *BufferFrameAttachmentCounts;
 pg_atomic_uint32 *BufferFrameGenerations;
+pg_atomic_uint32 *BufferTagGenerations;
 pg_atomic_uint32 *BufferWriteIntentOwners;
 ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
@@ -96,9 +97,9 @@ BufferManagerShmemInit(void)
 	 * Keep the test-only frame metadata in one allocation:
 	 *
 	 * non-identity count, descriptor mappings, frame attachment counts,
-	 * descriptor mapping generations.
+	 * descriptor mapping generations, descriptor tag generations.
 	 */
-	frameMapEntries = add_size(mul_size((Size) NBuffers, 3), 1);
+	frameMapEntries = add_size(mul_size((Size) NBuffers, 4), 1);
 	frameMap = (pg_atomic_uint32 *)
 		ShmemInitStruct("Buffer Frame IDs",
 						mul_size(frameMapEntries,
@@ -108,6 +109,7 @@ BufferManagerShmemInit(void)
 	BufferFrameIds = &frameMap[1];
 	BufferFrameAttachmentCounts = &frameMap[1 + NBuffers];
 	BufferFrameGenerations = &frameMap[1 + (2 * NBuffers)];
+	BufferTagGenerations = &frameMap[1 + (3 * NBuffers)];
 
 	BufferWriteIntentOwners = (pg_atomic_uint32 *)
 		ShmemInitStruct("Buffer Write Intent Owners",
@@ -165,6 +167,7 @@ BufferManagerShmemInit(void)
 			pg_atomic_init_u32(&BufferFrameIds[i], i);
 			pg_atomic_init_u32(&BufferFrameAttachmentCounts[i], 1);
 			pg_atomic_init_u32(&BufferFrameGenerations[i], 0);
+			pg_atomic_init_u32(&BufferTagGenerations[i], 0);
 			pg_atomic_init_u32(&BufferWriteIntentOwners[i],
 							   INVALID_PROC_NUMBER);
 			buf->wait_backend_pgprocno = INVALID_PROC_NUMBER;
@@ -205,6 +208,7 @@ BufferManagerShmemInit(void)
 			Assert(pg_atomic_read_u32(&BufferFrameIds[i]) == (uint32) i);
 			Assert(pg_atomic_read_u32(&BufferFrameAttachmentCounts[i]) == 1);
 			Assert(pg_atomic_read_u32(&BufferFrameGenerations[i]) == 0);
+			Assert(pg_atomic_read_u32(&BufferTagGenerations[i]) == 0);
 			Assert(pg_atomic_read_u32(&BufferWriteIntentOwners[i]) ==
 				   INVALID_PROC_NUMBER);
 		}
@@ -237,10 +241,10 @@ BufferManagerShmemSize(void)
 
 	/*
 	 * Descriptor-to-frame identifiers plus test-only attachment counts and
-	 * mapping generations.
+	 * mapping generations and descriptor tag generations.
 	 */
 	size = add_size(size,
-					mul_size(add_size(mul_size((Size) NBuffers, 3), 1),
+					mul_size(add_size(mul_size((Size) NBuffers, 4), 1),
 							 sizeof(pg_atomic_uint32)));
 
 	/* write-intent owner for each shared buffer */

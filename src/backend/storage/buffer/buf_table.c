@@ -32,6 +32,70 @@ typedef struct
 
 static HTAB *SharedBufHash;
 
+typedef struct DBBranchFrameCandidateEnt
+{
+	DBBranchFrameCandidateKey key;
+	DBBranchFrameCandidate candidate;
+}			DBBranchFrameCandidateEnt;
+
+typedef struct DBBranchFrameCandidateSlot
+{
+	bool		active;
+	DBBranchFrameCandidateKey key;
+	uint32		tag_generation;
+}			DBBranchFrameCandidateSlot;
+
+typedef struct DBBranchFrameCandidateControl
+{
+	LWLock		lock;
+	DBBranchFramePromotionStats stats;
+}			DBBranchFrameCandidateControl;
+
+static HTAB *DBBranchFrameCandidateHash;
+static DBBranchFrameCandidateControl * DBBranchFrameCandidateCtl;
+static DBBranchFrameCandidateSlot * DBBranchFrameCandidateSlots;
+DBBranchFramePromotionStats *DBBranchFrameStats;
+
+static bool
+DBBranchFrameCandidatesEqual(const DBBranchFrameCandidate * left,
+							 const DBBranchFrameCandidate * right)
+{
+	return left->source_buf_id == right->source_buf_id &&
+		left->source_tag_generation == right->source_tag_generation &&
+		BufferTagsEqual(&left->source_tag, &right->source_tag);
+}
+
+static bool
+DBBranchFrameCandidateKeysEqual(const DBBranchFrameCandidateKey * left,
+								const DBBranchFrameCandidateKey * right)
+{
+	return memcmp(left, right, sizeof(*left)) == 0;
+}
+
+/* Caller holds DBBranchFrameCandidateCtl->lock exclusively. */
+static void
+DBBranchFrameCandidateForgetSlot(int buf_id)
+{
+	DBBranchFrameCandidateSlot *slot;
+	DBBranchFrameCandidateEnt *entry;
+
+	Assert(buf_id >= 0 && buf_id < NBuffers);
+
+	slot = &DBBranchFrameCandidateSlots[buf_id];
+	if (!slot->active)
+		return;
+
+	entry = hash_search(DBBranchFrameCandidateHash, &slot->key,
+						HASH_FIND, NULL);
+	if (entry != NULL &&
+		entry->candidate.source_buf_id == buf_id &&
+		entry->candidate.source_tag_generation == slot->tag_generation)
+		hash_search(DBBranchFrameCandidateHash, &slot->key,
+					HASH_REMOVE, NULL);
+
+	slot->active = false;
+}
+
 
 /*
  * Estimate space needed for mapping hashtable
@@ -40,7 +104,19 @@ static HTAB *SharedBufHash;
 Size
 BufTableShmemSize(int size)
 {
-	return hash_estimate_size(size, sizeof(BufferLookupEnt));
+	Size		shmem_size;
+
+	shmem_size = hash_estimate_size(size, sizeof(BufferLookupEnt));
+	shmem_size = add_size(shmem_size,
+						  hash_estimate_size(size,
+											 sizeof(DBBranchFrameCandidateEnt)));
+	shmem_size = add_size(shmem_size,
+						  mul_size(NBuffers,
+								   sizeof(DBBranchFrameCandidateSlot)));
+	shmem_size = add_size(shmem_size,
+						  MAXALIGN(sizeof(DBBranchFrameCandidateControl)));
+
+	return shmem_size;
 }
 
 /*
@@ -51,6 +127,8 @@ void
 InitBufTable(int size)
 {
 	HASHCTL		info;
+	bool		found_control;
+	bool		found_slots;
 
 	/* assume no locking is needed yet */
 
@@ -63,6 +141,144 @@ InitBufTable(int size)
 								  size, size,
 								  &info,
 								  HASH_ELEM | HASH_BLOBS | HASH_PARTITION);
+
+	/*
+	 * Page-frame candidates use one short-lived lock.  Promotion is disabled
+	 * in normal backends until the immutable lifecycle is complete, so a
+	 * partitioned second lock hierarchy would add risk without current value.
+	 */
+	DBBranchFrameCandidateCtl = (DBBranchFrameCandidateControl *)
+		ShmemInitStruct("DB Branch Frame Candidate Control",
+						sizeof(DBBranchFrameCandidateControl),
+						&found_control);
+	DBBranchFrameCandidateSlots = (DBBranchFrameCandidateSlot *)
+		ShmemInitStruct("DB Branch Frame Candidate Slots",
+						mul_size(NBuffers,
+								 sizeof(DBBranchFrameCandidateSlot)),
+						&found_slots);
+
+	MemSet(&info, 0, sizeof(info));
+	info.keysize = sizeof(DBBranchFrameCandidateKey);
+	info.entrysize = sizeof(DBBranchFrameCandidateEnt);
+	DBBranchFrameCandidateHash =
+		ShmemInitHash("DB Branch Frame Candidate Table",
+					  size, size, &info, HASH_ELEM | HASH_BLOBS);
+
+	if (!found_control)
+	{
+		LWLockInitialize(&DBBranchFrameCandidateCtl->lock,
+						 LWTRANCHE_BUFFER_MAPPING);
+		pg_atomic_init_u64(&DBBranchFrameCandidateCtl->stats.attempts, 0);
+		pg_atomic_init_u64(&DBBranchFrameCandidateCtl->stats.registrations, 0);
+		pg_atomic_init_u64(&DBBranchFrameCandidateCtl->stats.hash_matches, 0);
+		pg_atomic_init_u64(&DBBranchFrameCandidateCtl->stats.full_mismatches, 0);
+		pg_atomic_init_u64(&DBBranchFrameCandidateCtl->stats.promotions, 0);
+		pg_atomic_init_u64(&DBBranchFrameCandidateCtl->stats.skips, 0);
+	}
+	if (!found_slots)
+		MemSet(DBBranchFrameCandidateSlots, 0,
+			   mul_size(NBuffers, sizeof(DBBranchFrameCandidateSlot)));
+
+	Assert(found_control == found_slots);
+	DBBranchFrameStats = &DBBranchFrameCandidateCtl->stats;
+}
+
+bool
+DBBranchFrameCandidateLookup(const DBBranchFrameCandidateKey * key,
+							 DBBranchFrameCandidate * candidate)
+{
+	DBBranchFrameCandidateEnt *entry;
+
+	LWLockAcquire(&DBBranchFrameCandidateCtl->lock, LW_SHARED);
+	entry = hash_search(DBBranchFrameCandidateHash, (void *) key,
+						HASH_FIND, NULL);
+	if (entry != NULL)
+		*candidate = entry->candidate;
+	LWLockRelease(&DBBranchFrameCandidateCtl->lock);
+
+	return entry != NULL;
+}
+
+/*
+ * Replace a weak candidate only if the table still contains expected.  A
+ * NULL expected means that the key must still be absent.
+ */
+bool
+DBBranchFrameCandidateReplace(const DBBranchFrameCandidateKey * key,
+							  const DBBranchFrameCandidate * expected,
+							  const DBBranchFrameCandidate * replacement)
+{
+	DBBranchFrameCandidateEnt *entry;
+	DBBranchFrameCandidate old_candidate;
+	DBBranchFrameCandidateSlot *old_slot;
+	DBBranchFrameCandidateSlot *replacement_slot;
+	bool		found;
+	bool		had_old = false;
+
+	Assert(replacement->source_buf_id >= 0 &&
+		   replacement->source_buf_id < NBuffers);
+
+	LWLockAcquire(&DBBranchFrameCandidateCtl->lock, LW_EXCLUSIVE);
+	entry = hash_search(DBBranchFrameCandidateHash, (void *) key,
+						HASH_FIND, NULL);
+	if ((expected == NULL && entry != NULL) ||
+		(expected != NULL &&
+		 (entry == NULL ||
+		  !DBBranchFrameCandidatesEqual(&entry->candidate, expected))))
+	{
+		LWLockRelease(&DBBranchFrameCandidateCtl->lock);
+		return false;
+	}
+
+	if (entry != NULL)
+	{
+		old_candidate = entry->candidate;
+		had_old = true;
+		hash_search(DBBranchFrameCandidateHash, (void *) key,
+					HASH_REMOVE, NULL);
+	}
+
+	DBBranchFrameCandidateForgetSlot(replacement->source_buf_id);
+
+	if (had_old && old_candidate.source_buf_id != replacement->source_buf_id)
+	{
+		old_slot = &DBBranchFrameCandidateSlots[old_candidate.source_buf_id];
+		if (old_slot->active &&
+			old_slot->tag_generation == old_candidate.source_tag_generation &&
+			DBBranchFrameCandidateKeysEqual(&old_slot->key, key))
+			old_slot->active = false;
+	}
+
+	entry = hash_search(DBBranchFrameCandidateHash, (void *) key,
+						HASH_ENTER_NULL, &found);
+	if (entry == NULL)
+	{
+		LWLockRelease(&DBBranchFrameCandidateCtl->lock);
+		return false;
+	}
+	Assert(!found);
+
+	entry->candidate = *replacement;
+	replacement_slot =
+		&DBBranchFrameCandidateSlots[replacement->source_buf_id];
+	replacement_slot->key = *key;
+	replacement_slot->tag_generation =
+		replacement->source_tag_generation;
+	replacement_slot->active = true;
+
+	LWLockRelease(&DBBranchFrameCandidateCtl->lock);
+	return true;
+}
+
+void
+DBBranchFrameCandidateUnregister(int buf_id)
+{
+	if (buf_id < 0 || buf_id >= NBuffers)
+		return;
+
+	LWLockAcquire(&DBBranchFrameCandidateCtl->lock, LW_EXCLUSIVE);
+	DBBranchFrameCandidateForgetSlot(buf_id);
+	LWLockRelease(&DBBranchFrameCandidateCtl->lock);
 }
 
 /*
@@ -148,6 +364,21 @@ void
 BufTableDelete(BufferTag *tagPtr, uint32 hashcode)
 {
 	BufferLookupEnt *result;
+	int			buf_id;
+
+	result = (BufferLookupEnt *)
+		hash_search_with_hash_value(SharedBufHash,
+									tagPtr,
+									hashcode,
+									HASH_FIND,
+									NULL);
+
+	if (!result)				/* shouldn't happen */
+		elog(ERROR, "shared buffer hash table corrupted");
+
+	buf_id = result->id;
+	DBBranchFrameCandidateUnregister(buf_id);
+	pg_atomic_fetch_add_u32(&BufferTagGenerations[buf_id], 1);
 
 	result = (BufferLookupEnt *)
 		hash_search_with_hash_value(SharedBufHash,
@@ -155,7 +386,6 @@ BufTableDelete(BufferTag *tagPtr, uint32 hashcode)
 									hashcode,
 									HASH_REMOVE,
 									NULL);
-
-	if (!result)				/* shouldn't happen */
+	if (!result)
 		elog(ERROR, "shared buffer hash table corrupted");
 }

@@ -114,3 +114,30 @@ CREATE FUNCTION test_buffer_frame_pages_alias(regclass, int4, regclass, int4)
 RETURNS boolean
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_promote(
+	regclass, int4, oid DEFAULT NULL, int8 DEFAULT NULL,
+	boolean DEFAULT false)
+RETURNS int4
+AS 'MODULE_PATHNAME'
+LANGUAGE C PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_reset_promotion_stats()
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_promotion_stats()
+RETURNS text
+AS 'MODULE_PATHNAME'
+LANGUAGE C PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_hold_page_lock(regclass, int4, text)
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+CREATE FUNCTION test_buffer_frame_overwrite_clean_page(regclass, int4, int4)
+RETURNS void
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;

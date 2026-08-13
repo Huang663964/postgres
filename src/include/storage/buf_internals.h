@@ -112,6 +112,38 @@ typedef struct buftag
 	BlockNumber blockNum;		/* blknum relative to begin of reln */
 } BufferTag;
 
+/*
+ * Family-scoped immutable frame candidate identity.  content_hash narrows
+ * the candidate set; callers must still compare all BLCKSZ bytes.
+ */
+typedef struct DBBranchFrameCandidateKey
+{
+	Oid			family_root_db_oid;
+	Oid			spc_oid;
+	RelFileNumber rel_number;
+	ForkNumber	fork_num;
+	BlockNumber block_num;
+	uint64		content_hash;
+}			DBBranchFrameCandidateKey;
+
+/* Weak candidate ownership stored in the shared candidate table. */
+typedef struct DBBranchFrameCandidate
+{
+	BufferTag	source_tag;
+	int			source_buf_id;
+	uint32		source_tag_generation;
+}			DBBranchFrameCandidate;
+
+typedef struct DBBranchFramePromotionStats
+{
+	pg_atomic_uint64 attempts;
+	pg_atomic_uint64 registrations;
+	pg_atomic_uint64 hash_matches;
+	pg_atomic_uint64 full_mismatches;
+	pg_atomic_uint64 promotions;
+	pg_atomic_uint64 skips;
+}			DBBranchFramePromotionStats;
+
 static inline RelFileNumber
 BufTagGetRelNumber(const BufferTag *tag)
 {
@@ -328,7 +360,9 @@ extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT pg_atomic_uint32 *BufferFrameAttachmentCounts;
 extern PGDLLIMPORT pg_atomic_uint32 *BufferFrameGenerations;
+extern PGDLLIMPORT pg_atomic_uint32 *BufferTagGenerations;
 extern PGDLLIMPORT pg_atomic_uint32 *BufferWriteIntentOwners;
+extern PGDLLIMPORT DBBranchFramePromotionStats * DBBranchFrameStats;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 
 /* in localbuf.c */
@@ -465,6 +499,11 @@ extern void TerminateBufferIO(BufferDesc *buf, bool clear_dirty, uint32 set_flag
 extern void TestOnlyAttachBufferFrame(Buffer target, Buffer source,
 									  const BufferTag *expected_source_tag);
 extern void TestOnlyDetachBufferFrame(Buffer target);
+extern void TestOnlyConfigureDBBranchFramePromotion(bool enabled,
+													Oid family_root_dboid,
+													bool override_hash,
+													uint64 content_hash);
+extern void TestOnlyResetDBBranchFramePromotionStats(void);
 
 
 /* freelist.c */
@@ -489,6 +528,12 @@ extern uint32 BufTableHashCode(BufferTag *tagPtr);
 extern int	BufTableLookup(BufferTag *tagPtr, uint32 hashcode);
 extern int	BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag *tagPtr, uint32 hashcode);
+extern bool DBBranchFrameCandidateLookup(const DBBranchFrameCandidateKey * key,
+										 DBBranchFrameCandidate * candidate);
+extern bool DBBranchFrameCandidateReplace(const DBBranchFrameCandidateKey * key,
+										  const DBBranchFrameCandidate * expected,
+										  const DBBranchFrameCandidate * replacement);
+extern void DBBranchFrameCandidateUnregister(int buf_id);
 
 /* localbuf.c */
 extern bool PinLocalBuffer(BufferDesc *buf_hdr, bool adjust_usagecount);

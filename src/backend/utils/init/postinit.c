@@ -31,6 +31,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_dbbranch.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
 #include "libpq/auth.h"
@@ -1174,6 +1175,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * least the minimum set of "nailed-in" cache entries.
 	 */
 	RelationCacheInitializePhase3();
+	InitializeDBBranchSessionBufferMode();
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();
