@@ -139,8 +139,8 @@ LockDBBranchVacuumWriteGate(void)
 	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
 		return;
 
-	/* ponytail: VACUUM can dirty relation pages without assigning an XID. */
-	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+	/* VACUUM can dirty relation pages without assigning an XID. */
+	LockDBBranchWriteGate(MyDatabaseId);
 }
 
 /*

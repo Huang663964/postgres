@@ -236,8 +236,11 @@ static bool LockDBBranchSourceWriteGate(Oid source_dboid, int *npreparedxacts);
 static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
 									  Oid tablespace_oid);
 static void CopyDBBranchDatabaseSettings(Oid source_dboid, Oid branch_dboid);
+static void CheckDBBranchDropDependencies(Oid dboid);
 static void DeleteDBBranchCatalogForDatabase(Oid dboid);
+static Oid LookupDBBranchFamilyRoot(Oid source_dboid);
 static void InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
+								  Oid family_root_dboid, char buffer_mode,
 								  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 								  const DBBranchWalScan *wal_scan,
 								  double source_blocking_ms,
@@ -1830,6 +1833,7 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 
 	LockDBBranchTargetWriteGate(db_id);
 	INJECTION_POINT("db-branch-drop-database-target-gate", NULL);
+	CheckDBBranchDropDependencies(db_id);
 
 	pgdbrel = table_open(DatabaseRelationId, RowExclusiveLock);
 
@@ -4065,6 +4069,47 @@ ReleaseDBBranchWalPin(void)
 		ReplicationSlotDropAcquired();
 }
 
+/*
+ * Serialize with CREATE BRANCH and reject writes to a durable shared-readonly
+ * branch.  The catalog check happens after the object lock, so a future mode
+ * transition can use the same lock as its publication boundary.
+ */
+void
+LockDBBranchWriteGate(Oid dboid)
+{
+	Relation	relation;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	char		buffer_mode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
+
+	if (!OidIsValid(dboid) || IsBootstrapProcessingMode())
+		return;
+
+	LockSharedObject(DbBranchRelationId, dboid, 0, RowExclusiveLock);
+
+	relation = table_open(DbBranchRelationId, AccessShareLock);
+	ScanKeyInit(&key[0],
+				Anum_pg_dbbranch_branch_db_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(dboid));
+	scan = systable_beginscan(relation, DbBranchBranchIndexId, true,
+							  NULL, 1, key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+		buffer_mode = ((Form_pg_dbbranch) GETSTRUCT(tuple))->buffer_mode;
+	systable_endscan(scan);
+	table_close(relation, AccessShareLock);
+
+	if (buffer_mode != DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("database branch is shared read-only"),
+				 errdetail("Database branch with OID %u has buffer mode \"%c\".",
+						   dboid, buffer_mode),
+				 errhint("Create a private writable branch when writes are required.")));
+}
+
 static void
 LockDBBranchTargetWriteGate(Oid dboid)
 {
@@ -4151,6 +4196,40 @@ CopyDBBranchDatabaseSettings(Oid source_dboid, Oid branch_dboid)
 }
 
 static void
+CheckDBBranchDropDependencies(Oid dboid)
+{
+	Relation	relation;
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			dependent_dboid = InvalidOid;
+
+	relation = table_open(DbBranchRelationId, AccessShareLock);
+	scan = systable_beginscan(relation, InvalidOid, false, NULL, 0, NULL);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_dbbranch form = (Form_pg_dbbranch) GETSTRUCT(tuple);
+
+		if (form->buffer_mode != DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE &&
+			form->branch_db_oid != dboid &&
+			(form->source_db_oid == dboid || form->family_root_db_oid == dboid))
+		{
+			dependent_dboid = form->branch_db_oid;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(relation, AccessShareLock);
+
+	if (OidIsValid(dependent_dboid))
+		ereport(ERROR,
+				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+				 errmsg("cannot drop database while shared-readonly branches depend on it"),
+				 errdetail("Shared-readonly database branch with OID %u depends on database OID %u.",
+						   dependent_dboid, dboid),
+				 errhint("Drop the dependent shared-readonly branches first.")));
+}
+
+static void
 DeleteDBBranchCatalogForDatabase(Oid dboid)
 {
 	Relation	relation;
@@ -4183,8 +4262,39 @@ DeleteDBBranchCatalogForDatabase(Oid dboid)
 	table_close(relation, RowExclusiveLock);
 }
 
+static Oid
+LookupDBBranchFamilyRoot(Oid source_dboid)
+{
+	Relation	relation;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Oid			family_root_dboid = source_dboid;
+
+	relation = table_open(DbBranchRelationId, AccessShareLock);
+	ScanKeyInit(&key[0],
+				Anum_pg_dbbranch_branch_db_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(source_dboid));
+	scan = systable_beginscan(relation, DbBranchBranchIndexId, true,
+							  NULL, 1, key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_dbbranch form = (Form_pg_dbbranch) GETSTRUCT(tuple);
+
+		if (OidIsValid(form->family_root_db_oid))
+			family_root_dboid = form->family_root_db_oid;
+	}
+	systable_endscan(scan);
+	table_close(relation, AccessShareLock);
+
+	return family_root_dboid;
+}
+
 static void
 InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
+					  Oid family_root_dboid, char buffer_mode,
 					  XLogRecPtr redo_ptr, XLogRecPtr branch_lsn,
 					  const DBBranchWalScan *wal_scan,
 					  double source_blocking_ms,
@@ -4203,6 +4313,9 @@ InsertDBBranchCatalog(Oid source_dboid, Oid branch_dboid,
 
 	values[Anum_pg_dbbranch_source_db_oid - 1] = ObjectIdGetDatum(source_dboid);
 	values[Anum_pg_dbbranch_branch_db_oid - 1] = ObjectIdGetDatum(branch_dboid);
+	values[Anum_pg_dbbranch_family_root_db_oid - 1] =
+		ObjectIdGetDatum(family_root_dboid);
+	values[Anum_pg_dbbranch_buffer_mode - 1] = CharGetDatum(buffer_mode);
 	values[Anum_pg_dbbranch_redo_ptr - 1] = LSNGetDatum(redo_ptr);
 	values[Anum_pg_dbbranch_branch_lsn - 1] = LSNGetDatum(branch_lsn);
 	values[Anum_pg_dbbranch_wal_range_bytes - 1] =
@@ -4280,10 +4393,12 @@ ScanDBBranchSourceRelations(Oid source_dboid, Oid source_deftablespace,
 }
 
 Oid
-CreateDatabaseBranch(const char *source_name, const char *branch_name)
+CreateDatabaseBranch(const char *source_name, const char *branch_name,
+					 bool shared_read_only)
 {
 	Oid		source_dboid;
 	Oid		locked_source_dboid;
+	Oid		family_root_dboid;
 	int		source_encoding;
 	bool		source_istemplate;
 	bool		source_allowconn;
@@ -4472,6 +4587,7 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("source database \"%s\" changed while creating branch",
 						source_name)));
+	family_root_dboid = LookupDBBranchFamilyRoot(source_dboid);
 
 	if (database_is_invalid_oid(source_dboid))
 		ereport(ERROR,
@@ -4809,7 +4925,11 @@ CreateDatabaseBranch(const char *source_name, const char *branch_name)
 		foreach(cell, tablespace_oids)
 			LogDBBranchCreateFileCopy(source_dboid, branch_dboid, lfirst_oid(cell));
 		ready_at = GetCurrentTimestamp();
-		InsertDBBranchCatalog(source_dboid, branch_dboid, redo_ptr, branch_lsn,
+		InsertDBBranchCatalog(source_dboid, branch_dboid, family_root_dboid,
+						  shared_read_only ?
+						  DBBRANCH_BUFFER_MODE_SHARED_READ_ONLY :
+						  DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE,
+						  redo_ptr, branch_lsn,
 						  wal_scan,
 						  source_blocking_ms, clone_elapsed_ms, replay_elapsed_ms,
 						  created_at, ready_at, clone_result,

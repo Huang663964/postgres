@@ -3881,6 +3881,7 @@ typedef struct CreateDbBranchStmt
 	NodeTag		type;
 	char	   *branchname;		/* name of database branch to create */
 	char	   *sourcename;		/* source database name */
+	bool		shared_read_only; /* request persistent shared-readonly mode */
 } CreateDbBranchStmt;
 
 /* ----------------------

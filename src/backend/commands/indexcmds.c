@@ -125,8 +125,8 @@ LockDBBranchReindexWriteGate(void)
 	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
 		return;
 
-	/* ponytail: REINDEX can wait on relation locks before assigning an XID. */
-	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+	/* REINDEX can wait on relation locks before assigning an XID. */
+	LockDBBranchWriteGate(MyDatabaseId);
 }
 
 /*

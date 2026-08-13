@@ -77,8 +77,8 @@ LockDBBranchMatViewWriteGate(void)
 	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
 		return;
 
-	/* ponytail: REFRESH can wait on relation locks before assigning an XID. */
-	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+	/* REFRESH can wait on relation locks before assigning an XID. */
+	LockDBBranchWriteGate(MyDatabaseId);
 }
 
 /*

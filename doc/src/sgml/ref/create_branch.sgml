@@ -23,6 +23,7 @@ PostgreSQL documentation
 <synopsis>
 CREATE BRANCH <replaceable class="parameter">name</replaceable>
     FROM DATABASE <replaceable class="parameter">source_database</replaceable>
+    [ BUFFER SHARED READ ONLY ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -33,6 +34,15 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
    <command>CREATE BRANCH</command> creates a connectable database by cloning
    an existing source database and replaying source database WAL records needed
    to make the branch consistent.
+  </para>
+
+  <para>
+   Without an option, the branch is private and writable.  Specifying
+   <literal>BUFFER SHARED READ ONLY</literal> records a durable branch mode
+   that rejects data definition, data modification, sequence, and maintenance
+   writes, including writes attempted by a superuser after changing
+   <varname>transaction_read_only</varname>.  The source database remains
+   private and writable.
   </para>
 
   <para>
@@ -68,6 +78,17 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
       <para>
        The database whose storage and WAL history are used as the branch
        source.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>BUFFER SHARED READ ONLY</literal></term>
+     <listitem>
+      <para>
+       Create a branch with persistent shared-readonly buffer mode.  This mode
+       is the eligibility and safety contract for later immutable page-frame
+       sharing; it does not by itself establish shared page frames.
       </para>
      </listitem>
     </varlistentry>
@@ -110,6 +131,20 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
    cloned.  Existing idle or read-only sessions can stay connected, but new
    source connections and write transactions wait until the branch setup
    releases the source lock.
+  </para>
+
+  <para>
+   A branch created with <literal>BUFFER SHARED READ ONLY</literal> accepts
+   ordinary reads but rejects writes independently of session configuration.
+   The current implementation has no in-place transition from this mode to a
+   writable mode.  Create a private branch when writes are required.
+  </para>
+
+  <para>
+   A database that is the direct source or family root of a shared-readonly
+   branch cannot be dropped until all dependent shared-readonly branches are
+   dropped.  This prevents removal of the catalog row from silently removing
+   the write policy.  Nested branches inherit the original family-root OID.
   </para>
 
   <para>
@@ -202,6 +237,15 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
    <literal>production</literal>:
 <programlisting>
 CREATE BRANCH test_branch FROM DATABASE production;
+</programlisting>
+  </para>
+
+  <para>
+   Create a persistent shared-readonly branch:
+<programlisting>
+CREATE BRANCH analytics_branch
+    FROM DATABASE production
+    BUFFER SHARED READ ONLY;
 </programlisting>
   </para>
  </refsect1>

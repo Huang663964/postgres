@@ -193,6 +193,7 @@ NOTICE:  checking pg_database {datdba} => pg_authid {oid}
 NOTICE:  checking pg_database {dattablespace} => pg_tablespace {oid}
 NOTICE:  checking pg_dbbranch {source_db_oid} => pg_database {oid}
 NOTICE:  checking pg_dbbranch {branch_db_oid} => pg_database {oid}
+NOTICE:  checking pg_dbbranch {family_root_db_oid} => pg_database {oid}
 NOTICE:  checking pg_db_role_setting {setdatabase} => pg_database {oid}
 NOTICE:  checking pg_db_role_setting {setrole} => pg_authid {oid}
 NOTICE:  checking pg_tablespace {spcowner} => pg_authid {oid}

@@ -316,7 +316,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <str>			opt_single_name
 %type <list>		opt_qualified_name
-%type <boolean>		opt_concurrently
+%type <boolean>		opt_concurrently opt_dbbranch_shared_read_only
 %type <dbehavior>	opt_drop_behavior
 
 %type <node>	alter_column_default opclass_item opclass_drop alter_using
@@ -702,7 +702,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ASENSITIVE ASSERTION ASSIGNMENT ASYMMETRIC ATOMIC AT ATTACH ATTRIBUTE AUTHORIZATION
 
 	BACKWARD BEFORE BEGIN_P BETWEEN BIGINT BINARY BIT
-	BOOLEAN_P BOTH BRANCH BREADTH BY
+	BOOLEAN_P BOTH BRANCH BREADTH BUFFER BY
 
 	CACHE CALL CALLED CASCADE CASCADED CASE CAST CATALOG_P CHAIN CHAR_P
 	CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE
@@ -769,7 +769,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
-	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
+	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHARED SHOW
 	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
@@ -11383,14 +11383,20 @@ LoadStmt:	LOAD file_name
  *****************************************************************************/
 
 CreateDbBranchStmt:
-			CREATE BRANCH name FROM DATABASE name
+			CREATE BRANCH name FROM DATABASE name opt_dbbranch_shared_read_only
 				{
 					CreateDbBranchStmt *n = makeNode(CreateDbBranchStmt);
 
 					n->branchname = $3;
 					n->sourcename = $6;
+					n->shared_read_only = $7;
 					$$ = (Node *) n;
 				}
+		;
+
+opt_dbbranch_shared_read_only:
+			BUFFER SHARED READ ONLY				{ $$ = true; }
+			| /* EMPTY */						{ $$ = false; }
 		;
 
 /****************************************************************************
@@ -17725,6 +17731,7 @@ unreserved_keyword:
 			| BEGIN_P
 			| BRANCH
 			| BREADTH
+			| BUFFER
 			| BY
 			| CACHE
 			| CALL
@@ -17964,6 +17971,7 @@ unreserved_keyword:
 			| SET
 			| SETS
 			| SHARE
+			| SHARED
 			| SHOW
 			| SIMPLE
 			| SKIP
@@ -18281,6 +18289,7 @@ bare_label_keyword:
 			| BOTH
 			| BRANCH
 			| BREADTH
+			| BUFFER
 			| BY
 			| CACHE
 			| CALL
@@ -18601,6 +18610,7 @@ bare_label_keyword:
 			| SETOF
 			| SETS
 			| SHARE
+			| SHARED
 			| SHOW
 			| SIMILAR
 			| SIMPLE

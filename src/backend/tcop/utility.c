@@ -91,8 +91,8 @@ LockDBBranchUtilityWriteGate(void)
 	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
 		return;
 
-	/* ponytail: utility DDL can wait on relation locks before assigning an XID. */
-	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+	/* Utility DDL can wait on relation locks before assigning an XID. */
+	LockDBBranchWriteGate(MyDatabaseId);
 }
 
 /*
@@ -797,7 +797,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 				/* no event triggers for global objects */
 				PreventInTransactionBlock(isTopLevel, "CREATE BRANCH");
-				CreateDatabaseBranch(stmt->sourcename, stmt->branchname);
+				CreateDatabaseBranch(stmt->sourcename, stmt->branchname,
+									 stmt->shared_read_only);
 			}
 			break;
 

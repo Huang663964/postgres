@@ -121,8 +121,8 @@ LockDBBranchSequenceWriteGate(Relation seqrel)
 		IsBootstrapProcessingMode())
 		return;
 
-	/* ponytail: sequence ops can dirty pages without assigning an XID. */
-	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, RowExclusiveLock);
+	/* Sequence operations can dirty pages without assigning an XID. */
+	LockDBBranchWriteGate(MyDatabaseId);
 }
 
 

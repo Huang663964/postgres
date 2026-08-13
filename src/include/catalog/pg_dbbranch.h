@@ -25,6 +25,8 @@ CATALOG(pg_dbbranch,8785,DbBranchRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 {
 	Oid			source_db_oid BKI_LOOKUP(pg_database);
 	Oid			branch_db_oid BKI_LOOKUP(pg_database);
+	Oid			family_root_db_oid BKI_LOOKUP(pg_database);
+	char		buffer_mode;
 	XLogRecPtr	redo_ptr;
 	XLogRecPtr	branch_lsn;
 	int64		wal_range_bytes;
@@ -51,6 +53,11 @@ CATALOG(pg_dbbranch,8785,DbBranchRelationId) BKI_SHARED_RELATION BKI_ROWTYPE_OID
 } FormData_pg_dbbranch;
 
 typedef FormData_pg_dbbranch *Form_pg_dbbranch;
+
+#define DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE	'p'
+#define DBBRANCH_BUFFER_MODE_SHARED_READ_ONLY	's'
+
+extern void LockDBBranchWriteGate(Oid dboid);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_dbbranch_branch_index, 8787, DbBranchBranchIndexId, pg_dbbranch, btree(branch_db_oid oid_ops));
 DECLARE_INDEX(pg_dbbranch_source_index, 8788, DbBranchSourceIndexId, pg_dbbranch, btree(source_db_oid oid_ops));

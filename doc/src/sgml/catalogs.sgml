@@ -3295,6 +3295,27 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>family_root_db_oid</structfield> <type>oid</type>
+       (references <link linkend="catalog-pg-database"><structname>pg_database</structname></link>.<structfield>oid</structfield>)
+      </para>
+      <para>
+       OID of the original database at the root of the branch family.  A
+       branch created from another branch inherits this value.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>buffer_mode</structfield> <type>char</type>
+      </para>
+      <para>
+       Persistent branch buffer mode: <literal>p</literal> for private
+       writable or <literal>s</literal> for shared read-only.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>redo_ptr</structfield> <type>pg_lsn</type>
       </para>
       <para>

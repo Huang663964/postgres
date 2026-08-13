@@ -687,9 +687,8 @@ AssignTransactionId(TransactionState s)
 		PG_TRY();
 		{
 			CurrentResourceOwner = s->curTransactionOwner;
-			/* ponytail: DB Branch freeze uses this lock; no shared flag table. */
-			LockSharedObject(DbBranchRelationId, MyDatabaseId, 0,
-							 RowExclusiveLock);
+			/* Also enforces the durable shared-readonly branch policy. */
+			LockDBBranchWriteGate(MyDatabaseId);
 			CurrentResourceOwner = currentOwner;
 		}
 		PG_CATCH();
