@@ -1176,6 +1176,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 */
 	RelationCacheInitializePhase3();
 	InitializeDBBranchSessionBufferMode();
+	LockDBBranchTransactionGate();
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();

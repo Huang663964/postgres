@@ -272,7 +272,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <node>	stmt toplevel_stmt schema_stmt routine_body_stmt
 		AlterEventTrigStmt AlterCollationStmt
-		AlterDatabaseStmt AlterDatabaseSetStmt AlterDomainStmt AlterEnumStmt
+		AlterDatabaseStmt AlterDatabaseSetStmt AlterDbBranchStmt AlterDomainStmt AlterEnumStmt
 		AlterFdwStmt AlterForeignServerStmt AlterGroupStmt
 		AlterObjectDependsStmt AlterObjectSchemaStmt AlterOwnerStmt
 		AlterOperatorStmt AlterTypeStmt AlterSeqStmt AlterSystemStmt AlterTableStmt
@@ -743,7 +743,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	LEADING LEAKPROOF LEAST LEFT LEVEL LIKE LIMIT LISTEN LOAD LOCAL
 	LOCALTIME LOCALTIMESTAMP LOCATION LOCK_P LOCKED LOGGED
 
-	MAPPING MATCH MATCHED MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
+	MAPPING MATCH MATCHED MATERIALIZE MATERIALIZED MAXVALUE MERGE MERGE_ACTION METHOD
 	MINUTE_P MINVALUE MODE MONTH_P MOVE
 
 	NAME_P NAMES NATIONAL NATURAL NCHAR NESTED NEW NEXT NFC NFD NFKC NFKD NO
@@ -785,7 +785,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
 	VERBOSE VERSION_P VIEW VIEWS VIRTUAL VOLATILE
 
-	WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITE
+	WHEN WHERE WHITESPACE_P WINDOW WITH WITHIN WITHOUT WORK WRAPPER WRITABLE WRITE
 
 	XML_P XMLATTRIBUTES XMLCONCAT XMLELEMENT XMLEXISTS XMLFOREST XMLNAMESPACES
 	XMLPARSE XMLPI XMLROOT XMLSERIALIZE XMLTABLE
@@ -1061,6 +1061,7 @@ stmt:
 			| CreateUserStmt
 			| CreateUserMappingStmt
 			| CreateDbBranchStmt
+			| AlterDbBranchStmt
 			| CreatedbStmt
 			| DeallocateStmt
 			| DeclareCursorStmt
@@ -11401,6 +11402,22 @@ opt_dbbranch_shared_read_only:
 
 /****************************************************************************
  *
+ *		ALTER BRANCH
+ *
+ *****************************************************************************/
+
+AlterDbBranchStmt:
+			ALTER BRANCH name MATERIALIZE WRITABLE
+				{
+					AlterDbBranchStmt *n = makeNode(AlterDbBranchStmt);
+
+					n->branchname = $3;
+					$$ = (Node *) n;
+				}
+		;
+
+/****************************************************************************
+ *
  *		CREATE DATABASE
  *
  *****************************************************************************/
@@ -17863,6 +17880,7 @@ unreserved_keyword:
 			| MAPPING
 			| MATCH
 			| MATCHED
+			| MATERIALIZE
 			| MATERIALIZED
 			| MAXVALUE
 			| MERGE
@@ -18035,6 +18053,7 @@ unreserved_keyword:
 			| WITHOUT
 			| WORK
 			| WRAPPER
+			| WRITABLE
 			| WRITE
 			| XML_P
 			| YEAR_P
@@ -18481,6 +18500,7 @@ bare_label_keyword:
 			| MAPPING
 			| MATCH
 			| MATCHED
+			| MATERIALIZE
 			| MATERIALIZED
 			| MAXVALUE
 			| MERGE
@@ -18694,6 +18714,7 @@ bare_label_keyword:
 			| WHITESPACE_P
 			| WORK
 			| WRAPPER
+			| WRITABLE
 			| WRITE
 			| XML_P
 			| XMLATTRIBUTES

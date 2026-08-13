@@ -175,6 +175,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_AlterTableStmt:
 		case T_AlterTypeStmt:
 		case T_AlterUserMappingStmt:
+		case T_AlterDbBranchStmt:
 		case T_CommentStmt:
 		case T_CompositeTypeStmt:
 		case T_CreateAmStmt:
@@ -799,6 +800,16 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				PreventInTransactionBlock(isTopLevel, "CREATE BRANCH");
 				CreateDatabaseBranch(stmt->sourcename, stmt->branchname,
 									 stmt->shared_read_only);
+			}
+			break;
+
+		case T_AlterDbBranchStmt:
+			{
+				AlterDbBranchStmt *stmt = (AlterDbBranchStmt *) parsetree;
+
+				/* no event triggers for global objects */
+				PreventInTransactionBlock(isTopLevel, "ALTER BRANCH");
+				MaterializeDatabaseBranch(stmt->branchname);
 			}
 			break;
 
@@ -2943,6 +2954,10 @@ CreateCommandTag(Node *parsetree)
 			tag = CMDTAG_CREATE_BRANCH;
 			break;
 
+		case T_AlterDbBranchStmt:
+			tag = CMDTAG_ALTER_BRANCH;
+			break;
+
 		case T_CreatedbStmt:
 			tag = CMDTAG_CREATE_DATABASE;
 			break;
@@ -3592,6 +3607,7 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_CreateDbBranchStmt:
+		case T_AlterDbBranchStmt:
 		case T_CreatedbStmt:
 			lev = LOGSTMT_DDL;
 			break;

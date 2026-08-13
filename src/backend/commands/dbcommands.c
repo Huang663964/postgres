@@ -141,7 +141,7 @@ typedef struct DBBranchWalScan
 	uint64		replayed_records;
 } DBBranchWalScan;
 
-/* Immutable for the lifetime of a backend connected to one database. */
+/* Refreshed under the per-branch transaction gate after a mode transition. */
 static char MyDBBranchBufferMode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
 static Oid MyDBBranchFamilyRootOid = InvalidOid;
 
@@ -240,6 +240,9 @@ static bool LockDBBranchSourceWriteGate(Oid source_dboid, int *npreparedxacts);
 static void LogDBBranchCreateFileCopy(Oid source_dboid, Oid branch_dboid,
 									  Oid tablespace_oid);
 static void CopyDBBranchDatabaseSettings(Oid source_dboid, Oid branch_dboid);
+static bool LookupDBBranchBufferPolicy(Oid dboid, char *buffer_mode,
+									  Oid *family_root_dboid);
+static void SetDBBranchBufferMode(Oid dboid, char buffer_mode);
 static void CheckDBBranchDropDependencies(Oid dboid);
 static void DeleteDBBranchCatalogForDatabase(Oid dboid);
 static Oid LookupDBBranchFamilyRoot(Oid source_dboid);
@@ -4081,16 +4084,108 @@ ReleaseDBBranchWalPin(void)
 void
 LockDBBranchWriteGate(Oid dboid)
 {
-	Relation	relation;
-	ScanKeyData key[1];
-	SysScanDesc scan;
-	HeapTuple	tuple;
 	char		buffer_mode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
 
 	if (!OidIsValid(dboid) || IsBootstrapProcessingMode())
 		return;
 
 	LockSharedObject(DbBranchRelationId, dboid, 0, RowExclusiveLock);
+	(void) LookupDBBranchBufferPolicy(dboid, &buffer_mode, NULL);
+
+	if (buffer_mode != DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE)
+	{
+		if (buffer_mode == DBBRANCH_BUFFER_MODE_MATERIALIZING)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("database branch is being materialized"),
+					 errdetail("Database branch with OID %u has buffer mode \"%c\".",
+							   dboid, buffer_mode),
+					 errhint("Retry ALTER BRANCH ... MATERIALIZE WRITABLE from another database.")));
+
+		ereport(ERROR,
+				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
+				 errmsg("database branch is shared read-only"),
+				 errdetail("Database branch with OID %u has buffer mode \"%c\".",
+						   dboid, buffer_mode),
+				 errhint("Run ALTER BRANCH ... MATERIALIZE WRITABLE from another database.")));
+	}
+}
+
+/*
+ * Cache the connected database's durable branch policy once catalog access is
+ * available.  The read hot path must never recurse into catalog I/O.
+ */
+void
+InitializeDBBranchSessionBufferMode(void)
+{
+	MyDBBranchBufferMode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
+	MyDBBranchFamilyRootOid = InvalidOid;
+
+	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	(void) LookupDBBranchBufferPolicy(MyDatabaseId,
+								   &MyDBBranchBufferMode,
+								   &MyDBBranchFamilyRootOid);
+}
+
+/*
+ * A shared-readonly target holds this lock for every transaction.  The
+ * materializer takes the conflicting session lock before publishing mode
+ * changes, which drains old transactions and makes new ones wait.  Rescan
+ * after locking so sessions cached as shared-readonly observe private mode.
+ */
+void
+LockDBBranchTransactionGate(void)
+{
+	char		buffer_mode;
+	Oid			family_root_dboid;
+
+	if (MyDBBranchBufferMode == DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE ||
+		!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
+		return;
+
+	LockSharedObject(DbBranchRelationId, MyDatabaseId, 0, AccessShareLock);
+	if (!LookupDBBranchBufferPolicy(MyDatabaseId, &buffer_mode,
+									&family_root_dboid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("database branch policy disappeared during a mode transition"),
+				 errdetail("Database branch with OID %u no longer has a pg_dbbranch row.",
+						   MyDatabaseId)));
+
+	MyDBBranchBufferMode = buffer_mode;
+	MyDBBranchFamilyRootOid = family_root_dboid;
+
+	if (buffer_mode == DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE)
+	{
+		UnlockSharedObject(DbBranchRelationId, MyDatabaseId, 0,
+						   AccessShareLock);
+		return;
+	}
+	if (buffer_mode != DBBRANCH_BUFFER_MODE_SHARED_READ_ONLY)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("database branch is not available for transactions"),
+				 errdetail("Database branch with OID %u has buffer mode \"%c\".",
+						   MyDatabaseId, buffer_mode),
+				 errhint("Retry ALTER BRANCH ... MATERIALIZE WRITABLE from another database.")));
+}
+
+static bool
+LookupDBBranchBufferPolicy(Oid dboid, char *buffer_mode,
+						   Oid *family_root_dboid)
+{
+	Relation	relation;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		found = false;
+
+	Assert(buffer_mode != NULL);
+	*buffer_mode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
+	if (family_root_dboid != NULL)
+		*family_root_dboid = InvalidOid;
 
 	relation = table_open(DbBranchRelationId, AccessShareLock);
 	ScanKeyInit(&key[0],
@@ -4101,54 +4196,143 @@ LockDBBranchWriteGate(Oid dboid)
 							  NULL, 1, key);
 	tuple = systable_getnext(scan);
 	if (HeapTupleIsValid(tuple))
-		buffer_mode = ((Form_pg_dbbranch) GETSTRUCT(tuple))->buffer_mode;
+	{
+		Form_pg_dbbranch form = (Form_pg_dbbranch) GETSTRUCT(tuple);
+
+		*buffer_mode = form->buffer_mode;
+		if (family_root_dboid != NULL)
+			*family_root_dboid = form->family_root_db_oid;
+		found = true;
+	}
 	systable_endscan(scan);
 	table_close(relation, AccessShareLock);
 
-	if (buffer_mode != DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE)
-		ereport(ERROR,
-				(errcode(ERRCODE_READ_ONLY_SQL_TRANSACTION),
-				 errmsg("database branch is shared read-only"),
-				 errdetail("Database branch with OID %u has buffer mode \"%c\".",
-						   dboid, buffer_mode),
-				 errhint("Create a private writable branch when writes are required.")));
+	return found;
 }
 
-/*
- * Cache the connected database's durable branch policy once catalog access is
- * available.  The read hot path must never recurse into catalog I/O.
- */
-void
-InitializeDBBranchSessionBufferMode(void)
+static void
+SetDBBranchBufferMode(Oid dboid, char buffer_mode)
 {
 	Relation	relation;
 	ScanKeyData key[1];
 	SysScanDesc scan;
 	HeapTuple	tuple;
+	HeapTuple	newtuple;
+	Datum		values[Natts_pg_dbbranch] = {0};
+	bool		nulls[Natts_pg_dbbranch] = {0};
+	bool		replaces[Natts_pg_dbbranch] = {0};
 
-	MyDBBranchBufferMode = DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE;
-	MyDBBranchFamilyRootOid = InvalidOid;
-
-	if (!OidIsValid(MyDatabaseId) || IsBootstrapProcessingMode())
-		return;
-
-	relation = table_open(DbBranchRelationId, AccessShareLock);
+	relation = table_open(DbBranchRelationId, RowExclusiveLock);
 	ScanKeyInit(&key[0],
 				Anum_pg_dbbranch_branch_db_oid,
 				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(MyDatabaseId));
+				ObjectIdGetDatum(dboid));
 	scan = systable_beginscan(relation, DbBranchBranchIndexId, true,
 							  NULL, 1, key);
 	tuple = systable_getnext(scan);
-	if (HeapTupleIsValid(tuple))
-	{
-		Form_pg_dbbranch form = (Form_pg_dbbranch) GETSTRUCT(tuple);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("database with OID %u is not a database branch", dboid)));
 
-		MyDBBranchBufferMode = form->buffer_mode;
-		MyDBBranchFamilyRootOid = form->family_root_db_oid;
-	}
+	values[Anum_pg_dbbranch_buffer_mode - 1] = CharGetDatum(buffer_mode);
+	replaces[Anum_pg_dbbranch_buffer_mode - 1] = true;
+	newtuple = heap_modify_tuple(tuple, RelationGetDescr(relation),
+								 values, nulls, replaces);
+	CatalogTupleUpdate(relation, &tuple->t_self, newtuple);
+	heap_freetuple(newtuple);
 	systable_endscan(scan);
-	table_close(relation, AccessShareLock);
+	table_close(relation, RowExclusiveLock);
+}
+
+/*
+ * Convert a durable shared-readonly branch to ordinary private writable
+ * operation.  The session-level object lock survives the two internal
+ * commits: first publish fail-closed MATERIALIZING, then invalidate every
+ * target buffer without copying page bytes, and only then publish PRIVATE.
+ */
+void
+MaterializeDatabaseBranch(const char *branch_name)
+{
+	Oid			branch_dboid;
+	char		buffer_mode;
+	bool		already_private = false;
+
+	branch_dboid = get_database_oid(branch_name, false);
+	if (branch_dboid == MyDatabaseId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("cannot materialize the currently open database branch"),
+				 errhint("Run ALTER BRANCH from another database.")));
+
+	LockSharedObjectForSession(DbBranchRelationId, branch_dboid, 0,
+							   AccessExclusiveLock);
+
+	PG_TRY();
+	{
+		if (get_database_oid(branch_name, false) != branch_dboid)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_DATABASE),
+					 errmsg("database branch \"%s\" changed while materializing",
+							branch_name)));
+		if (!object_ownercheck(DatabaseRelationId, branch_dboid, GetUserId()))
+			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE, branch_name);
+		if (!LookupDBBranchBufferPolicy(branch_dboid, &buffer_mode, NULL))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("database \"%s\" is not a database branch",
+							branch_name)));
+
+		if (buffer_mode == DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE)
+			already_private = true;
+		else if (buffer_mode == DBBRANCH_BUFFER_MODE_SHARED_READ_ONLY)
+			SetDBBranchBufferMode(branch_dboid,
+							  DBBRANCH_BUFFER_MODE_MATERIALIZING);
+		else if (buffer_mode != DBBRANCH_BUFFER_MODE_MATERIALIZING)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("database branch has invalid buffer mode \"%c\"",
+							buffer_mode)));
+
+		if (!already_private)
+		{
+			/* Make fail-closed state durable before touching shared mappings. */
+			ForceSyncCommit();
+			if (ActiveSnapshotSet())
+				PopActiveSnapshot();
+			CommitTransactionCommand();
+			StartTransactionCommand();
+
+			INJECTION_POINT("db-branch-materialize-after-state", NULL);
+
+			/*
+			 * No target transaction can run while the session lock is held.
+			 * Invalidation detaches aliases in metadata only; a later private
+			 * read loads bytes from the branch's own cloned storage.
+			 */
+			DropDatabaseBuffers(branch_dboid);
+
+			INJECTION_POINT("db-branch-materialize-after-buffer-drop", NULL);
+
+			SetDBBranchBufferMode(branch_dboid,
+							  DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE);
+			ForceSyncCommit();
+			if (ActiveSnapshotSet())
+				PopActiveSnapshot();
+			CommitTransactionCommand();
+			StartTransactionCommand();
+		}
+	}
+	PG_CATCH();
+	{
+		UnlockSharedObjectForSession(DbBranchRelationId, branch_dboid, 0,
+								 AccessExclusiveLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	UnlockSharedObjectForSession(DbBranchRelationId, branch_dboid, 0,
+								 AccessExclusiveLock);
 }
 
 bool

@@ -370,6 +370,27 @@ check_completion(
 
 clear_query();
 
+check_completion(
+	"ALTER BR\t",
+	qr/ALTER BRANCH /,
+	"complete ALTER BRANCH command");
+
+clear_query();
+
+check_completion(
+	"ALTER BRANCH dbbranch_tab\t",
+	qr/dbbranch_tab_source /,
+	"complete ALTER BRANCH target database name");
+
+clear_query();
+
+check_completion(
+	"ALTER BRANCH dbbranch_tab_source \t",
+	qr/MATERIALIZE WRITABLE /,
+	"complete ALTER BRANCH target with MATERIALIZE WRITABLE");
+
+clear_query();
+
 # check VersionedQuery infrastructure
 check_completion(
 	"DROP PUBLIC\t \t\t",

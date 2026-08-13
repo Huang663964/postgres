@@ -1,0 +1,110 @@
+<!--
+doc/src/sgml/ref/alter_branch.sgml
+PostgreSQL documentation
+-->
+
+<refentry id="sql-alterbranch">
+ <indexterm zone="sql-alterbranch">
+  <primary>ALTER BRANCH</primary>
+ </indexterm>
+
+ <refmeta>
+  <refentrytitle>ALTER BRANCH</refentrytitle>
+  <manvolnum>7</manvolnum>
+  <refmiscinfo>SQL - Language Statements</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>ALTER BRANCH</refname>
+  <refpurpose>materialize a shared-readonly database branch as private writable</refpurpose>
+ </refnamediv>
+
+ <refsynopsisdiv>
+<synopsis>
+ALTER BRANCH <replaceable class="parameter">name</replaceable> MATERIALIZE WRITABLE
+</synopsis>
+ </refsynopsisdiv>
+
+ <refsect1>
+  <title>Description</title>
+
+  <para>
+   <command>ALTER BRANCH ... MATERIALIZE WRITABLE</command> permanently changes
+   a branch created with <literal>BUFFER SHARED READ ONLY</literal> into an
+   ordinary private-writable branch.  The branch already has cloned storage,
+   so materialization does not copy relation files or page bytes.  It drains
+   target transactions, invalidates the target database's buffer mappings,
+   and lets later reads load pages from the branch's own storage.
+  </para>
+
+  <para>
+   Materialization uses the persistent
+   <link linkend="catalog-pg-dbbranch"><structname>pg_dbbranch</structname></link>
+   modes <literal>s</literal>, <literal>m</literal>, and
+   <literal>p</literal>.  It first commits <literal>m</literal> as a
+   fail-closed state, removes the target's shared-buffer aliases, and only
+   then commits <literal>p</literal>.  Existing target transactions drain;
+   target transactions that arrive during the operation wait behind the same
+   gate.  The wait honors normal lock timeout and cancellation behavior.
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Parameters</title>
+
+  <variablelist>
+   <varlistentry>
+    <term><replaceable class="parameter">name</replaceable></term>
+    <listitem>
+     <para>
+      The name of the database branch to materialize.  Run the command while
+      connected to another database.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </refsect1>
+
+ <refsect1>
+  <title>Notes</title>
+
+  <para>
+   The command cannot run inside a transaction block.  The caller must own the
+   target database or be a superuser, and the target must have a
+   <structname>pg_dbbranch</structname> row.
+  </para>
+
+  <para>
+   If the server stops or the command fails after <literal>m</literal> is
+   committed, new target transactions fail closed.  Run the same command from
+   another database to repeat buffer cleanup and finish the transition.
+   Repeating the command after the branch reaches <literal>p</literal> is a
+   successful no-op.
+  </para>
+
+  <para>
+   This transition is one-way.  It does not make a private branch shared
+   again, and it does not change the buffer mode of the source database or
+   sibling branches.
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Examples</title>
+
+  <para>
+   Make <literal>analytics_branch</literal> private and writable:
+<programlisting>
+ALTER BRANCH analytics_branch MATERIALIZE WRITABLE;
+</programlisting>
+  </para>
+ </refsect1>
+
+ <refsect1>
+  <title>Compatibility</title>
+
+  <para>
+   There is no <command>ALTER BRANCH</command> statement in the SQL standard.
+  </para>
+ </refsect1>
+</refentry>

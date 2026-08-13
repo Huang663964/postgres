@@ -35,6 +35,7 @@
 
    &abort;
    &alterAggregate;
+   &alterBranch;
    &alterCollation;
    &alterConversion;
    &alterDatabase;

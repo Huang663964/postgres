@@ -56,9 +56,11 @@ typedef FormData_pg_dbbranch *Form_pg_dbbranch;
 
 #define DBBRANCH_BUFFER_MODE_PRIVATE_WRITABLE	'p'
 #define DBBRANCH_BUFFER_MODE_SHARED_READ_ONLY	's'
+#define DBBRANCH_BUFFER_MODE_MATERIALIZING		'm'
 
 extern void LockDBBranchWriteGate(Oid dboid);
 extern void InitializeDBBranchSessionBufferMode(void);
+extern void LockDBBranchTransactionGate(void);
 extern bool GetMyDBBranchSharedReadOnlyFamily(Oid *family_root_dboid);
 
 DECLARE_UNIQUE_INDEX_PKEY(pg_dbbranch_branch_index, 8787, DbBranchBranchIndexId, pg_dbbranch, btree(branch_db_oid oid_ops));

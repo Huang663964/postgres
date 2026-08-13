@@ -136,8 +136,9 @@ CREATE BRANCH <replaceable class="parameter">name</replaceable>
   <para>
    A branch created with <literal>BUFFER SHARED READ ONLY</literal> accepts
    ordinary reads but rejects writes independently of session configuration.
-   The current implementation has no in-place transition from this mode to a
-   writable mode.  Create a private branch when writes are required.
+   Use <link linkend="sql-alterbranch"><command>ALTER BRANCH ... MATERIALIZE
+   WRITABLE</command></link> from another database to make the branch private
+   and writable without cloning its storage again.
   </para>
 
   <para>

@@ -59,7 +59,8 @@ tests += {
       't/048_vacuum_horizon_floor.pl',
       't/049_db_branch.pl',
       't/050_db_branch_dml_gate.pl',
-      't/051_db_branch_shared_readonly.pl'
+      't/051_db_branch_shared_readonly.pl',
+      't/052_db_branch_materialize.pl'
     ],
   },
 }

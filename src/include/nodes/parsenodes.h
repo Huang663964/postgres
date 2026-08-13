@@ -3885,6 +3885,18 @@ typedef struct CreateDbBranchStmt
 } CreateDbBranchStmt;
 
 /* ----------------------
+ *		Alter DB Branch Statement
+ * ----------------------
+ */
+typedef struct AlterDbBranchStmt
+{
+	pg_node_attr(nodetag_number(8001))
+
+	NodeTag		type;
+	char	   *branchname;		/* branch to make private writable */
+} AlterDbBranchStmt;
+
+/* ----------------------
  *	Alter Database
  * ----------------------
  */

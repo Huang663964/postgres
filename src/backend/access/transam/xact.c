@@ -2230,6 +2230,9 @@ StartTransaction(void)
 	 */
 	s->state = TRANS_INPROGRESS;
 
+	/* Drainable gate for sessions cached as shared-readonly branches. */
+	LockDBBranchTransactionGate();
+
 	/* Schedule transaction timeout */
 	if (TransactionTimeout > 0)
 		enable_timeout_after(TRANSACTION_TIMEOUT, TransactionTimeout);

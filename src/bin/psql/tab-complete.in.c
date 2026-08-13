@@ -1276,7 +1276,7 @@ static const char *const Keywords_for_user_thing[] = {
 static const pgsql_thing_t words_after_create[] = {
 	{"ACCESS METHOD", NULL, NULL, NULL, NULL, THING_NO_ALTER},
 	{"AGGREGATE", NULL, NULL, Query_for_list_of_aggregates},
-	{"BRANCH", NULL, NULL, NULL, NULL, THING_NO_DROP | THING_NO_ALTER},
+	{"BRANCH", Query_for_list_of_databases, NULL, NULL, NULL, THING_NO_DROP},
 	{"CAST", NULL, NULL, NULL}, /* Casts have complex structures for names, so
 								 * skip it */
 	{"COLLATION", NULL, NULL, &Query_for_list_of_collations},
@@ -2197,6 +2197,9 @@ match_previous_words(int pattern_id,
 	/* ALTER something */
 	else if (Matches("ALTER"))
 		matches = rl_completion_matches(text, alter_command_generator);
+	/* ALTER BRANCH <name> */
+	else if (Matches("ALTER", "BRANCH", MatchAny))
+		COMPLETE_WITH("MATERIALIZE WRITABLE");
 	/* ALTER TABLE,INDEX,MATERIALIZED VIEW ALL IN TABLESPACE xxx */
 	else if (TailMatches("ALL", "IN", "TABLESPACE", MatchAny))
 		COMPLETE_WITH("SET TABLESPACE", "OWNED BY");
