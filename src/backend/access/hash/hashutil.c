@@ -572,6 +572,15 @@ _hash_kill_items(IndexScanDesc scan)
 	else
 		buf = _hash_getbuf(rel, blkno, HASH_READ, LH_OVERFLOW_PAGE);
 
+	if (BufferIsDBBranchFrameImmutable(buf))
+	{
+		if (so->hashso_bucket_buf == so->currPos.buf || havePin)
+			LockBuffer(so->currPos.buf, BUFFER_LOCK_UNLOCK);
+		else
+			_hash_relbuf(rel, buf);
+		return;
+	}
+
 	page = BufferGetPage(buf);
 	opaque = HashPageGetOpaque(page);
 	maxoff = PageGetMaxOffsetNumber(page);

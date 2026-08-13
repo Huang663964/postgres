@@ -270,6 +270,28 @@ DBBranchFrameCandidateReplace(const DBBranchFrameCandidateKey * key,
 	return true;
 }
 
+/*
+ * Check the reverse slot used by the candidate table.  This is intentionally
+ * lock-based for the first product slice: hint updates are optional and the
+ * existing lock avoids another per-buffer atomic side array.
+ */
+bool
+DBBranchFrameCandidateIsRegistered(int buf_id, uint32 tag_generation)
+{
+	DBBranchFrameCandidateSlot *slot;
+	bool		registered;
+
+	if (buf_id < 0 || buf_id >= NBuffers)
+		return false;
+
+	LWLockAcquire(&DBBranchFrameCandidateCtl->lock, LW_SHARED);
+	slot = &DBBranchFrameCandidateSlots[buf_id];
+	registered = slot->active && slot->tag_generation == tag_generation;
+	LWLockRelease(&DBBranchFrameCandidateCtl->lock);
+
+	return registered;
+}
+
 void
 DBBranchFrameCandidateUnregister(int buf_id)
 {

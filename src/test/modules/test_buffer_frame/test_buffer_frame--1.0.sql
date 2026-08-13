@@ -7,6 +7,11 @@ RETURNS int4
 AS 'MODULE_PATHNAME'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 
+CREATE FUNCTION test_buffer_frame_read_fork(regclass, int4, int4)
+RETURNS int4
+AS 'MODULE_PATHNAME'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
 CREATE FUNCTION test_buffer_frame_page_digest(
 	int4, oid, oid, oid, int2, int8)
 RETURNS int8

@@ -1609,7 +1609,8 @@ backtrack:
 			 */
 			Assert(nhtidsdead == 0);
 			if (vstate->cycleid != 0 &&
-				opaque->btpo_cycleid == vstate->cycleid)
+				opaque->btpo_cycleid == vstate->cycleid &&
+				!BufferIsDBBranchFrameImmutable(buf))
 			{
 				opaque->btpo_cycleid = 0;
 				MarkBufferDirtyHint(buf, true);

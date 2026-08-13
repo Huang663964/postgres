@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/relation.h"
 #include "access/table.h"
 #include "common/hashfn.h"
 #include "fmgr.h"
@@ -28,16 +29,29 @@ static Buffer
 read_test_buffer(Oid relid, int32 block, Relation *rel)
 {
 	BlockNumber nblocks;
+	volatile Buffer buffer = InvalidBuffer;
 
 	if (block < 0)
 		elog(ERROR, "invalid block number: %d", block);
 
-	*rel = table_open(relid, AccessShareLock);
+	*rel = relation_open(relid, AccessShareLock);
 	nblocks = RelationGetNumberOfBlocks(*rel);
 	if ((BlockNumber) block >= nblocks)
 		elog(ERROR, "block %d is past relation size %u", block, nblocks);
 
-	return ReadBuffer(*rel, (BlockNumber) block);
+	/* Observation helpers must not change the product promotion state. */
+	TestOnlySuppressDBBranchFramePromotion(true);
+	PG_TRY();
+	{
+		buffer = ReadBuffer(*rel, (BlockNumber) block);
+	}
+	PG_FINALLY();
+	{
+		TestOnlySuppressDBBranchFramePromotion(false);
+	}
+	PG_END_TRY();
+
+	return buffer;
 }
 
 static void
@@ -165,6 +179,29 @@ test_buffer_frame_buffer_id(PG_FUNCTION_ARGS)
 	buffer = read_test_buffer(PG_GETARG_OID(0), PG_GETARG_INT32(1), &rel);
 	ReleaseBuffer(buffer);
 	table_close(rel, AccessShareLock);
+
+	PG_RETURN_INT32(buffer);
+}
+
+PG_FUNCTION_INFO_V1(test_buffer_frame_read_fork);
+Datum
+test_buffer_frame_read_fork(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ForkNumber	fork = (ForkNumber) PG_GETARG_INT32(1);
+	BlockNumber block = (BlockNumber) PG_GETARG_INT32(2);
+	Relation	rel;
+	Buffer		buffer;
+
+	if (fork <= MAIN_FORKNUM || fork > MAX_FORKNUM)
+		elog(ERROR, "invalid non-main fork number: %d", fork);
+
+	rel = relation_open(relid, AccessShareLock);
+	if (block >= RelationGetNumberOfBlocksInFork(rel, fork))
+		elog(ERROR, "block %u is past fork size", block);
+	buffer = ReadBufferExtended(rel, fork, block, RBM_NORMAL, NULL);
+	ReleaseBuffer(buffer);
+	relation_close(rel, AccessShareLock);
 
 	PG_RETURN_INT32(buffer);
 }
@@ -672,10 +709,11 @@ test_buffer_frame_drop_buffers(PG_FUNCTION_ARGS)
 	ForkNumber	fork = MAIN_FORKNUM;
 	BlockNumber first = 0;
 
-	rel = table_open(PG_GETARG_OID(0), AccessExclusiveLock);
+	/* Test-only single-session probe; product callers provide stronger locks. */
+	rel = table_open(PG_GETARG_OID(0), AccessShareLock);
 	smgr = RelationGetSmgr(rel);
 	DropRelationBuffers(smgr, &fork, 1, &first);
-	table_close(rel, AccessExclusiveLock);
+	table_close(rel, AccessShareLock);
 
 	PG_RETURN_BOOL(true);
 }

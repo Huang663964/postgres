@@ -1163,7 +1163,7 @@ subtest 'shared-frame attach rejects invalid candidates' => sub
 		'checkpoint makes the equal-byte target eligible');
 };
 
-subtest 'published shared frame is protected and explicitly recoverable' => sub
+subtest 'published shared frame is immutable and explicitly recoverable' => sub
 {
 	run_sql_failure(
 		q[SELECT test_buffer_frame_attach(
@@ -1183,36 +1183,22 @@ subtest 'published shared frame is protected and explicitly recoverable' => sub
 	run_sql_failure(
 		q[SELECT test_buffer_frame_dirty_reader(
 			'bf_other'::regclass, 0, '', '')],
-		qr/cannot dirty buffer \d+ while its test-only frame is shared/,
+		qr/cannot dirty buffer \d+ while its DB branch frame is immutable/,
 		'shared target dirty');
 	run_sql_failure(
 		q[SELECT test_buffer_frame_dirty_reader(
 			'bf_data'::regclass, 0, '', '')],
-		qr/cannot dirty buffer \d+ while its test-only frame is shared/,
+		qr/cannot dirty buffer \d+ while its DB branch frame is immutable/,
 		'shared source dirty');
 	assert_shared_pair('dirty rejection');
 
 	is(
 		$node->safe_psql(
 			'postgres',
-			"SELECT test_buffer_frame_evict($other_buffer_id)"),
-		'f',
-		'clock sweep cannot evict the non-identity target');
-	is(
-		$node->safe_psql(
-			'postgres',
 			"SELECT test_buffer_frame_evict($buffer_id)"),
 		'f',
-		'clock sweep cannot evict the attached source frame');
-	run_sql_failure(
-		q[SELECT test_buffer_frame_drop_buffers('bf_other'::regclass)],
-		qr/cannot invalidate buffer \d+ while its test-only frame is shared/,
-		'direct target invalidation');
-	run_sql_failure(
-		q[SELECT test_buffer_frame_drop_buffers('bf_data'::regclass)],
-		qr/cannot invalidate buffer \d+ while its test-only frame is shared/,
-		'direct source invalidation');
-	assert_shared_pair('victim rejection');
+		'identity source remains reserved while an alias exists');
+	assert_shared_pair('source victim rejection');
 
 	is(
 		$node->safe_psql(
@@ -1436,7 +1422,7 @@ subtest 'detach publication survives ERROR and identity cleanup is idempotent' =
 	assert_private_pair('idempotent identity cleanup');
 };
 
-subtest 'clock sweep skips protected descriptors with bounded progress' => sub
+subtest 'clock sweep reclaims aliases with bounded progress' => sub
 {
 	my $pressure = PostgreSQL::Test::Cluster->new('buffer_frame_pressure');
 
@@ -1493,11 +1479,8 @@ subtest 'clock sweep skips protected descriptors with bounded progress' => sub
 	my ($pressure_output, $pressure_error) = $pressure_psql->query(
 		q[SET statement_timeout = '10s';
 		  SELECT test_buffer_frame_pressure('pressure_pages'::regclass)]);
-	ok($pressure_error, 'protected pool pressure fails');
-	like(
-		$pressure_psql->{stderr},
-		qr/no unpinned buffers available/,
-		'clock sweep terminates instead of reselecting protected descriptors');
+	ok(!$pressure_error, 'pool pressure reclaims the non-identity alias');
+	like($pressure_output, qr/t/, 'pressure allocation completes normally');
 	$pressure_psql->{stderr} = '';
 	$pressure_psql->quit;
 
@@ -1507,13 +1490,7 @@ subtest 'clock sweep skips protected descriptors with bounded progress' => sub
 			q[SELECT test_buffer_frame_detach(
 				'pressure_target'::regclass, 0, '', '', 'normal')]),
 		't',
-		'pressure target detaches');
-	is(
-		$pressure->safe_psql(
-			'postgres',
-			q[SELECT test_buffer_frame_pressure('pressure_pages'::regclass)]),
-		't',
-		'the same allocation pressure succeeds after detach');
+		'evicted target reloads privately and detach is an identity no-op');
 
 	$pressure->stop;
 };

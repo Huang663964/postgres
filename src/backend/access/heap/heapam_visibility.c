@@ -114,6 +114,10 @@ static inline void
 SetHintBits(HeapTupleHeader tuple, Buffer buffer,
 			uint16 infomask, TransactionId xid)
 {
+	/* Shared-readonly candidates and aliases must remain byte-for-byte stable. */
+	if (BufferIsDBBranchFrameImmutable(buffer))
+		return;
+
 	if (TransactionIdIsValid(xid))
 	{
 		/* NB: xid must be known committed here! */

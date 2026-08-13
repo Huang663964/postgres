@@ -301,7 +301,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 			local_buf_state = LockBufHdr(buf);
 			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 				&& BUF_STATE_GET_USAGECOUNT(local_buf_state) == 0
-				&& BufferHasPrivateFrame(buf))
+				&& BufferFrameCanBeDiscarded(buf))
 			{
 				if (strategy != NULL)
 					AddBufferToRing(strategy, buf);
@@ -319,14 +319,13 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		buf = GetBufferDescriptor(ClockSweepTick());
 
 		/*
-		 * If the buffer is pinned, has a nonzero usage_count, or participates
-		 * in a test-only shared frame, we cannot use it.  Decrement the
-		 * usage_count only for an unpinned private frame and keep scanning.
+		 * An unpinned private descriptor or non-identity alias can be reused.
+		 * An identity frame owner remains reserved until its last alias leaves.
 		 */
 		local_buf_state = LockBufHdr(buf);
 
 		if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0 &&
-			BufferHasPrivateFrame(buf))
+			BufferFrameCanBeDiscarded(buf))
 		{
 			if (BUF_STATE_GET_USAGECOUNT(local_buf_state) != 0)
 			{
@@ -741,7 +740,7 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 {
 	BufferDesc *buf;
 	Buffer		bufnum;
-	bool		has_private_frame;
+	bool		can_discard_frame;
 	uint32		local_buf_state;	/* to avoid repeated (de-)referencing */
 
 
@@ -759,8 +758,8 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 		return NULL;
 
 	/*
-	 * If the buffer is pinned or participates in a test-only shared frame we
-	 * cannot use it under any circumstances.
+	 * A ring may reuse a private descriptor or a non-identity alias.  The
+	 * latter is detached atomically by InvalidateVictimBuffer().
 	 *
 	 * If usage_count is 0 or 1 then the buffer is fair game (we expect 1,
 	 * since our own previous usage of the ring element would have left it
@@ -770,17 +769,17 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 	 */
 	buf = GetBufferDescriptor(bufnum - 1);
 	local_buf_state = LockBufHdr(buf);
-	has_private_frame = BufferHasPrivateFrame(buf);
+	can_discard_frame = BufferFrameCanBeDiscarded(buf);
 	if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0
 		&& BUF_STATE_GET_USAGECOUNT(local_buf_state) <= 1
-		&& has_private_frame)
+		&& can_discard_frame)
 	{
 		*buf_state = local_buf_state;
 		return buf;
 	}
 	UnlockBufHdr(buf, local_buf_state);
 
-	if (!has_private_frame)
+	if (!can_discard_frame)
 		strategy->buffers[strategy->current] = InvalidBuffer;
 
 	/*

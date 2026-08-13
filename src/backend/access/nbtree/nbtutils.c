@@ -3341,6 +3341,15 @@ _bt_killitems(IndexScanDesc scan)
 		/* Unmodified, hinting is safe */
 	}
 
+	if (BufferIsDBBranchFrameImmutable(buf))
+	{
+		if (!so->dropPin)
+			_bt_unlockbuf(rel, buf);
+		else
+			_bt_relbuf(rel, buf);
+		return;
+	}
+
 	page = BufferGetPage(buf);
 	opaque = BTPageGetOpaque(page);
 	minoff = P_FIRSTDATAKEY(opaque);

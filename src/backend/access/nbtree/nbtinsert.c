@@ -677,22 +677,20 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 									  (prevalldead &&
 									   curposti == BTreeTupleGetNPosting(curitup) - 1)))
 				{
+					Buffer		hintbuf = nbuf != InvalidBuffer ?
+						nbuf : insertstate->buf;
+
 					/*
 					 * The conflicting tuple (or all HOT chains pointed to by
 					 * all posting list TIDs) is dead to everyone, so mark the
 					 * index entry killed.
 					 */
-					ItemIdMarkDead(curitemid);
-					opaque->btpo_flags |= BTP_HAS_GARBAGE;
-
-					/*
-					 * Mark buffer with a dirty hint, since state is not
-					 * crucial. Be sure to mark the proper buffer dirty.
-					 */
-					if (nbuf != InvalidBuffer)
-						MarkBufferDirtyHint(nbuf, true);
-					else
-						MarkBufferDirtyHint(insertstate->buf, true);
+					if (!BufferIsDBBranchFrameImmutable(hintbuf))
+					{
+						ItemIdMarkDead(curitemid);
+						opaque->btpo_flags |= BTP_HAS_GARBAGE;
+						MarkBufferDirtyHint(hintbuf, true);
+					}
 				}
 
 				/*

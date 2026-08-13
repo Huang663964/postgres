@@ -204,6 +204,8 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 	 */
 	if (RecoveryInProgress())
 		return;
+	if (BufferIsDBBranchFrameImmutable(buffer))
+		return;
 
 	/*
 	 * First check whether there's any chance there's something to prune,
@@ -368,6 +370,9 @@ heap_page_prune_and_freeze(Relation relation, Buffer buffer,
 	bool		do_hint;
 	bool		hint_bit_fpi;
 	int64		fpi_before = pgWalUsage.wal_fpi;
+
+	if (BufferIsDBBranchFrameImmutable(buffer))
+		elog(ERROR, "cannot prune an immutable DB branch buffer");
 
 	/* Copy parameters to prstate */
 	prstate.vistest = vistest;

@@ -190,12 +190,9 @@ int			checkpoint_flush_after = DEFAULT_CHECKPOINT_FLUSH_AFTER;
 int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
-/*
- * P3 promotion is deliberately reachable only from test_buffer_frame.
- * Phase 4 must close hint/lifecycle mutation before this becomes a product
- * GUC.
- */
+/* Backend-local overrides used only by test_buffer_frame. */
 static bool TestOnlyDBBranchFramePromotionEnabled = false;
+static bool TestOnlyDBBranchFramePromotionSuppressed = false;
 static Oid	TestOnlyDBBranchFrameFamilyOverride = InvalidOid;
 static bool TestOnlyDBBranchFrameHashOverrideEnabled = false;
 static uint64 TestOnlyDBBranchFrameHashOverride = 0;
@@ -591,6 +588,10 @@ static void LockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
 									 uint32 *a_state, uint32 *b_state);
 static void UnlockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
 									   uint32 a_state, uint32 b_state);
+static bool InvalidateDBBranchAlias(BufferDesc *target,
+									const BufferTag *expected_tag,
+									uint32 expected_refcount,
+									uint32 *old_flags);
 static bool LockBufferContentPairConditional(BufferDesc *a, BufferDesc *b);
 static void UnlockBufferContentPair(BufferDesc *a, BufferDesc *b);
 static bool DBBranchFramePromotionPairValid(BufferDesc *target,
@@ -2307,13 +2308,6 @@ InvalidateBuffer(BufferDesc *buf)
 
 	buf_state = pg_atomic_read_u32(&buf->state);
 	Assert(buf_state & BM_LOCKED);
-	if (!BufferHasPrivateFrame(buf))
-	{
-		UnlockBufHdr(buf, buf_state);
-		elog(ERROR,
-			 "cannot invalidate buffer %d while its test-only frame is shared",
-			 BufferDescriptorGetBuffer(buf));
-	}
 	UnlockBufHdr(buf, buf_state);
 
 	/*
@@ -2365,13 +2359,39 @@ retry:
 	}
 
 	/*
-	 * Clear out the buffer's tag and flags.  We must do this to ensure that
-	 * linear scans of the buffer array don't think the buffer is valid.
+	 * A non-identity descriptor can give up its frame association because the
+	 * buffer is about to become invalid.  The mapping partition lock prevents
+	 * a new first pin between publication of the home mapping and clearing
+	 * BM_VALID.  InvalidateDBBranchAlias() performs both changes under the
+	 * descriptor pair locks, so linear buffer scans cannot observe valid
+	 * stale home bytes.
+	 *
+	 * An identity owner with aliases needs no special action here.  Its tag
+	 * and flags may be invalidated while its home frame remains reserved; the
+	 * replacement clock cannot reuse that descriptor until the last alias is
+	 * detached.
 	 */
-	oldFlags = buf_state & BUF_FLAG_MASK;
-	ClearBufferTag(&buf->tag);
-	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
-	UnlockBufHdr(buf, buf_state);
+	if (pg_atomic_read_u32(&BufferFrameIds[buf->buf_id]) !=
+		(BufferFrameId) buf->buf_id)
+	{
+		UnlockBufHdr(buf, buf_state);
+		if (!InvalidateDBBranchAlias(buf, &oldTag, 0, &oldFlags))
+		{
+			LWLockRelease(oldPartitionLock);
+			goto retry;
+		}
+	}
+	else
+	{
+		/*
+		 * Clear out the buffer's tag and flags.  We must do this to ensure that
+		 * linear scans of the buffer array don't think the buffer is valid.
+		 */
+		oldFlags = buf_state & BUF_FLAG_MASK;
+		ClearBufferTag(&buf->tag);
+		buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
+		UnlockBufHdr(buf, buf_state);
+	}
 
 	/*
 	 * Remove the buffer from the lookup hashtable, if it was in there.
@@ -2428,11 +2448,8 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 	Assert(BufferTagsEqual(&buf_hdr->tag, &tag));
 
-	/*
-	 * A descriptor using a non-home frame, or a home frame attached to
-	 * another descriptor, must not be reused by clock sweep.
-	 */
-	if (!BufferHasPrivateFrame(buf_hdr) ||
+	/* An identity owner remains reserved while another descriptor aliases it. */
+	if (!BufferFrameCanBeDiscarded(buf_hdr) ||
 		BUF_STATE_GET_REFCOUNT(buf_state) != 1 || (buf_state & BM_DIRTY))
 	{
 		Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
@@ -2443,16 +2460,33 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 		return false;
 	}
 
-	/*
-	 * Clear out the buffer's tag and flags and usagecount.  This is not
-	 * strictly required, as BM_TAG_VALID/BM_VALID needs to be checked before
-	 * doing anything with the buffer. But currently it's beneficial, as the
-	 * cheaper pre-check for several linear scans of shared buffers use the
-	 * tag (see e.g. FlushDatabaseBuffers()).
-	 */
-	ClearBufferTag(&buf_hdr->tag);
-	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
-	UnlockBufHdr(buf_hdr, buf_state);
+	if (pg_atomic_read_u32(&BufferFrameIds[buf_hdr->buf_id]) !=
+		(BufferFrameId) buf_hdr->buf_id)
+	{
+		uint32		old_flags;
+
+		UnlockBufHdr(buf_hdr, buf_state);
+		if (!InvalidateDBBranchAlias(buf_hdr, &tag, 1, &old_flags))
+		{
+			LWLockRelease(partition_lock);
+			return false;
+		}
+		Assert(old_flags & BM_TAG_VALID);
+		buf_state = BUF_REFCOUNT_ONE;
+	}
+	else
+	{
+		/*
+		 * Clear out the buffer's tag and flags and usagecount.  This is not
+		 * strictly required, as BM_TAG_VALID/BM_VALID needs to be checked before
+		 * doing anything with the buffer. But currently it's beneficial, as the
+		 * cheaper pre-check for several linear scans of shared buffers use the
+		 * tag (see e.g. FlushDatabaseBuffers()).
+		 */
+		ClearBufferTag(&buf_hdr->tag);
+		buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
+		UnlockBufHdr(buf_hdr, buf_state);
+	}
 
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) > 0);
 
@@ -3102,10 +3136,13 @@ MarkBufferDirty(Buffer buffer)
 	Assert(BufferIsPinned(buffer));
 	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(bufHdr),
 								LW_EXCLUSIVE));
-	if (!BufferHasPrivateFrame(bufHdr))
+	if (BufferIsDBBranchFrameImmutable(buffer))
+	{
+		DBBranchFrameCandidateUnregister(bufHdr->buf_id);
 		elog(ERROR,
-			 "cannot dirty buffer %d while its test-only frame is shared",
+			 "cannot dirty buffer %d while its DB branch frame is immutable",
 			 buffer);
+	}
 
 	old_buf_state = pg_atomic_read_u32(&bufHdr->state);
 	for (;;)
@@ -3190,8 +3227,8 @@ BufferWriteIntentOwner(BufferDesc *buf)
 }
 
 /*
- * Test-only frame publication takes two buffer header locks.  Keep a single
- * descriptor-id order so two independent helpers cannot deadlock.
+ * Frame publication and alias invalidation take two buffer header locks.
+ * Keep a single descriptor-id order so independent helpers cannot deadlock.
  */
 static void
 LockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
@@ -3227,6 +3264,98 @@ UnlockBufferDescriptorPair(BufferDesc *a, BufferDesc *b,
 		UnlockBufHdr(a, a_state);
 		UnlockBufHdr(b, b_state);
 	}
+}
+
+/*
+ * Invalidate one non-identity descriptor without copying its page.  Callers
+ * hold the target tag's mapping partition lock exclusively and have already
+ * established the expected target refcount.  The physical source bytes are
+ * immutable, so only descriptor headers and frame metadata need locking.
+ */
+static bool
+InvalidateDBBranchAlias(BufferDesc *target, const BufferTag *expected_tag,
+						uint32 expected_refcount, uint32 *old_flags)
+{
+	BufferDesc *source;
+	BufferFrameId source_frame;
+	BufferFrameId observed_source_frame;
+	uint32		target_state;
+	uint32		source_state;
+	uint32		attachments;
+	uint32		old_nonidentity PG_USED_FOR_ASSERTS_ONLY;
+	const uint32 required = BM_VALID | BM_TAG_VALID | BM_PERMANENT;
+	const uint32 rejected = BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS |
+		BM_IO_ERROR | BM_PIN_COUNT_WAITER;
+
+	source_frame = pg_atomic_read_u32(&BufferFrameIds[target->buf_id]);
+	if (source_frame == (BufferFrameId) target->buf_id ||
+		source_frame >= (BufferFrameId) NBuffers)
+		return false;
+	source = GetBufferDescriptor(source_frame);
+
+	LockBufferDescriptorPair(target, source, &target_state, &source_state);
+	observed_source_frame =
+		pg_atomic_read_u32(&BufferFrameIds[target->buf_id]);
+	attachments =
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[source->buf_id]);
+	if (observed_source_frame != source_frame ||
+		pg_atomic_read_u32(&BufferFrameIds[source->buf_id]) != source_frame ||
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[target->buf_id]) != 0 ||
+		attachments <= 1 ||
+		BUF_STATE_GET_REFCOUNT(target_state) != expected_refcount ||
+		(target_state & required) != required ||
+		(target_state & rejected) != 0 ||
+		BufferWriteIntentOwner(target) != INVALID_PROC_NUMBER ||
+		!BufferTagsEqual(&target->tag, expected_tag))
+	{
+		UnlockBufferDescriptorPair(target, source,
+								   target_state, source_state);
+		return false;
+	}
+
+	*old_flags = target_state & BUF_FLAG_MASK;
+
+	/* Publish a private-but-invalid home mapping before releasing the alias. */
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[target->buf_id], 1);
+	pg_write_barrier();
+	pg_atomic_write_u32(&BufferFrameIds[target->buf_id], target->buf_id);
+	pg_atomic_write_u32(&BufferFrameAttachmentCounts[source->buf_id],
+						attachments - 1);
+	old_nonidentity =
+		pg_atomic_fetch_sub_u32(BufferNonIdentityFrameCount, 1);
+	Assert(old_nonidentity > 0);
+	pg_atomic_fetch_add_u32(&BufferFrameGenerations[target->buf_id], 1);
+
+	ClearBufferTag(&target->tag);
+	target_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
+	UnlockBufferDescriptorPair(target, source, target_state, source_state);
+
+	return true;
+}
+
+/*
+ * True for both an established alias and a clean candidate source.  The
+ * latter matters because promotion registers the candidate before returning
+ * the page to its first ordinary SQL reader.
+ */
+bool
+BufferIsDBBranchFrameImmutable(Buffer buffer)
+{
+	BufferDesc *buf;
+	Oid			family_root_dboid;
+	uint32		tag_generation;
+
+	if (!BufferIsValid(buffer) || BufferIsLocal(buffer))
+		return false;
+
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!BufferHasPrivateFrame(buf))
+		return true;
+	if (!GetMyDBBranchSharedReadOnlyFamily(&family_root_dboid))
+		return false;
+
+	tag_generation = pg_atomic_read_u32(&BufferTagGenerations[buf->buf_id]);
+	return DBBranchFrameCandidateIsRegistered(buf->buf_id, tag_generation);
 }
 
 /* Promotion must never wait while holding one of a pair of content locks. */
@@ -3325,6 +3454,12 @@ TestOnlyConfigureDBBranchFramePromotion(bool enabled, Oid family_root_dboid,
 }
 
 void
+TestOnlySuppressDBBranchFramePromotion(bool suppressed)
+{
+	TestOnlyDBBranchFramePromotionSuppressed = suppressed;
+}
+
+void
 TestOnlyResetDBBranchFramePromotionStats(void)
 {
 	pg_atomic_write_u64(&DBBranchFrameStats->attempts, 0);
@@ -3337,9 +3472,10 @@ TestOnlyResetDBBranchFramePromotionStats(void)
 
 /*
  * Try to replace a just-read private frame with an equal family candidate.
- * The feature is test-only until Phase 4 closes all in-place mutation paths.
- * A miss merely registers one weak candidate; every hit is confirmed by a
- * full-page comparison while both content locks are held exclusively.
+ * Durable shared-readonly branches use this path automatically.  Tests may
+ * supply a family or digest override.  A miss registers one weak candidate;
+ * every hit is confirmed by a full-page comparison while both content locks
+ * are held exclusively.
  */
 static void
 TryDBBranchFramePromotion(Buffer target_buffer, char persistence)
@@ -3363,13 +3499,14 @@ TryDBBranchFramePromotion(Buffer target_buffer, char persistence)
 	bool		content_locked = false;
 	bool		replace_candidate = false;
 
-	if (!TestOnlyDBBranchFramePromotionEnabled ||
+	if (TestOnlyDBBranchFramePromotionSuppressed ||
 		persistence != RELPERSISTENCE_PERMANENT ||
 		!BufferIsValid(target_buffer) || BufferIsLocal(target_buffer) ||
 		RecoveryInProgress())
 		return;
 
-	if (OidIsValid(TestOnlyDBBranchFrameFamilyOverride))
+	if (TestOnlyDBBranchFramePromotionEnabled &&
+		OidIsValid(TestOnlyDBBranchFrameFamilyOverride))
 		family_root_dboid = TestOnlyDBBranchFrameFamilyOverride;
 	else if (!GetMyDBBranchSharedReadOnlyFamily(&family_root_dboid))
 		return;
@@ -3377,6 +3514,11 @@ TryDBBranchFramePromotion(Buffer target_buffer, char persistence)
 	target = GetBufferDescriptor(target_buffer - 1);
 	if (GetPrivateRefCount(target_buffer) != 1 ||
 		LWLockHeldByMe(BufferDescriptorGetContentLock(target)))
+		return;
+	if (!TestOnlyDBBranchFramePromotionEnabled &&
+		DBBranchFrameCandidateIsRegistered(
+			target->buf_id,
+			pg_atomic_read_u32(&BufferTagGenerations[target->buf_id])))
 		return;
 
 	pg_atomic_fetch_add_u64(&DBBranchFrameStats->attempts, 1);
@@ -3403,7 +3545,8 @@ TryDBBranchFramePromotion(Buffer target_buffer, char persistence)
 	target_tag = target->tag;
 	target_tag_generation =
 		pg_atomic_read_u32(&BufferTagGenerations[target->buf_id]);
-	if (TestOnlyDBBranchFrameHashOverrideEnabled)
+	if (TestOnlyDBBranchFramePromotionEnabled &&
+		TestOnlyDBBranchFrameHashOverrideEnabled)
 		target_hash = TestOnlyDBBranchFrameHashOverride;
 	else
 		target_hash = hash_bytes_extended(
@@ -3476,7 +3619,8 @@ TryDBBranchFramePromotion(Buffer target_buffer, char persistence)
 		goto skipped;
 	}
 
-	INJECTION_POINT("dbbranch-frame-promotion-before-content-lock", NULL);
+	if (TestOnlyDBBranchFramePromotionEnabled)
+		INJECTION_POINT("dbbranch-frame-promotion-before-content-lock", NULL);
 	if (LWLockHeldByMe(BufferDescriptorGetContentLock(source)) ||
 		!LockBufferContentPairConditional(target, source))
 		goto skipped;
@@ -3494,7 +3638,8 @@ TryDBBranchFramePromotion(Buffer target_buffer, char persistence)
 	}
 	UnlockBufferDescriptorPair(target, source, target_state, source_state);
 
-	if ((!TestOnlyDBBranchFrameHashOverrideEnabled &&
+	if ((!(TestOnlyDBBranchFramePromotionEnabled &&
+			 TestOnlyDBBranchFrameHashOverrideEnabled) &&
 		 hash_bytes_extended(
 							 (unsigned char *) (BufferBlocks +
 												((Size) target->buf_id * BLCKSZ)),
@@ -6600,10 +6745,13 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 	Assert(GetPrivateRefCount(buffer) > 0);
 	/* here, either share or exclusive lock is OK */
 	Assert(LWLockHeldByMe(BufferDescriptorGetContentLock(bufHdr)));
-	if (!BufferHasPrivateFrame(bufHdr))
+	if (BufferIsDBBranchFrameImmutable(buffer))
+	{
+		DBBranchFrameCandidateUnregister(bufHdr->buf_id);
 		elog(ERROR,
-			 "cannot dirty buffer %d while its test-only frame is shared",
+			 "cannot dirty buffer %d while its DB branch frame is immutable",
 			 buffer);
+	}
 	page = BufferGetPage(buffer);
 
 	/*

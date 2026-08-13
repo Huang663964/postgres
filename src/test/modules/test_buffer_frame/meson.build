@@ -38,6 +38,7 @@ tests += {
     'tests': [
       't/001_pin_gate.pl',
       't/002_read_promotion.pl',
+      't/003_product_lifecycle.pl',
     ],
   },
 }

@@ -356,6 +356,8 @@ typedef uint32 BufferFrameId;
 extern PGDLLIMPORT pg_atomic_uint32 *BufferFrameIds;
 extern PGDLLIMPORT pg_atomic_uint32 *BufferNonIdentityFrameCount;
 
+extern bool BufferIsDBBranchFrameImmutable(Buffer buffer);
+
 /*
  * BufferIsValid
  *		True iff the given buffer number is valid (either as a shared

@@ -406,6 +406,27 @@ BufferHasPrivateFrame(const BufferDesc *buf)
 		pg_atomic_read_u32(&BufferFrameAttachmentCounts[frame_id]) == 1;
 }
 
+/*
+ * True when replacement may discard this descriptor's current frame
+ * association.  A non-identity target can be detached while it is being
+ * invalidated; an identity owner must remain reserved until its last alias
+ * has gone away.
+ */
+static inline bool
+BufferFrameCanBeDiscarded(const BufferDesc *buf)
+{
+	BufferFrameId frame_id;
+
+	if (pg_atomic_read_u32(BufferNonIdentityFrameCount) == 0)
+		return true;
+
+	frame_id = pg_atomic_read_u32(&BufferFrameIds[buf->buf_id]);
+	Assert(frame_id < (BufferFrameId) NBuffers);
+
+	return frame_id != (BufferFrameId) buf->buf_id ||
+		pg_atomic_read_u32(&BufferFrameAttachmentCounts[frame_id]) == 1;
+}
+
 static inline ConditionVariable *
 BufferDescriptorGetIOCV(const BufferDesc *bdesc)
 {
@@ -503,6 +524,7 @@ extern void TestOnlyConfigureDBBranchFramePromotion(bool enabled,
 													Oid family_root_dboid,
 													bool override_hash,
 													uint64 content_hash);
+extern void TestOnlySuppressDBBranchFramePromotion(bool suppressed);
 extern void TestOnlyResetDBBranchFramePromotionStats(void);
 
 
@@ -533,6 +555,8 @@ extern bool DBBranchFrameCandidateLookup(const DBBranchFrameCandidateKey * key,
 extern bool DBBranchFrameCandidateReplace(const DBBranchFrameCandidateKey * key,
 										  const DBBranchFrameCandidate * expected,
 										  const DBBranchFrameCandidate * replacement);
+extern bool DBBranchFrameCandidateIsRegistered(int buf_id,
+											 uint32 tag_generation);
 extern void DBBranchFrameCandidateUnregister(int buf_id);
 
 /* localbuf.c */

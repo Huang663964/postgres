@@ -531,6 +531,8 @@ brin_start_evacuating_page(Relation idxRel, Buffer buf)
 
 	if (PageIsNew(page))
 		return false;
+	if (BufferIsDBBranchFrameImmutable(buf))
+		elog(ERROR, "cannot evacuate an immutable DB branch buffer");
 
 	maxoff = PageGetMaxOffsetNumber(page);
 	for (off = FirstOffsetNumber; off <= maxoff; off++)

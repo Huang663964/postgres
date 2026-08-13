@@ -54,6 +54,12 @@ gistkillitems(IndexScanDesc scan)
 		return;
 
 	LockBuffer(buffer, GIST_SHARE);
+	if (BufferIsDBBranchFrameImmutable(buffer))
+	{
+		UnlockReleaseBuffer(buffer);
+		so->numKilled = 0;
+		return;
+	}
 	gistcheckpage(scan->indexRelation, buffer);
 	page = BufferGetPage(buffer);
 
